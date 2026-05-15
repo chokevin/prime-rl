@@ -78,6 +78,96 @@ class SlurmConfig(BaseConfig):
         return self
 
 
+class RayJobConfig(BaseConfig):
+    """Configures portable KubeRay RayJob manifest rendering."""
+
+    job_name: Annotated[str, Field(description="The Kubernetes RayJob name.")] = "prime-rl"
+
+    namespace: Annotated[str, Field(description="The Kubernetes namespace for rendered resources.")] = "default"
+
+    image: Annotated[
+        str,
+        Field(
+            description="Container image used by the Ray head and worker pods. The image must include PRIME-RL, Ray, "
+            "vLLM, vllm-router, torchrun, and uv."
+        ),
+    ] = "primeintellect/prime-rl:main"
+
+    image_pull_policy: Annotated[
+        Literal["Always", "IfNotPresent", "Never"], Field(description="Kubernetes imagePullPolicy for Ray pods.")
+    ] = "IfNotPresent"
+
+    ray_version: Annotated[str, Field(description="KubeRay rayClusterSpec.rayVersion value.")] = "2.54.0"
+
+    shared_pvc_name: Annotated[
+        str,
+        Field(
+            description="Name of an existing ReadWriteMany PVC mounted by all Ray pods for outputs and checkpoints."
+        ),
+    ] = "prime-rl-shared-data"
+
+    shared_mount_path: Annotated[
+        Path, Field(description="Container mount path for shared output/checkpoint storage.")
+    ] = Path("/data")
+
+    config_mount_path: Annotated[Path, Field(description="Container mount path for rendered PRIME-RL subconfigs.")] = (
+        Path("/prime-rl/configs")
+    )
+
+    runtime_mount_path: Annotated[Path, Field(description="Container mount path for the generated Ray driver/script.")] = (
+        Path("/prime-rl/runtime")
+    )
+
+    manifest_path: Annotated[
+        Path | None,
+        Field(description="Where to write the rendered RayJob YAML stream. Defaults to <output_dir>/rayjob.yaml."),
+    ] = None
+
+    config_map_name: Annotated[
+        str | None,
+        Field(description="ConfigMap name for subconfigs and runtime scripts. Defaults to <job_name>-runtime."),
+    ] = None
+
+    service_account_name: Annotated[
+        str | None, Field(description="Optional serviceAccountName for Ray head and worker pods.")
+    ] = None
+
+    gpu_resource_name: Annotated[
+        str, Field(description="Kubernetes GPU resource name requested by trainer and inference workers.")
+    ] = "nvidia.com/gpu"
+
+    head_cpu_request: Annotated[str, Field(description="CPU request/limit for the Ray head/orchestrator pod.")] = "1"
+    head_memory_request: Annotated[str, Field(description="Memory request/limit for the Ray head/orchestrator pod.")] = (
+        "4Gi"
+    )
+    worker_cpu_request: Annotated[str, Field(description="CPU request/limit for trainer and inference worker pods.")] = (
+        "8"
+    )
+    worker_memory_request: Annotated[
+        str, Field(description="Memory request/limit for trainer and inference worker pods.")
+    ] = "64Gi"
+
+    inference_startup_grace_seconds: Annotated[
+        int,
+        Field(
+            ge=0,
+            description="Seconds the Ray driver waits after starting inference before launching trainer/orchestrator.",
+        ),
+    ] = 30
+
+    ttl_seconds_after_finished: Annotated[
+        int | None, Field(description="RayJob ttlSecondsAfterFinished. If None, omit the field.")
+    ] = 3600
+
+    env: Annotated[
+        dict[str, str],
+        Field(
+            default_factory=dict,
+            description="Additional environment variables to set on Ray head and worker containers.",
+        ),
+    ]
+
+
 ServerType = Literal["vllm", "openai"]
 
 

@@ -18,6 +18,28 @@ kubectl exec -it my-exp-trainer-0 -- bash
 cd /data && uv run trainer @ /app/examples/reverse_text/configs/train.toml
 ```
 
+## RayJob launcher backend
+
+For KubeRay-based platforms, the `rl` entrypoint can render a RayJob manifest from a normal multi-node RL TOML by using
+`[rayjob]` instead of `[slurm]` and running with `dry_run = true`:
+
+```toml
+[rayjob]
+job_name = "my-prime-rl-run"
+namespace = "ray"
+image = "registry.example.com/prime-rl-ray:latest"
+shared_pvc_name = "prime-rl-shared-data"
+```
+
+```bash
+uv run rl @ configs/my-run.toml --dry-run
+kubectl apply -f outputs/my-run/rayjob.yaml
+```
+
+This renderer owns the portable PRIME-RL role contract: trainer `torchrun`, inference `vllm-router`/backend,
+orchestrator URLs, resolved subconfigs, shared output, and NCCL weight-broadcast host wiring. It deliberately does not
+own platform placement such as queues, node selectors, dynamic resource allocation, or cluster preflight.
+
 ## Prerequisites
 
 - Kubernetes cluster with GPU nodes

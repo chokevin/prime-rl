@@ -19,6 +19,7 @@ from prime_rl.configs.orchestrator import (
     OrchestratorConfig,
 )
 from prime_rl.configs.shared import (
+    RayJobConfig,
     SlurmConfig,
     VLMConfig,
     WandbConfig,
@@ -358,6 +359,14 @@ class RLConfig(BaseConfig):
 
     slurm: Annotated[SlurmConfig | None, Field(description="SLURM configuration. If None, will run locally.")] = None
 
+    rayjob: Annotated[
+        RayJobConfig | None,
+        Field(
+            description="KubeRay RayJob rendering configuration. If set, multi-node RL renders a RayJob manifest "
+            "instead of a SLURM script."
+        ),
+    ] = None
+
     dry_run: Annotated[bool, Field(description="Only validate and dump resolved configs and exit early.")] = False
 
     experimental: Annotated[
@@ -369,9 +378,15 @@ class RLConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_deployment(self):
+        if self.slurm is not None and self.rayjob is not None:
+            raise ValueError("Configure only one multi-node launcher: slurm or rayjob.")
+
+        if self.rayjob is not None and self.deployment.type != "multi_node":
+            raise ValueError("RayJob launcher currently supports deployment.type = 'multi_node' only.")
+
         if self.deployment.type == "multi_node":
-            if self.slurm is None:
-                raise ValueError("Must use SLURM for multi-node deployment.")
+            if self.slurm is None and self.rayjob is None:
+                raise ValueError("Must configure SLURM or RayJob for multi-node deployment.")
             if self.deployment.num_infer_nodes > 0 and not self.inference:
                 raise ValueError("Must configure inference when using multi-node deployment with inference nodes.")
             if self.deployment.num_infer_nodes == 0 and self.inference:
@@ -384,6 +399,16 @@ class RLConfig(BaseConfig):
                     "Must use fake data (trainer.data.fake or bench = true) when num_infer_nodes = 0, "
                     "since no orchestrator or inference server will be running."
                 )
+
+            if self.rayjob is not None:
+                if self.deployment.num_infer_nodes != 1 or self.deployment.num_infer_replicas != 1:
+                    raise ValueError(
+                        "RayJob launcher currently supports exactly one inference node and one inference replica."
+                    )
+                if self.deployment.num_train_nodes != 1:
+                    raise ValueError("RayJob launcher currently supports exactly one trainer node.")
+                if self.inference is not None and self.inference.deployment.type == "disaggregated":
+                    raise ValueError("RayJob launcher does not yet support disaggregated inference.")
         return self
 
     # TODO: fix this
@@ -392,7 +417,7 @@ class RLConfig(BaseConfig):
         if self.deployment.type == "multi_node" and self.teacher_inference is not None:
             raise ValueError(
                 "Teacher inference is not supported in multi-node deployment. "
-                "The SLURM template only handles inference and training nodes."
+                "The multi-node launchers only handle inference and training nodes."
             )
         return self
 

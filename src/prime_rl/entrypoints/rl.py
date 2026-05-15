@@ -14,6 +14,7 @@ import tomli_w
 
 import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before transitive import
 from prime_rl.configs.rl import RLConfig
+from prime_rl.launchers.rayjob import write_rayjob_manifest
 from prime_rl.trainer.model import pre_download_model
 from prime_rl.utils.config import cli
 from prime_rl.utils.logger import get_logger, setup_logger
@@ -543,6 +544,33 @@ def rl_slurm(config: RLConfig):
     logger.success(f"{result.stdout.strip()}\n\n{log_message}")
 
 
+def rl_rayjob(config: RLConfig):
+    assert config.rayjob is not None
+
+    logger = setup_logger(
+        config.log.level or os.environ.get("PRIME_LOG_LEVEL", "info"), json_logging=config.log.json_logging
+    )
+
+    config_dir = config.output_dir / "configs"
+    write_subconfigs(config, config_dir)
+    logger.info(f"Wrote subconfigs to {config_dir}")
+
+    manifest_path = config.rayjob.manifest_path or config.output_dir / "rayjob.yaml"
+    write_rayjob_manifest(config, config_dir, manifest_path)
+    logger.info(f"Wrote RayJob manifest to {manifest_path}")
+
+    if not config.dry_run:
+        raise RuntimeError(
+            "RayJob launcher currently renders manifests only. Set dry_run=true, review the manifest, then apply it "
+            "with your platform orchestrator or kubectl."
+        )
+
+    logger.success(
+        "Dry run complete. Review the rendered RayJob manifest and apply it with a platform orchestrator:\n\n"
+        f"  kubectl apply -f {manifest_path}\n"
+    )
+
+
 def rl(config: RLConfig):
     resuming = config.ckpt is not None and config.ckpt.resume_step is not None
     clean = config.clean_output_dir and not os.environ.get("NEVER_CLEAN_OUTPUT_DIR")
@@ -569,6 +597,10 @@ def rl(config: RLConfig):
     else:
         get_logger().info("Training from scratch, cleaning any stale rollouts and broadcasts")
         clean_future_steps(config.output_dir, -1)
+
+    if config.rayjob is not None:
+        rl_rayjob(config)
+        return
 
     if not config.dry_run:
         pre_download_model(config.trainer.model.name)

@@ -34,6 +34,62 @@ helm install my-exp ./k8s/prime-rl -f ./k8s/prime-rl/examples/reverse-text.yaml
 helm install my-exp ./k8s/prime-rl --set trainer.replicas=3 --set inference.replicas=2
 ```
 
+## RayJob dry-run rendering
+
+PRIME-RL can also render a portable [KubeRay RayJob](https://github.com/ray-project/kuberay) manifest for
+multi-node RL runs. This path is for platform orchestrators that already own queueing, placement, and cluster preflight:
+PRIME-RL renders the resolved trainer/inference/orchestrator runtime contract, while the platform decides how and when to
+apply it.
+
+Add a `[rayjob]` section instead of `[slurm]`:
+
+```toml
+dry_run = true
+output_dir = "/data/outputs/my-run"
+
+[deployment]
+type = "multi_node"
+num_train_nodes = 1
+num_infer_nodes = 1
+gpus_per_node = 8
+
+[rayjob]
+job_name = "my-prime-rl-run"
+namespace = "ray"
+image = "registry.example.com/prime-rl-ray:latest"
+shared_pvc_name = "prime-rl-shared-data"
+
+[weight_broadcast]
+type = "nccl"
+```
+
+Then render the manifest:
+
+```bash
+uv run rl @ configs/my-run.toml --dry-run
+```
+
+The command writes resolved subconfigs under `<output_dir>/configs` and a RayJob YAML stream at
+`<output_dir>/rayjob.yaml`. The manifest includes:
+
+- a ConfigMap containing `trainer.toml`, `inference.toml`, `orchestrator.toml`, `prime-rl-ray-driver.py`, and
+  `prime-rl-ray-role.sh`;
+- a Ray head pod that runs the orchestrator/driver;
+- one trainer worker group and one inference worker group, each requesting `deployment.gpus_per_node` GPUs;
+- role environment for inference URLs, trainer rendezvous, shared output, and NCCL weight broadcast.
+
+This first RayJob backend intentionally renders only. It does not call `kubectl apply`, create queues, create PVCs, or
+configure vendor-specific GPU allocation. The container image must include PRIME-RL, Ray, vLLM, `vllm-router`,
+`torchrun`, and `uv`.
+
+Current limitations:
+
+- exactly one trainer node and one inference node;
+- one inference replica;
+- no teacher inference;
+- no disaggregated prefill/decode inference;
+- no platform-specific Kueue, DRA, node selector, or topology policy in upstream PRIME-RL.
+
 ### 2. Verify deployment
 
 ```bash
