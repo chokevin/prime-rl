@@ -75,6 +75,13 @@ the `experimental.ray.*` config reference.
   failures); not a Prime-RL bug. Fix the node networking first, then the same
   `k8s/raycluster/` manifests should apply.
 
+### Cloud-specific notes
+
+For Azure Kubernetes Service (AKS) — GPU node pool selectors, DRA vs
+`nvidia.com/gpu` resource shape, ACR images, Azure Files / Azure Blob CSI for
+`RWX` storage, optional Kueue, and H200/DeepGEMM caveats from the validation
+runs — see [`k8s/raycluster/aks.md`](../k8s/raycluster/aks.md).
+
 ---
 
 ## Legacy StatefulSet Helm chart

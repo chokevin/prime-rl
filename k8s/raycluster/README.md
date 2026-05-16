@@ -118,6 +118,10 @@ See `docs/ray.md` and the PR description for the full H200 validation summary.
 
 ## See also
 
+- [`aks.md`](./aks.md) — Azure Kubernetes Service (AKS) overlay: GPU pool
+  selectors, DRA or `nvidia.com/gpu` resource shape, ACR images, Azure
+  Files/Blob CSI for `RWX` storage, and the H200 caveats from the validation
+  runs.
 - `docs/ray.md` — Ray-native architecture and config reference.
 - `docs/kubernetes.md` — Kubernetes paths and decision matrix.
 - `../prime-rl/` — legacy SLURM-shaped Helm chart (StatefulSets per role).
