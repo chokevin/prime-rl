@@ -193,8 +193,27 @@ def test_ray_runtime_config_parses_with_ray_transport():
     assert config.experimental.ray.namespace == "test"
     assert config.experimental.ray.placement_strategy == "STRICT_PACK"
     assert config.experimental.ray.trainer_backend == "tasks"
+    assert config.experimental.ray.inference_backend == "prime_vllm"
     assert config.trainer.rollout_transport.type == "ray"
     assert config.orchestrator.rollout_transport.type == "ray"
+
+
+def test_ray_runtime_config_parses_prime_vllm_inference_backend():
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "--experimental.ray.enabled",
+            "--experimental.ray.inference-backend",
+            "prime_vllm",
+            "--trainer.rollout-transport.type",
+            "ray",
+            "--orchestrator.rollout-transport.type",
+            "ray",
+        ],
+    )
+    assert config.experimental.ray.inference_backend == "prime_vllm"
 
 
 def test_ray_runtime_config_parses_ray_train_backend():

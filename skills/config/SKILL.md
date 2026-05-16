@@ -163,7 +163,7 @@ enabled = true
 namespace = "prime-rl"
 ```
 
-Ray-native mode is validated to local `single_node` runs without SLURM. It runs inference and orchestrator workers as in-process Ray tasks. By default, trainer rank workers also run as Ray tasks and call `train(config)` directly. Set `experimental.ray.trainer_backend = "ray_train"` to run trainer workers through Ray Train's `TorchTrainer` instead.
+Ray-native mode is validated to local `single_node` runs without SLURM. It runs inference and orchestrator workers as in-process Ray tasks. Inference uses `experimental.ray.inference_backend = "prime_vllm"` by default, which runs Prime-RL's existing vLLM server inside a Ray GPU task and preserves custom inference endpoints plus filesystem/NCCL weight updates. By default, trainer rank workers also run as Ray tasks and call `train(config)` directly. Set `experimental.ray.trainer_backend = "ray_train"` to run trainer workers through Ray Train's `TorchTrainer` instead.
 
 Ray-native mode requires Ray rollout transport on both trainer and orchestrator:
 
@@ -188,6 +188,7 @@ Optional Ray Train settings live under `[experimental.ray]`:
 ```toml
 [experimental.ray]
 trainer_backend = "ray_train"
+inference_backend = "prime_vllm"
 train_run_name = "my-run"
 train_storage_path = "/shared/ray-train"
 ```

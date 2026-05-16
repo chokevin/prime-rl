@@ -3,22 +3,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.shared import RayTransportConfig
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.ray._utils import require_ray, role_context
+from prime_rl.ray.inference import start_prime_vllm_inference
 from prime_rl.transport.ray import create_ray_transport_actor
 from prime_rl.utils.process import set_proc_title
-
-
-def _run_inference_role(config: InferenceConfig, env: dict[str, str], log_path: Path) -> None:
-    with role_context(env, log_path):
-        set_proc_title("RayInference")
-        from prime_rl.entrypoints.inference import inference_local
-
-        inference_local(config)
 
 
 def _run_orchestrator_role(config: OrchestratorConfig, env: dict[str, str], log_path: Path) -> None:
@@ -161,24 +153,36 @@ def run_ray_native(
         transport_actor = create_ray_transport_actor(config.trainer.rollout_transport)
 
         if config.inference is not None:
-            inference_task = ray.remote(_run_inference_role).options(
+            if ray_config.inference_backend != "prime_vllm":
+                raise ValueError(f"Unsupported Ray inference backend: {ray_config.inference_backend}")
+            log_path = log_dir / "inference.log"
+            ref = start_prime_vllm_inference(
+                ray,
+                config.inference,
+                env=None,
+                log_path=log_path,
+                role_name="Inference",
                 num_cpus=ray_config.role_num_cpus,
                 num_gpus=config.deployment.num_infer_gpus,
                 scheduling_strategy=strategy(bundle_idx),
             )
-            log_path = log_dir / "inference.log"
-            ref = inference_task.remote(config.inference, {}, log_path)
             refs[ref] = ("inference", log_path)
             bundle_idx += 1
 
         if config.teacher_inference is not None:
-            teacher_task = ray.remote(_run_inference_role).options(
+            if ray_config.inference_backend != "prime_vllm":
+                raise ValueError(f"Unsupported Ray inference backend: {ray_config.inference_backend}")
+            log_path = log_dir / "teacher_inference.log"
+            ref = start_prime_vllm_inference(
+                ray,
+                config.teacher_inference,
+                env=None,
+                log_path=log_path,
+                role_name="TeacherInference",
                 num_cpus=ray_config.role_num_cpus,
                 num_gpus=config.deployment.num_teacher_gpus or 0,
                 scheduling_strategy=strategy(bundle_idx),
             )
-            log_path = log_dir / "teacher_inference.log"
-            ref = teacher_task.remote(config.teacher_inference, {}, log_path)
             refs[ref] = ("teacher_inference", log_path)
             bundle_idx += 1
 

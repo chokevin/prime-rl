@@ -118,6 +118,17 @@ class RayRuntimeConfig(BaseConfig):
         ),
     ] = "tasks"
 
+    inference_backend: Annotated[
+        Literal["prime_vllm"],
+        Field(
+            description=(
+                "Backend for inference execution in Ray-native mode. "
+                "'prime_vllm' runs Prime-RL's existing vLLM server inside a Ray GPU task, "
+                "preserving custom endpoints and filesystem/NCCL weight-update behavior."
+            )
+        ),
+    ] = "prime_vllm"
+
     train_run_name: Annotated[
         str | None,
         Field(description="Optional Ray Train run name when trainer_backend = 'ray_train'."),
