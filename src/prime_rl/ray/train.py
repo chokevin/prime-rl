@@ -19,18 +19,20 @@ def _run_ray_train_worker(train_loop_config: dict[str, Any]) -> None:
     context = ray_train.get_context()
     rank = context.get_world_rank()
     world_size = context.get_world_size()
-    local_rank = context.get_local_rank()
-    local_world_size = context.get_local_world_size()
 
     env = {
         **shared_env,
         "RANK": str(rank),
         "WORLD_SIZE": str(world_size),
-        "LOCAL_RANK": str(local_rank),
-        "LOCAL_WORLD_SIZE": str(local_world_size),
+        # Ray Train with use_gpu=True restricts each worker's CUDA_VISIBLE_DEVICES to a
+        # single GPU, so torch.cuda.device_count() == 1 inside the worker. Local rank/size
+        # must therefore be 0/1 even when multiple workers share a node — otherwise
+        # torch.cuda.set_device(local_rank) hits "invalid device ordinal".
+        "LOCAL_RANK": "0",
+        "LOCAL_WORLD_SIZE": "1",
         "PYTHONUNBUFFERED": "1",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     }
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     for key in ("MASTER_ADDR", "MASTER_PORT"):
         if key in os.environ:
             env[key] = os.environ[key]
@@ -91,3 +93,25 @@ def run_trainer_with_ray_train(
         run_config=RunConfig(**run_config_kwargs) if run_config_kwargs else None,
     )
     return trainer.fit()
+
+
+def run_trainer_with_ray_train_remote(
+    config: RLConfig,
+    log_dir_str: str,
+    shared_env: dict[str, str],
+    start_command: list[str],
+) -> None:
+    """Ray-task entrypoint that wraps run_trainer_with_ray_train.
+
+    Defined as a module-level function so it can be registered as a Ray remote task
+    from run_ray_native and joined into the same refs dict as the inference and
+    orchestrator roles. Returning the ObjectRef lets _monitor_roles observe trainer
+    completion (or failure) concurrently with the other roles instead of blocking on
+    a synchronous trainer.fit() call.
+    """
+    run_trainer_with_ray_train(
+        config,
+        log_dir=Path(log_dir_str),
+        shared_env=shared_env,
+        start_command=start_command,
+    )

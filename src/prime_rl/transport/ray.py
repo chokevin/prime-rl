@@ -21,8 +21,11 @@ class _RayTransportStore:
         self.micro_batches: dict[tuple[int, int], bytes] = {}
 
     def put_training_batch(self, sender_id: str, payload: bytes) -> None:
-        if len(self.training_batches) >= self.max_queued_items:
-            raise RuntimeError(f"Ray training batch queue is full ({self.max_queued_items} items)")
+        per_sender = sum(1 for sid, _ in self.training_batches if sid == sender_id)
+        if per_sender >= self.max_queued_items:
+            raise RuntimeError(
+                f"Ray training batch queue is full for sender {sender_id!r} ({self.max_queued_items} items)"
+            )
         self.training_batches.append((sender_id, payload))
 
     def drain_training_batches(self) -> list[tuple[str, bytes]]:
@@ -34,8 +37,11 @@ class _RayTransportStore:
         return len(self.training_batches)
 
     def put_micro_batch(self, data_rank: int, step: int, payload: bytes) -> None:
-        if len(self.micro_batches) >= self.max_queued_items:
-            raise RuntimeError(f"Ray micro-batch queue is full ({self.max_queued_items} items)")
+        per_rank = sum(1 for (rank, _) in self.micro_batches if rank == data_rank)
+        if per_rank >= self.max_queued_items:
+            raise RuntimeError(
+                f"Ray micro-batch queue is full for data_rank={data_rank} ({self.max_queued_items} items)"
+            )
         key = (data_rank, step)
         if key in self.micro_batches:
             raise RuntimeError(f"Ray micro-batch already queued for data_rank={data_rank}, step={step}")
@@ -88,6 +94,14 @@ def create_ray_transport_actor(config: RayTransportConfig):
     except ValueError:
         pass
     else:
+        if not config.reclaim_stale_actor:
+            raise RuntimeError(
+                f"Ray transport actor {config.actor_name!r} already exists in namespace "
+                f"{config.namespace!r}. Refusing to kill it because reclaim_stale_actor=false. "
+                "On shared RayClusters set rollout_transport.actor_name (and matching trainer/orchestrator "
+                "values) to a unique name per run, e.g. include the run id. To force the launcher to "
+                "reclaim an orphaned actor, set rollout_transport.reclaim_stale_actor = true."
+            )
         ray.kill(stale_actor, no_restart=True)
         deadline = time.time() + ACTOR_SHUTDOWN_TIMEOUT_SECONDS
         while time.time() < deadline:

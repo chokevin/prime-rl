@@ -44,8 +44,8 @@ def _run_trainer_rank(
         "MASTER_ADDR": master_addr,
         "MASTER_PORT": str(master_port),
         "PYTHONUNBUFFERED": "1",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     }
+    rank_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     with role_context(rank_env, log_path):
         set_proc_title(f"RayTrainerRank{rank}")
         from prime_rl.trainer.rl.train import train
@@ -279,10 +279,20 @@ def run_ray_native(
         }
 
         if ray_config.trainer_backend == "ray_train":
-            from prime_rl.ray.train import run_trainer_with_ray_train
+            # Wrap trainer.fit() in a Ray task so its ObjectRef can be polled alongside
+            # inference and orchestrator refs. Without this, trainer.fit() blocks the
+            # driver and an inference crash mid-run goes undetected — the trainer hangs
+            # forever waiting for rollout batches that will never arrive.
+            from prime_rl.ray.train import run_trainer_with_ray_train_remote
 
-            run_trainer_with_ray_train(config, log_dir=log_dir, shared_env=shared_env, start_command=start_command)
-            critical_names = {"orchestrator"}
+            trainer_task = ray.remote(run_trainer_with_ray_train_remote).options(
+                num_cpus=ray_config.role_num_cpus,
+            )
+            log_path = log_dir / "trainer" / "ray_train.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            ref = trainer_task.remote(config, log_dir.as_posix(), shared_env, start_command)
+            refs[ref] = ("trainer", log_path)
+            critical_names = {"orchestrator", "trainer"}
         else:
             trainer_start_bundle_idx = bundle_idx
             ip_task = ray.remote(_get_worker_node_ip).options(
@@ -310,7 +320,9 @@ def run_ray_native(
                 refs[ref] = (f"trainer_rank_{rank}", log_path)
                 bundle_idx += 1
 
-            critical_names = {"orchestrator"} | {f"trainer_rank_{rank}" for rank in range(config.deployment.num_train_gpus)}
+            critical_names = {"orchestrator"} | {
+                f"trainer_rank_{rank}" for rank in range(config.deployment.num_train_gpus)
+            }
         _monitor_roles(ray, refs, critical_names, ray_config.poll_interval_seconds)
     except KeyboardInterrupt:
         _cancel_refs(ray, refs)
@@ -320,8 +332,14 @@ def run_ray_native(
         raise
     finally:
         if pg is not None:
-            from ray.util import remove_placement_group
+            try:
+                from ray.util import remove_placement_group
 
-            remove_placement_group(pg)
+                remove_placement_group(pg)
+            except Exception as exc:
+                get_logger().warning(f"Failed to remove Ray placement group: {exc}")
         if transport_actor is not None:
-            ray.kill(transport_actor, no_restart=True)
+            try:
+                ray.kill(transport_actor, no_restart=True)
+            except Exception as exc:
+                get_logger().warning(f"Failed to kill Ray transport actor: {exc}")

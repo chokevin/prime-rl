@@ -573,9 +573,22 @@ class RayTransportConfig(BaseTransportConfig):
         int,
         Field(
             ge=1,
-            description="Maximum queued training or micro-batch payloads before senders fail with backpressure.",
+            description=(
+                "Maximum queued training or micro-batch payloads per sender (per data_rank for "
+                "micro-batches, per sender_id for training batches) before senders fail with backpressure."
+            ),
         ),
     ] = 64
+    reclaim_stale_actor: Annotated[
+        bool,
+        Field(
+            description=(
+                "If true, the Ray-native launcher will kill any pre-existing transport actor with the "
+                "same actor_name/namespace before creating its own. Default false: fail loudly on collision. "
+                "Use only on dedicated/per-run RayClusters; on shared clusters, prefer unique actor_name."
+            ),
+        ),
+    ] = False
 
 
 TransportConfig: TypeAlias = Annotated[

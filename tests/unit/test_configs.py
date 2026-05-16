@@ -13,7 +13,8 @@ from prime_rl.configs.sft import SFTConfig
 from prime_rl.configs.shared import TransportConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
-from prime_rl.ray.native import _orchestrator_with_ray_inference_endpoint
+from prime_rl.ray.native import _monitor_roles, _orchestrator_with_ray_inference_endpoint
+from prime_rl.transport.ray import _RayTransportStore
 from prime_rl.utils.config import BaseConfig, cli
 
 # All config config classes
@@ -469,3 +470,116 @@ def test_ray_native_preserves_external_inference_client_urls():
     rewritten = _orchestrator_with_ray_inference_endpoint(orchestrator, inference, "10.0.4.184")
 
     assert rewritten.client.base_url == ["http://inference.ray.svc.cluster.local:8000/v1"]
+
+
+def test_ray_transport_config_reclaim_stale_actor_defaults_false():
+    transport = TypeAdapter(TransportConfig).validate_python({"type": "ray"})
+    assert transport.type == "ray"
+    assert transport.reclaim_stale_actor is False
+
+
+def test_ray_transport_store_per_rank_micro_batch_cap():
+    """Regression: max_queued_items applies per data_rank, not globally."""
+    store = _RayTransportStore(max_queued_items=2)
+
+    store.put_micro_batch(data_rank=0, step=0, payload=b"a")
+    store.put_micro_batch(data_rank=0, step=1, payload=b"b")
+    store.put_micro_batch(data_rank=1, step=0, payload=b"c")
+    store.put_micro_batch(data_rank=1, step=1, payload=b"d")
+
+    with pytest.raises(RuntimeError, match="data_rank=0"):
+        store.put_micro_batch(data_rank=0, step=2, payload=b"e")
+
+    assert store.pop_micro_batch(data_rank=1, step=0) == b"c"
+    store.put_micro_batch(data_rank=1, step=2, payload=b"f")
+
+
+def test_ray_transport_store_per_sender_training_batch_cap():
+    """Regression: training-batch cap is per sender_id, not globally."""
+    store = _RayTransportStore(max_queued_items=2)
+
+    store.put_training_batch("sender-a", b"a0")
+    store.put_training_batch("sender-a", b"a1")
+    store.put_training_batch("sender-b", b"b0")
+    store.put_training_batch("sender-b", b"b1")
+
+    with pytest.raises(RuntimeError, match="sender-a"):
+        store.put_training_batch("sender-a", b"a2")
+
+
+class _FakeRay:
+    """Minimal stub used to drive _monitor_roles without a live Ray cluster."""
+
+    def __init__(self, ready_order: list[object], failure_map: dict[object, BaseException] | None = None) -> None:
+        self._ready_order = list(ready_order)
+        self._failures = failure_map or {}
+        self.cancelled: list[object] = []
+
+    def wait(self, refs, num_returns: int = 1, timeout: float = 0.0):
+        ref_set = set(refs)
+        for ref in list(self._ready_order):
+            if ref in ref_set:
+                self._ready_order.remove(ref)
+                return [ref], [r for r in refs if r is not ref]
+        return [], list(refs)
+
+    def get(self, ref):
+        if ref in self._failures:
+            raise self._failures[ref]
+        return None
+
+    def cancel(self, ref, force: bool = False) -> None:
+        self.cancelled.append(ref)
+
+
+def test_monitor_roles_surfaces_real_exception_from_failed_role():
+    """When a role's Ray task raises, _monitor_roles must chain that exception so
+    operators see the real cause (e.g. vLLM stack trace) and not just a launcher message."""
+    inference_ref = object()
+    orchestrator_ref = object()
+    real_failure = RuntimeError("vLLM engine OOM")
+    refs = {
+        inference_ref: ("inference", Path("/tmp/inference.log")),
+        orchestrator_ref: ("orchestrator", Path("/tmp/orchestrator.log")),
+    }
+    fake = _FakeRay(ready_order=[inference_ref], failure_map={inference_ref: real_failure})
+
+    with pytest.raises(RuntimeError, match="Ray-native role inference failed") as excinfo:
+        _monitor_roles(fake, refs, critical_names={"orchestrator"}, poll_interval_seconds=0.0)
+
+    assert excinfo.value.__cause__ is real_failure
+    assert orchestrator_ref in fake.cancelled
+
+
+def test_monitor_roles_raises_when_long_running_role_returns_cleanly():
+    """When a non-critical role returns cleanly before training finishes (e.g. inference
+    exits 0 unexpectedly), _monitor_roles must raise and cancel remaining roles."""
+    inference_ref = object()
+    orchestrator_ref = object()
+    refs = {
+        inference_ref: ("inference", Path("/tmp/inference.log")),
+        orchestrator_ref: ("orchestrator", Path("/tmp/orchestrator.log")),
+    }
+    fake = _FakeRay(ready_order=[inference_ref])
+
+    with pytest.raises(RuntimeError, match="exited before training finished"):
+        _monitor_roles(fake, refs, critical_names={"orchestrator"}, poll_interval_seconds=0.0)
+
+    assert orchestrator_ref in fake.cancelled
+
+
+def test_monitor_roles_cancels_non_critical_after_critical_completes():
+    """When all critical roles finish, _monitor_roles must cancel remaining non-critical
+    roles instead of waiting on them forever."""
+    orchestrator_ref = object()
+    inference_ref = object()
+    refs = {
+        orchestrator_ref: ("orchestrator", Path("/tmp/orchestrator.log")),
+        inference_ref: ("inference", Path("/tmp/inference.log")),
+    }
+    fake = _FakeRay(ready_order=[orchestrator_ref])
+
+    _monitor_roles(fake, refs, critical_names={"orchestrator"}, poll_interval_seconds=0.0)
+
+    assert inference_ref in fake.cancelled
+    assert orchestrator_ref not in fake.cancelled
