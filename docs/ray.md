@@ -50,6 +50,20 @@ actor_name = "prime-rl-transport"
 
 Prime-RL disables Ray's automatic `uv run` runtime-env propagation for this path so Ray workers use the same active Python environment as the launcher. Install Ray into the active environment before launching `rl`.
 
+For multi-node RayCluster validation, set `experimental.ray.address` to the Ray head service and use `experimental.ray.runtime_env` to make the fork checkout importable on remote worker pods:
+
+```toml
+[experimental.ray]
+address = "my-raycluster-head-svc.ray.svc.cluster.local:6379"
+placement_strategy = "SPREAD"
+
+[experimental.ray.runtime_env]
+working_dir = "/shared/checkouts/prime-rl"
+
+[experimental.ray.runtime_env.env_vars]
+PYTHONPATH = "/shared/checkouts/prime-rl/src:/shared/checkouts/prime-rl/packages/prime-rl-configs/src"
+```
+
 ## Ray Train backend
 
 Set `experimental.ray.trainer_backend = "ray_train"` to run trainer ranks with `ray.train.torch.TorchTrainer` instead of one manual Ray task per rank:
@@ -78,7 +92,7 @@ Ray owns placement, lifecycle, and log/failure surfacing for this server. It doe
 
 Ray supports vLLM through Ray Serve LLM and Ray Data LLM, but those APIs do not directly replace Prime-RL's current vLLM server contract. Prime-RL depends on custom endpoints such as `/v1/chat/completions/tokens`, `/pause`, `/resume`, `/update_weights`, `/liveness`, and `/init_broadcaster`. A Ray Serve backend needs a Prime-RL compatibility facade before it can replace the current vLLM server.
 
-Ray Train checkpoint/storage APIs are the right durable checkpoint path, but Ray's object store is not a reliable cluster-wide weight broadcast bus for full model updates. For now, Ray-native runs keep the existing filesystem or NCCL weight broadcast backends while the Ray-specific broadcast mechanism remains a separate spike.
+Ray Train checkpoint/storage APIs are the right durable checkpoint path, but Ray's object store is not a reliable cluster-wide weight broadcast bus for full model updates. The supported Ray-native path keeps Prime-RL's existing HF-compatible filesystem weight broadcast (or NCCL where configured): trainer writes the update under the broadcast directory, marks it `STABLE`, and the Prime-vLLM inference task reloads through the existing `/update_weights` endpoint.
 
 ## Current constraints
 
@@ -89,6 +103,7 @@ Ray Train checkpoint/storage APIs are the right durable checkpoint path, but Ray
 - The Ray-native `rl` launcher owns the shared transport actor; Ray transport workers fail fast if that actor is missing instead of creating disconnected queues.
 - Ray Train support is experimental and currently targets the same local `single_node` deployment as the Ray task backend.
 - Ray Serve is not used yet because `prime_vllm` is the supported Ray inference backend and relies on Prime-RL's custom vLLM endpoints.
+- Multi-node RayCluster validation requires a shared checkout or Ray `runtime_env` because remote Ray worker pods cannot see a driver pod's local `/tmp` clone.
 
 ## Verifier and rollout actor assessment
 

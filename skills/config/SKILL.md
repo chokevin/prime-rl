@@ -195,6 +195,22 @@ train_storage_path = "/shared/ray-train"
 
 Use shared `train_storage_path` for future multi-node RayCluster validation. The current Ray Train backend still keeps Prime-RL's vLLM inference and filesystem/NCCL weight broadcast contracts.
 
+For multi-node RayCluster validation, set `experimental.ray.address` to the Ray head service and use Ray `runtime_env` so remote worker pods can import the fork checkout:
+
+```toml
+[experimental.ray]
+address = "my-raycluster-head-svc.ray.svc.cluster.local:6379"
+placement_strategy = "SPREAD"
+
+[experimental.ray.runtime_env]
+working_dir = "/shared/checkouts/prime-rl"
+
+[experimental.ray.runtime_env.env_vars]
+PYTHONPATH = "/shared/checkouts/prime-rl/src:/shared/checkouts/prime-rl/packages/prime-rl-configs/src"
+```
+
+The accepted Ray-native weight update path reuses Prime-RL's HF-compatible filesystem broadcast by default; do not add `weight_broadcast.type = "ray"` unless a separate design proves a better full-model live update path.
+
 ### SFT hard distill override
 
 For hosted multi-tenant runs where the trainer image's `trainer.loss.type` is fixed, the orchestrator exposes a per-run override that forces SFT loss on every micro-batch without rebuilding the trainer. Set `orchestrator.use_sft_loss = true` alongside `orchestrator.teacher_rollout_model`; both must be configured together (the orchestrator validator enforces this). The orchestrator stamps each `TrainingSample.sft_loss = True`, which the trainer's `compute_loss` honors by dispatching to `sft_loss_fn` per batch — independent of the trainer's configured default loss.

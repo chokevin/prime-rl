@@ -52,6 +52,25 @@ from prime_rl.utils.validation import (
 )
 
 
+class RayRuntimeEnvConfig(BaseConfig):
+    """Configures Ray runtime_env for remote RayCluster workers."""
+
+    working_dir: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional Ray runtime_env working_dir. Use this for RayCluster validation when worker pods "
+                "need the fork checkout uploaded from the launcher."
+            )
+        ),
+    ] = None
+
+    env_vars: Annotated[
+        dict[str, str],
+        Field(description="Optional Ray runtime_env env_vars to set on remote Ray workers."),
+    ] = {}
+
+
 class RayRuntimeConfig(BaseConfig):
     """Configures experimental Ray-native RL training."""
 
@@ -80,6 +99,11 @@ class RayRuntimeConfig(BaseConfig):
         bool,
         Field(description="Forward Ray worker logs to the launcher driver."),
     ] = False
+
+    runtime_env: Annotated[
+        RayRuntimeEnvConfig,
+        Field(description="Optional Ray runtime_env settings for remote workers."),
+    ] = RayRuntimeEnvConfig()
 
     role_num_cpus: Annotated[
         float,

@@ -240,6 +240,36 @@ def test_ray_runtime_config_parses_ray_train_backend():
     assert config.experimental.ray.train_storage_path == "/tmp/ray-train"
 
 
+def test_ray_runtime_config_parses_runtime_env(tmp_path):
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "--experimental.ray.enabled",
+            "--experimental.ray.address",
+            "ray-head.ray.svc.cluster.local:6379",
+            "--experimental.ray.runtime-env.working-dir",
+            tmp_path.as_posix(),
+            "--experimental.ray.runtime-env.env-vars",
+            '{"PYTHONPATH": "/repo/src:/repo/packages/prime-rl-configs/src"}',
+            "--trainer.rollout-transport.type",
+            "ray",
+            "--trainer.rollout-transport.address",
+            "ray-head.ray.svc.cluster.local:6379",
+            "--orchestrator.rollout-transport.type",
+            "ray",
+            "--orchestrator.rollout-transport.address",
+            "ray-head.ray.svc.cluster.local:6379",
+        ],
+    )
+    assert config.experimental.ray.address == "ray-head.ray.svc.cluster.local:6379"
+    assert config.experimental.ray.runtime_env.working_dir == tmp_path.as_posix()
+    assert config.experimental.ray.runtime_env.env_vars["PYTHONPATH"] == "/repo/src:/repo/packages/prime-rl-configs/src"
+    assert config.trainer.rollout_transport.address == "ray-head.ray.svc.cluster.local:6379"
+    assert config.orchestrator.rollout_transport.address == "ray-head.ray.svc.cluster.local:6379"
+
+
 def test_ray_runtime_config_requires_matching_actor_name():
     with pytest.raises(ValidationError, match="same actor_name"):
         cli(

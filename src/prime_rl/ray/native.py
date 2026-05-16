@@ -63,6 +63,13 @@ def _init_ray(config: RLConfig):
         kwargs: dict[str, Any] = {"namespace": ray_config.namespace, "log_to_driver": ray_config.log_to_driver}
         if ray_config.address is not None:
             kwargs["address"] = ray_config.address
+        runtime_env: dict[str, Any] = {}
+        if ray_config.runtime_env.working_dir is not None:
+            runtime_env["working_dir"] = ray_config.runtime_env.working_dir
+        if ray_config.runtime_env.env_vars:
+            runtime_env["env_vars"] = ray_config.runtime_env.env_vars
+        if runtime_env:
+            kwargs["runtime_env"] = runtime_env
         ray.init(**kwargs)
     return ray
 
