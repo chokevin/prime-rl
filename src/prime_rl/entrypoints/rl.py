@@ -413,7 +413,8 @@ def rl_local(config: RLConfig):
 
 
 def rl_ray(config: RLConfig):
-    assert config.deployment.type == "single_node"
+    if config.deployment.type not in ("single_node", "ray_cluster"):
+        raise ValueError("Ray-native RL requires deployment.type = 'single_node' or 'ray_cluster'.")
 
     from prime_rl.ray import run_ray_native
 
@@ -642,6 +643,9 @@ def rl(config: RLConfig):
 
     if not config.dry_run:
         pre_download_model(config.trainer.model.name)
+
+    if config.deployment.type == "ray_cluster" and not config.experimental.ray.enabled:
+        raise ValueError("deployment.type = 'ray_cluster' requires experimental.ray.enabled = true.")
 
     if config.experimental.ray.enabled:
         rl_ray(config)

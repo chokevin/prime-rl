@@ -327,6 +327,51 @@ class SingleNodeDeploymentConfig(BaseDeploymentConfig):
         return self
 
 
+class RayClusterDeploymentConfig(BaseDeploymentConfig):
+    """Configures logical role resources for Ray-native RayCluster deployment."""
+
+    type: Literal["ray_cluster"] = "ray_cluster"
+
+    num_train_gpus: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Number of trainer GPU workers to launch through Ray. These workers may be spread across "
+                "RayCluster nodes by the Ray placement strategy."
+            ),
+        ),
+    ] = 1
+    num_infer_gpus: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Number of GPUs reserved by the Prime-vLLM inference Ray task. Must fit on one Ray worker node."
+            ),
+        ),
+    ] = 1
+    num_teacher_gpus: Annotated[
+        int | None,
+        Field(description="Number of GPUs reserved by the teacher inference Ray task, if configured."),
+    ] = None
+
+    @model_validator(mode="after")
+    def validate_role_bundle_gpu_count(self):
+        if self.num_infer_gpus > self.gpus_per_node:
+            raise ValueError(
+                f"Ray inference GPU count ({self.num_infer_gpus}) exceeds gpus_per_node ({self.gpus_per_node}). "
+                "Prime-vLLM inference is scheduled as one Ray task and must fit on one Ray worker node."
+            )
+        if self.num_teacher_gpus is not None and self.num_teacher_gpus > self.gpus_per_node:
+            raise ValueError(
+                f"Ray teacher inference GPU count ({self.num_teacher_gpus}) exceeds gpus_per_node "
+                f"({self.gpus_per_node}). Teacher inference is scheduled as one Ray task and must fit on one "
+                "Ray worker node."
+            )
+        return self
+
+
 class MultiNodeDeploymentConfig(BaseDeploymentConfig):
     """Configures a multi node deployment."""
 
@@ -368,7 +413,7 @@ class MultiNodeDeploymentConfig(BaseDeploymentConfig):
 
 
 DeploymentConfig: TypeAlias = Annotated[
-    SingleNodeDeploymentConfig | MultiNodeDeploymentConfig, Field(discriminator="type")
+    SingleNodeDeploymentConfig | RayClusterDeploymentConfig | MultiNodeDeploymentConfig, Field(discriminator="type")
 ]
 
 
@@ -500,6 +545,11 @@ class RLConfig(BaseConfig):
     @model_validator(mode="after")
     def validate_deployment(self):
         if self.deployment.type == "multi_node":
+            if self.experimental.ray.enabled:
+                raise ValueError(
+                    "deployment.type = 'multi_node' is the SLURM multi-node path. "
+                    "Use deployment.type = 'ray_cluster' with experimental.ray.enabled for Ray-native multi-node runs."
+                )
             if self.slurm is None:
                 raise ValueError("Must use SLURM for multi-node deployment.")
             if self.deployment.num_infer_nodes > 0 and not self.inference:
@@ -514,6 +564,13 @@ class RLConfig(BaseConfig):
                     "Must use fake data (trainer.data.fake or bench = true) when num_infer_nodes = 0, "
                     "since no orchestrator or inference server will be running."
                 )
+        if self.deployment.type == "ray_cluster":
+            if self.slurm is not None:
+                raise ValueError("deployment.type = 'ray_cluster' cannot be combined with SLURM.")
+            if self.inference is not None and self.deployment.num_infer_gpus < 1:
+                raise ValueError("Ray-native inference requires deployment.num_infer_gpus >= 1.")
+            if self.teacher_inference is not None and not self.deployment.num_teacher_gpus:
+                raise ValueError("Ray-native teacher inference requires deployment.num_teacher_gpus >= 1.")
         return self
 
     @model_validator(mode="after")
@@ -522,8 +579,11 @@ class RLConfig(BaseConfig):
             return self
         if self.slurm is not None:
             raise ValueError("experimental.ray.enabled is only supported for local runs without SLURM.")
-        if self.deployment.type != "single_node":
-            raise ValueError("experimental.ray.enabled currently supports only single_node deployment.")
+        if self.deployment.type not in ("single_node", "ray_cluster"):
+            raise ValueError(
+                "experimental.ray.enabled supports deployment.type = 'single_node' or 'ray_cluster'. "
+                "Use 'ray_cluster' for Ray-native multi-node placement."
+            )
         if self.trainer.rollout_transport.type != "ray" or self.orchestrator.rollout_transport.type != "ray":
             raise ValueError(
                 "experimental.ray.enabled requires trainer.rollout_transport.type = 'ray' and "
@@ -549,7 +609,7 @@ class RLConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_enough_devices_for_nccl(self):
-        if self.deployment.type == "single_node":
+        if self.deployment.type in ("single_node", "ray_cluster"):
             if self.trainer.weight_broadcast.type == "nccl":
                 if self.deployment.num_train_gpus + self.deployment.num_infer_gpus < 2:
                     raise ValueError(

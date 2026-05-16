@@ -26,6 +26,12 @@ Inference calls Prime-RL's Python `inference_local(config)` function inside a Ra
 ## Example config
 
 ```toml
+[deployment]
+type = "single_node"
+gpus_per_node = 2
+num_train_gpus = 1
+num_infer_gpus = 1
+
 [experimental.ray]
 enabled = true
 namespace = "prime-rl"
@@ -50,9 +56,15 @@ actor_name = "prime-rl-transport"
 
 Prime-RL disables Ray's automatic `uv run` runtime-env propagation for this path so Ray workers use the same active Python environment as the launcher. Install Ray into the active environment before launching `rl`.
 
-For multi-node RayCluster validation, run the driver on a Ray node, for example with KubeRay's job submission path or by execing into the head pod. A plain Kubernetes driver pod that calls `ray.init(address="<head-svc>:6379")` can connect to GCS but has no local raylet, so worker creation fails. Use `address = "auto"` from a Ray head/job driver and `experimental.ray.runtime_env` to make the fork checkout importable on remote worker pods:
+For multi-node RayCluster validation, use `deployment.type = "ray_cluster"` and run the driver on a Ray node, for example with KubeRay's job submission path or by execing into the head pod. A plain Kubernetes driver pod that calls `ray.init(address="<head-svc>:6379")` can connect to GCS but has no local raylet, so worker creation fails. Use `address = "auto"` from a Ray head/job driver and `experimental.ray.runtime_env` to make the fork checkout importable on remote worker pods:
 
 ```toml
+[deployment]
+type = "ray_cluster"
+gpus_per_node = 1
+num_train_gpus = 1
+num_infer_gpus = 1
+
 [experimental.ray]
 address = "auto"
 placement_strategy = "SPREAD"
@@ -63,6 +75,8 @@ working_dir = "/shared/checkouts/prime-rl"
 [experimental.ray.runtime_env.env_vars]
 PYTHONPATH = "/shared/checkouts/prime-rl/src:/shared/checkouts/prime-rl/packages/prime-rl-configs/src"
 ```
+
+`ray_cluster` is a Ray-native resource model, not the old SLURM `multi_node` deployment. It names logical role GPU resources and lets Ray/Ray Train place them on RayCluster worker nodes. `num_train_gpus` is the Ray Train worker count and may span nodes. `num_infer_gpus` and `num_teacher_gpus` reserve GPUs for single Prime-vLLM Ray tasks, so each must fit within `gpus_per_node`.
 
 ## Ray Train backend
 
@@ -98,12 +112,13 @@ Ray Train checkpoint/storage APIs are the right durable checkpoint path, but Ray
 
 ## Current constraints
 
-- Only `deployment.type = "single_node"` is supported.
+- `deployment.type = "single_node"` and `deployment.type = "ray_cluster"` are supported by `experimental.ray.enabled`.
+- `deployment.type = "multi_node"` remains the SLURM multi-node path; use `ray_cluster` for Ray-native multi-node placement.
 - SLURM mode is not supported by `experimental.ray.enabled`.
 - Ray is an optional runtime dependency for this fork; non-Ray Prime-RL paths do not import Ray.
 - `trainer.rollout_transport.type` and `orchestrator.rollout_transport.type` must both be `ray`.
 - The Ray-native `rl` launcher owns the shared transport actor; Ray transport workers fail fast if that actor is missing instead of creating disconnected queues.
-- Ray Train support is experimental and currently targets the same local `single_node` deployment as the Ray task backend.
+- Ray Train support is experimental and targets the same logical role GPU counts as the Ray task backend.
 - Ray Serve is not used yet because `prime_vllm` is the supported Ray inference backend and relies on Prime-RL's custom vLLM endpoints.
 - Multi-node RayCluster validation requires a shared checkout or Ray `runtime_env` because remote Ray worker pods cannot see a driver pod's local `/tmp` clone.
 - Multi-node RayCluster drivers should run through Ray job/head-node execution and use `address = "auto"`; direct non-Ray Kubernetes pods should use Ray Client or job submission rather than the GCS port.

@@ -9,7 +9,7 @@ All entrypoints are run via `uv run <command>` and accept TOML configs via `@ pa
 
 ## `rl` — RL training
 
-Orchestrates the complete RL loop. By default it launches inference server, orchestrator, and trainer as subprocesses; with `experimental.ray.enabled` it runs the single-node Prime-RL config under Ray tasks/Ray Train. Ray inference uses `experimental.ray.inference_backend = "prime_vllm"` to run Prime-RL's existing vLLM server inside a Ray GPU task. If Ray places inference away from the orchestrator, the launcher rewrites default localhost rollout URLs to the inference node IP. The default Ray trainer backend uses one Ray task per trainer rank; `experimental.ray.trainer_backend = "ray_train"` uses Ray Train's `TorchTrainer`.
+Orchestrates the complete RL loop. By default it launches inference server, orchestrator, and trainer as subprocesses; with `experimental.ray.enabled` it runs `single_node` or `ray_cluster` deployment configs under Ray tasks/Ray Train. Ray inference uses `experimental.ray.inference_backend = "prime_vllm"` to run Prime-RL's existing vLLM server inside a Ray GPU task. If Ray places inference away from the orchestrator, the launcher rewrites default localhost rollout URLs to the inference node IP. The default Ray trainer backend uses one Ray task per trainer rank; `experimental.ray.trainer_backend = "ray_train"` uses Ray Train's `TorchTrainer`.
 
 ```bash
 uv run rl @ examples/reverse_text/rl.toml
@@ -27,7 +27,7 @@ uv run rl @ examples/reverse_text/rl.toml --experimental.ray.enabled \
 - **Config:** `RLConfig` (`src/prime_rl/configs/rl.py`)
 - **Entrypoint:** `src/prime_rl/entrypoints/rl.py`
 - **SLURM:** yes — single-node and multi-node
-- **Ray:** experimental fork path for single-node Prime-RL configs, including multi-node RayCluster placement validation. It runs Prime-RL's vLLM inference server and orchestrator as Ray tasks, rewrites local inference client URLs when tasks land on different nodes, and runs trainer ranks either as Ray tasks with explicit torch distributed rank env or through Ray Train's `TorchTrainer` when `experimental.ray.trainer_backend = "ray_train"`.
+- **Ray:** experimental fork path for `deployment.type = "single_node"` and `deployment.type = "ray_cluster"`. The old `multi_node` deployment remains SLURM-shaped. Ray mode runs Prime-RL's vLLM inference server and orchestrator as Ray tasks, rewrites local inference client URLs when tasks land on different nodes, and runs trainer ranks either as Ray tasks with explicit torch distributed rank env or through Ray Train's `TorchTrainer` when `experimental.ray.trainer_backend = "ray_train"`.
 
 ## `sft` — SFT training
 

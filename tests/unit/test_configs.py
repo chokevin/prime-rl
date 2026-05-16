@@ -241,6 +241,132 @@ def test_ray_runtime_config_parses_ray_train_backend():
     assert config.experimental.ray.train_storage_path == "/tmp/ray-train"
 
 
+def test_ray_runtime_config_parses_ray_cluster_deployment(tmp_path):
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "gpus_per_node": 1,
+                "num_train_gpus": 1,
+                "num_infer_gpus": 1,
+            },
+            "experimental": {
+                "ray": {
+                    "enabled": True,
+                    "address": "auto",
+                    "namespace": "test",
+                    "placement_strategy": "SPREAD",
+                    "trainer_backend": "ray_train",
+                    "inference_backend": "prime_vllm",
+                }
+            },
+            "trainer": {"rollout_transport": {"type": "ray", "address": "auto", "namespace": "test"}},
+            "orchestrator": {"rollout_transport": {"type": "ray", "address": "auto", "namespace": "test"}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster.toml"),
+        ],
+    )
+
+    assert config.deployment.type == "ray_cluster"
+    assert config.deployment.num_train_gpus == 1
+    assert config.deployment.num_infer_gpus == 1
+    assert config.experimental.ray.enabled
+    assert config.experimental.ray.placement_strategy == "SPREAD"
+    assert config.experimental.ray.trainer_backend == "ray_train"
+
+
+def test_ray_cluster_deployment_can_be_selected_before_ray_cli_flags(tmp_path):
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "num_train_gpus": 1,
+                "num_infer_gpus": 1,
+            },
+            "trainer": {"rollout_transport": {"type": "ray"}},
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster.toml"),
+            "--experimental.ray.enabled",
+        ],
+    )
+    assert config.deployment.type == "ray_cluster"
+    assert config.experimental.ray.enabled
+
+
+def test_ray_runtime_rejects_slurm_multinode_deployment(tmp_path):
+    write_toml(
+        tmp_path / "ray_multinode.toml",
+        {
+            "deployment": {
+                "type": "multi_node",
+                "num_train_nodes": 1,
+                "num_infer_nodes": 1,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {"rollout_transport": {"type": "ray"}},
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+        },
+    )
+
+    with pytest.raises(ConfigFileError, match="Use deployment.type = 'ray_cluster'"):
+        cli(
+            RLConfig,
+            args=[
+                "@",
+                "examples/reverse_text/rl.toml",
+                "@",
+                str(tmp_path / "ray_multinode.toml"),
+            ],
+        )
+
+
+def test_ray_cluster_inference_bundle_must_fit_one_node(tmp_path):
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "gpus_per_node": 1,
+                "num_train_gpus": 1,
+                "num_infer_gpus": 2,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {"rollout_transport": {"type": "ray"}},
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+        },
+    )
+
+    with pytest.raises(ConfigFileError, match="Prime-vLLM inference is scheduled as one Ray task"):
+        cli(
+            RLConfig,
+            args=[
+                "@",
+                "examples/reverse_text/rl.toml",
+                "@",
+                str(tmp_path / "ray_cluster.toml"),
+            ],
+        )
+
+
 def test_ray_runtime_config_parses_runtime_env(tmp_path):
     config = cli(
         RLConfig,
