@@ -215,31 +215,21 @@ spec:
 
 ## Known AKS caveats
 
-- **H200 node pool networking.** The H200 multi-node RayCluster run in this
-  PR was blocked before Prime-RL by node-pool networking on the H200 pool
-  (kubelet logs/exec returned 504s, H200 pods could not resolve DNS or reach
-  `github.com` / `huggingface.co`). Workers never reached `wait-gcs-ready`
-  past the connectivity check. This is a cluster-side issue. Until it is
-  resolved, RayCluster multi-node validation should be done on A100. The
-  same-node H200 fallback validated the Prime-RL runtime path on three H200
-  GPUs (trainer + primary Prime-vLLM + teacher Prime-vLLM) once caches were
-  staged on `/shared`.
-- **vLLM DeepGEMM warmup on H200 / Hopper FP8.** vLLM 0.20.2 enters the
-  Hopper FP8 DeepGEMM warmup path on H200 even when the model is not FP8 and
-  fails warmup unless `deep_gemm` is installed *and* the runtime accepts it.
-  Set `VLLM_DEEP_GEMM_WARMUP=skip` in the launch Job `env:` on H200 pools.
-  Harmless on A100.
 - **Egress-restricted node pools.** If your AKS node pool restricts outbound
-  to `github.com` and `huggingface.co`, pre-stage the Prime-RL fork checkout
-  and HF cache on the Azure RWX PVC instead of relying on the launch Job to
-  clone and download at run time. Point
-  `experimental.ray.runtime_env.working_dir` and the HF cache env vars at
-  `/shared`.
+  to `github.com` and `huggingface.co` (Azure Firewall, NSG rules, or
+  cluster-egress policy), pre-stage the Prime-RL fork checkout and HF cache
+  on the Azure RWX PVC instead of relying on the launch Job to clone and
+  download at run time. Point `experimental.ray.runtime_env.working_dir` and
+  the HF cache env vars at `/shared`.
 - **DRA preview status.** DRA is still moving through Kubernetes betas; AKS
   exposure varies by cluster version. Verify with `kubectl get deviceclass`
   and `kubectl get resourceclaimtemplates` before adopting the DRA path. If
   DRA is not available on your AKS version, use the `nvidia.com/gpu` shape
   instead — the rest of the manifest is unchanged.
+
+H200 / Hopper FP8 cluster caveats (DeepGEMM warmup, H200 node-pool networking
+quirks observed during validation) are not AKS-specific. See
+[`README.md`](./README.md) → "H200 / FP8 cluster notes" for those.
 
 ## See also
 
