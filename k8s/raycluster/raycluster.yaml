@@ -1,0 +1,119 @@
+# Minimal vendor-neutral RayCluster for Prime-RL.
+#
+# Adapt the following before applying:
+#   - metadata.namespace                       -> your namespace
+#   - spec.headGroupSpec.template ...
+#       containers[0].image                    -> your Prime-RL Ray image
+#       nodeSelector / tolerations             -> your CPU pool selectors
+#   - spec.workerGroupSpecs[0] ...
+#       replicas / minReplicas / maxReplicas   -> total GPU workers
+#       containers[0].image                    -> same image as head
+#       nodeSelector                           -> your GPU pool selectors
+#       resources.limits["nvidia.com/gpu"]     -> 1 (must match num-gpus)
+#   - volumes[].persistentVolumeClaim.claimName
+#                                              -> your RWX PVC bound at /shared
+#
+# Apply with:
+#   kubectl apply -f k8s/raycluster/raycluster.yaml
+#
+# The matching launch Job (k8s/raycluster/rl-launch-job.yaml) submits the
+# Prime-RL `rl` entrypoint to this RayCluster via `ray job submit`.
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: prime-rl-raycluster
+  namespace: prime-rl
+  labels:
+    app.kubernetes.io/name: prime-rl
+    app.kubernetes.io/component: raycluster
+spec:
+  rayVersion: "2.40.0"
+
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      num-cpus: "2"
+      num-gpus: "0"
+    template:
+      metadata:
+        labels:
+          app.kubernetes.io/name: prime-rl
+          app.kubernetes.io/component: raycluster
+          ray.io/group: head
+      spec:
+        # nodeSelector: choose your CPU pool. The head does not need GPUs.
+        # nodeSelector:
+        #   workload: cpu
+        containers:
+          - name: ray-head
+            image: rayproject/ray:2.40.0-py312
+            imagePullPolicy: IfNotPresent
+            ports:
+              - { containerPort: 6379, name: gcs,       protocol: TCP }
+              - { containerPort: 8265, name: dashboard, protocol: TCP }
+              - { containerPort: 10001, name: client,   protocol: TCP }
+            resources:
+              requests: { cpu: "2", memory: "8Gi" }
+              limits:   { cpu: "4", memory: "16Gi" }
+            volumeMounts:
+              - { name: shared,     mountPath: /shared }
+              - { name: shared-mem, mountPath: /dev/shm }
+        volumes:
+          - name: shared
+            persistentVolumeClaim:
+              claimName: prime-rl-shared
+          - name: shared-mem
+            emptyDir: { medium: Memory, sizeLimit: "8Gi" }
+
+  workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 2
+      minReplicas: 2
+      maxReplicas: 2
+      rayStartParams:
+        # num-gpus must match the GPU resource the container actually requests.
+        num-cpus: "8"
+        num-gpus: "1"
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: prime-rl
+            app.kubernetes.io/component: raycluster
+            ray.io/group: gpu-workers
+        spec:
+          # nodeSelector: choose your GPU pool.
+          # nodeSelector:
+          #   accelerator: a100
+          # tolerations:
+          #   - key: nvidia.com/gpu
+          #     operator: Exists
+          #     effect: NoSchedule
+          # Optional: spread one worker per node so trainer and inference
+          # land on distinct GPUs.
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: prime-rl
+                      ray.io/group: gpu-workers
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.40.0-py312
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests: { cpu: "8",  memory: "64Gi"  }
+                limits:
+                  cpu: "16"
+                  memory: "128Gi"
+                  nvidia.com/gpu: "1"
+              volumeMounts:
+                - { name: shared,     mountPath: /shared }
+                - { name: shared-mem, mountPath: /dev/shm }
+          volumes:
+            - name: shared
+              persistentVolumeClaim:
+                claimName: prime-rl-shared
+            - name: shared-mem
+              emptyDir: { medium: Memory, sizeLimit: "32Gi" }

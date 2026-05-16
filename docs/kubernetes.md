@@ -1,8 +1,91 @@
 # Kubernetes
 
-This guide covers deploying PRIME-RL training infrastructure on Kubernetes clusters using the provided Helm chart.
+PRIME-RL on Kubernetes has two paths in this fork. New deployments should use the
+**Ray-native RayCluster** path. The **legacy StatefulSet Helm chart** is kept for
+backwards compatibility with the original SLURM-shaped topology.
 
-For Ray-based experimentation in this fork, see [Ray-native fork architecture](ray.md). The Kubernetes chart remains process-role based: StatefulSets provide stable names and storage for the same trainer, inference, and orchestrator roles that the `rl` entrypoint launches locally.
+## Which Kubernetes path should I use?
+
+| | Ray-native RayCluster (recommended) | Legacy StatefulSet Helm chart |
+|---|---|---|
+| Shape | KubeRay `RayCluster` + Ray placement | One `StatefulSet` per Prime-RL role |
+| Multi-node placement | Ray placement groups, logical `num_train_gpus` / `num_infer_gpus` / `num_teacher_gpus` | Stable DNS per pod, manual `torchrun` rendezvous |
+| Lifecycle supervision | Ray driver fails the whole run on any role crash | Per-pod `kubectl` health; restart semantics per StatefulSet |
+| Cross-node inference URL | Auto-rewritten by the Ray-native runtime | Resolved via the pod DNS env vars on each role |
+| Weight broadcast | Shared `RWX` PVC + Prime-vLLM `/update_weights` | Shared `RWX` PVC + Prime-vLLM `/update_weights` |
+| Teacher inference | Driven by `deployment.num_teacher_gpus` | Manual extra `inference` StatefulSet |
+| Maturity | Validated end-to-end on multi-node A100; single-node validated on H200 | Long-standing chart used by the upstream `kubernetes.md` flow |
+| When to choose | New k8s deployments, especially when you want Ray Train, Ray transport, and logical resource modeling | Clusters that already mirror SLURM topology, or workflows already invested in the chart |
+
+If you do not have a strong reason to stay on the StatefulSet chart, prefer the
+RayCluster path. The rest of this document covers both, starting with the
+recommended path.
+
+---
+
+## Ray-native RayCluster (recommended)
+
+### Quick start
+
+The example manifests live under [`k8s/raycluster/`](../k8s/raycluster/):
+
+```bash
+# 1. Bring up the RayCluster (CPU head + GPU workers).
+kubectl apply -f k8s/raycluster/raycluster.yaml
+
+# 2. Submit the Prime-RL launcher from the head pool.
+kubectl apply -f k8s/raycluster/rl-launch-job.yaml
+
+# 3. Tail the launcher.
+kubectl logs -f -n prime-rl job/prime-rl-launch
+```
+
+See [`k8s/raycluster/README.md`](../k8s/raycluster/README.md) for prerequisites
+(KubeRay operator, GPU operator, shared `ReadWriteMany` PVC) and for the full
+file layout, and see [`docs/ray.md`](ray.md) for the Ray-native architecture and
+the `experimental.ray.*` config reference.
+
+### Why this shape
+
+- **CPU head, GPU workers.** Keeps GPUs reserved for Prime-RL roles instead of
+  GCS/dashboard housekeeping, and lets `placement_strategy = "SPREAD"` put
+  trainer, primary Prime-vLLM, and teacher Prime-vLLM on distinct nodes.
+- **Logical role GPU counts.** `deployment.type = "ray_cluster"` with
+  `num_train_gpus`, `num_infer_gpus`, and `num_teacher_gpus` describes what
+  Prime-RL needs; Ray places the work on whatever RayCluster workers can satisfy
+  the placement group. No `torchrun` rendezvous to hand-roll.
+- **Single shared PVC.** Filesystem weight broadcast, checkpoints, dataset and
+  HF caches, and the Prime-RL checkout all live under `/shared`. This matches
+  the contract used by single-node and SLURM runs, so the rest of the trainer
+  code is unchanged.
+- **Submit from the head, not from outside.** The launcher Job runs on the same
+  pool as the Ray head so `RAY_ADDRESS=auto` resolves via a local raylet. A
+  plain Kubernetes pod that hits the GCS port directly can connect but cannot
+  place workers.
+
+### Validation status
+
+- Multi-node A100 RayCluster: validated end to end (trainer step completed,
+  checkpoint/broadcast/final weights produced, custom Prime-vLLM routes served,
+  `Ray-native RL training finished!` logged).
+- Same-node H200: Prime-RL runtime path validated with trainer + primary
+  Prime-vLLM + teacher Prime-vLLM on three H200 GPUs.
+- Multi-node H200 RayCluster: **not yet validated**. Blocked by node-pool
+  networking on the available H200 pool (kubelet logs/exec 504s and pod DNS
+  failures); not a Prime-RL bug. Fix the node networking first, then the same
+  `k8s/raycluster/` manifests should apply.
+
+---
+
+## Legacy StatefulSet Helm chart
+
+The original Kubernetes path uses a process-role Helm chart: `StatefulSet`s
+provide stable names and storage for the same trainer, inference, and
+orchestrator roles that the `rl` entrypoint launches locally.
+
+Use this path when your cluster already mirrors SLURM topology, or when you
+have existing workflows around the chart that you do not want to rewrite. For
+new deployments prefer the Ray-native path above.
 
 ## Prerequisites
 

@@ -4,6 +4,17 @@ Prime-RL's stable runtime remains process-role based: `rl` writes resolved TOML 
 
 This fork adds a Ray-native runtime path. When `experimental.ray.enabled = true`, Ray launches Prime-RL roles as in-process Ray tasks instead of shelling out to the CLI role commands.
 
+> **Kubernetes-native Prime-RL.** This Ray-native path is the recommended way to
+> run Prime-RL on Kubernetes in this fork. The shape used end to end during
+> validation is a KubeRay `RayCluster` with a CPU head and GPU workers, a single
+> shared `ReadWriteMany` PVC mounted at `/shared`, and a launch Job that submits
+> `rl` to the cluster from the head pool. See [`k8s/raycluster/`](../k8s/raycluster/)
+> for the manifests and [`docs/kubernetes.md`](kubernetes.md) for the
+> "which k8s path should I use" decision matrix. The legacy StatefulSet Helm
+> chart remains available for backwards compatibility but does not get Ray
+> Train, logical role GPU resources, supervised lifecycle, or auto-rewritten
+> cross-node inference URLs.
+
 ```bash
 uv pip install "ray[default,train]>=2.40.0"
 uv run rl @ examples/reverse_text/rl.toml \

@@ -1,0 +1,84 @@
+# Submits the Prime-RL `rl` entrypoint to the RayCluster defined in
+# raycluster.yaml. Runs on the same node pool as the Ray head so that
+# `RAY_ADDRESS=auto` resolves through a local raylet rather than the bare
+# GCS port.
+#
+# Adapt before applying:
+#   - metadata.namespace                  -> match the RayCluster namespace
+#   - PRIME_RL_REPO / PRIME_RL_REF        -> your fork checkout
+#   - RAY_HEAD_SVC                        -> KubeRay head service name
+#   - volumes[].persistentVolumeClaim     -> the same RWX PVC as the RayCluster
+#   - container image                     -> same image as the RayCluster head
+#
+# Apply with:
+#   kubectl apply -f k8s/raycluster/rl-launch-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: prime-rl-launch
+  namespace: prime-rl
+  labels:
+    app.kubernetes.io/name: prime-rl
+    app.kubernetes.io/component: launcher
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prime-rl
+        app.kubernetes.io/component: launcher
+    spec:
+      restartPolicy: Never
+      # nodeSelector: same CPU pool as the Ray head, so RAY_ADDRESS=auto
+      # finds the local raylet.
+      # nodeSelector:
+      #   workload: cpu
+      containers:
+        - name: launcher
+          image: rayproject/ray:2.40.0-py312
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: PRIME_RL_REPO, value: "https://github.com/chokevin/prime-rl.git" }
+            - { name: PRIME_RL_REF,  value: "chokevin/chore-ray-native-architecture" }
+            - { name: RAY_HEAD_SVC,  value: "prime-rl-raycluster-head-svc" }
+            - { name: RAY_ADDRESS,   value: "auto" }
+            # Set this on H200 / Hopper FP8 paths where vLLM picks
+            # DeepGEMM warmup. Harmless on A100.
+            # - { name: VLLM_DEEP_GEMM_WARMUP, value: "skip" }
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+
+              CHECKOUT=/shared/checkouts/prime-rl
+              RUN_ID="${RUN_ID:-prime-rl-$(date -u +%Y%m%dT%H%M%SZ)}"
+              OUT=/shared/outputs/${RUN_ID}
+              mkdir -p "${OUT}"
+
+              # Stage the fork once per shared PVC; subsequent runs reuse it.
+              if [ ! -d "${CHECKOUT}/.git" ]; then
+                git clone --depth 1 --branch "${PRIME_RL_REF}" \
+                  "${PRIME_RL_REPO}" "${CHECKOUT}"
+              fi
+              ( cd "${CHECKOUT}" && git rev-parse HEAD ) > "${OUT}/prime-rl-commit.txt"
+
+              # The launcher must run on a Ray head/worker so it has a local
+              # raylet; RAY_ADDRESS=auto then attaches without GCS-port hacks.
+              cd "${CHECKOUT}"
+              export PYTHONPATH="${CHECKOUT}/src:${CHECKOUT}/packages/prime-rl-configs/src:${PYTHONPATH:-}"
+
+              ray job submit \
+                --address "http://${RAY_HEAD_SVC}:8265" \
+                --working-dir "${CHECKOUT}" \
+                --no-wait=false \
+                --submission-id "${RUN_ID}" \
+                -- \
+                uv run rl @ /shared/checkouts/prime-rl/k8s/raycluster/rl-example.toml \
+                  --output-dir "${OUT}" \
+                  --run-name "${RUN_ID}"
+          volumeMounts:
+            - { name: shared, mountPath: /shared }
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: prime-rl-shared
