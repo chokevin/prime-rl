@@ -16,7 +16,7 @@ uv run rl @ examples/reverse_text/rl.toml \
 
 - **Role lifecycle**: Ray tasks run inference and orchestrator; trainer ranks run either as direct Ray tasks or Ray Train workers.
 - **Placement accounting**: the Ray task backend reserves inference GPUs and one GPU per trainer rank in a placement group. The Ray Train backend lets `TorchTrainer` own the trainer worker placement group.
-- **Inference backend**: `experimental.ray.inference_backend = "prime_vllm"` runs Prime-RL's existing vLLM server in a Ray GPU task, preserving custom routes and filesystem/NCCL weight updates. When the orchestrator client still points at localhost, Ray-native startup rewrites that rollout URL to the Ray node IP that hosts the inference task.
+- **Inference backend**: `experimental.ray.inference_backend = "prime_vllm"` runs Prime-RL's existing vLLM server in a Ray GPU task, preserving custom routes and filesystem/NCCL weight updates. When the orchestrator client still points at localhost, Ray-native startup rewrites rollout and teacher-model URLs to the Ray node IPs that host the corresponding inference tasks.
 - **Distributed trainer execution**: by default Ray trainer tasks set `RANK`, `WORLD_SIZE`, `LOCAL_RANK`, `LOCAL_WORLD_SIZE`, `MASTER_ADDR`, and `MASTER_PORT`, then call `train(config)`. With `experimental.ray.trainer_backend = "ray_train"`, `ray.train.torch.TorchTrainer` owns trainer worker orchestration and Prime-RL reuses Ray Train's distributed process group.
 - **Failure surfacing**: failed Ray role tasks fail the run and point at the role log file.
 - **Rollout transport**: `rollout_transport.type = "ray"` moves `TrainingBatch` and packed micro-batches through a named Ray actor instead of filesystem or ZMQ.
@@ -102,7 +102,7 @@ The supported Ray inference backend is `prime_vllm`. It deliberately reuses the 
 
 Ray owns placement, lifecycle, and log/failure surfacing for this server. It does not replace the server implementation with Ray Serve LLM.
 
-For multi-node RayCluster, `prime_vllm` is not assumed to be colocated with the orchestrator. The launcher probes the inference placement bundle, gets that Ray node's IP, and rewrites local rollout/admin client URLs such as `http://localhost:8000/v1` to `http://<inference-node-ip>:8000/v1` in the orchestrator config copy passed to the Ray task. Non-local or elastic client URLs are preserved.
+For multi-node RayCluster, `prime_vllm` is not assumed to be colocated with the orchestrator. The launcher probes the inference placement bundle, gets that Ray node's IP, and rewrites local rollout/admin client URLs such as `http://localhost:8000/v1` to `http://<inference-node-ip>:8000/v1` in the orchestrator config copy passed to the Ray task. If `deployment.num_teacher_gpus` configures a teacher inference server, the same rewrite is applied to `orchestrator.teacher_model.client` using the teacher inference task's Ray node IP. Non-local or elastic client URLs are preserved.
 
 ## Ray Serve and weight sharing assessment
 
@@ -119,6 +119,7 @@ Ray Train checkpoint/storage APIs are the right durable checkpoint path, but Ray
 - `trainer.rollout_transport.type` and `orchestrator.rollout_transport.type` must both be `ray`.
 - The Ray-native `rl` launcher owns the shared transport actor; Ray transport workers fail fast if that actor is missing instead of creating disconnected queues.
 - Ray Train support is experimental and targets the same logical role GPU counts as the Ray task backend.
+- RayCluster teacher inference is supported when `deployment.num_teacher_gpus` is set; the launcher starts the teacher as a Prime-vLLM Ray task and rewrites local teacher-model client URLs to that task's Ray node IP.
 - Ray Serve is not used yet because `prime_vllm` is the supported Ray inference backend and relies on Prime-RL's custom vLLM endpoints.
 - Multi-node RayCluster validation requires a shared checkout or Ray `runtime_env` because remote Ray worker pods cannot see a driver pod's local `/tmp` clone.
 - Multi-node RayCluster drivers should run through Ray job/head-node execution and use `address = "auto"`; direct non-Ray Kubernetes pods should use Ray Client or job submission rather than the GCS port.

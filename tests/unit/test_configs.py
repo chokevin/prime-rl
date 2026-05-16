@@ -7,13 +7,17 @@ from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from pydantic_config import ConfigFileError
 
 from prime_rl.configs.inference import InferenceConfig
-from prime_rl.configs.orchestrator import OrchestratorConfig
+from prime_rl.configs.orchestrator import OrchestratorConfig, TeacherModelConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
 from prime_rl.configs.shared import TransportConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
-from prime_rl.ray.native import _monitor_roles, _orchestrator_with_ray_inference_endpoint
+from prime_rl.ray.native import (
+    _monitor_roles,
+    _orchestrator_with_ray_inference_endpoint,
+    _orchestrator_with_ray_teacher_endpoint,
+)
 from prime_rl.transport.ray import _RayTransportStore
 from prime_rl.utils.config import BaseConfig, cli
 
@@ -368,6 +372,43 @@ def test_ray_cluster_inference_bundle_must_fit_one_node(tmp_path):
         )
 
 
+def test_ray_cluster_num_teacher_gpus_auto_configures_teacher_model(tmp_path):
+    write_toml(
+        tmp_path / "ray_cluster_teacher.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "num_train_gpus": 1,
+                "num_infer_gpus": 1,
+                "num_teacher_gpus": 1,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {
+                "rollout_transport": {"type": "ray"},
+                "loss": {"teacher_tau": 1.0},
+            },
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster_teacher.toml"),
+        ],
+    )
+
+    assert config.deployment.type == "ray_cluster"
+    assert config.teacher_inference is not None
+    assert config.teacher_inference.server.port == config.inference.server.port + 1
+    assert config.orchestrator.teacher_model is not None
+    assert config.orchestrator.teacher_model.client.base_url == ["http://localhost:8001/v1"]
+    assert config.orchestrator.teacher_model.model.name == config.teacher_inference.model.name
+
+
 def test_ray_runtime_config_parses_runtime_env(tmp_path):
     config = cli(
         RLConfig,
@@ -470,6 +511,19 @@ def test_ray_native_preserves_external_inference_client_urls():
     rewritten = _orchestrator_with_ray_inference_endpoint(orchestrator, inference, "10.0.4.184")
 
     assert rewritten.client.base_url == ["http://inference.ray.svc.cluster.local:8000/v1"]
+
+
+def test_ray_native_rewrites_local_teacher_inference_client_urls():
+    orchestrator = OrchestratorConfig()
+    orchestrator.teacher_model = TeacherModelConfig()
+    orchestrator.teacher_model.client.base_url = ["http://0.0.0.0:8001/v1"]
+    teacher_inference = InferenceConfig()
+    teacher_inference.server.port = 8124
+
+    rewritten = _orchestrator_with_ray_teacher_endpoint(orchestrator, teacher_inference, "10.0.9.162")
+
+    assert rewritten.teacher_model.client.base_url == ["http://10.0.9.162:8124/v1"]
+    assert orchestrator.teacher_model.client.base_url == ["http://0.0.0.0:8001/v1"]
 
 
 def test_ray_transport_config_reclaim_stale_actor_defaults_false():

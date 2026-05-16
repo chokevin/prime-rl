@@ -110,6 +110,21 @@ def _orchestrator_with_ray_inference_endpoint(
     return config
 
 
+def _orchestrator_with_ray_teacher_endpoint(
+    config: OrchestratorConfig, teacher_inference_config: InferenceConfig, host: str
+) -> OrchestratorConfig:
+    config = config.model_copy(deep=True)
+    if config.teacher_model is None:
+        raise ValueError(
+            "Ray-native teacher_inference requires orchestrator.teacher_model. "
+            "Set deployment.num_teacher_gpus to auto-configure it or configure orchestrator.teacher_model manually."
+        )
+    port = teacher_inference_config.server.port
+    if _rewrite_local_client_urls(config.teacher_model.client, host, port):
+        get_logger().info(f"Using Ray teacher inference endpoint http://{host}:{port}/v1 for teacher logprobs")
+    return config
+
+
 def _init_ray(config: RLConfig):
     ray = require_ray()
     ray_config = config.experimental.ray
@@ -240,6 +255,11 @@ def run_ray_native(
         if config.teacher_inference is not None:
             if ray_config.inference_backend != "prime_vllm":
                 raise ValueError(f"Unsupported Ray inference backend: {ray_config.inference_backend}")
+            ip_task = ray.remote(_get_worker_node_ip).options(num_cpus=0, scheduling_strategy=strategy(bundle_idx))
+            teacher_inference_host = ray.get(ip_task.remote())
+            orchestrator_config = _orchestrator_with_ray_teacher_endpoint(
+                orchestrator_config, config.teacher_inference, teacher_inference_host
+            )
             log_path = log_dir / "teacher_inference.log"
             ref = start_prime_vllm_inference(
                 ray,

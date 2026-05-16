@@ -637,7 +637,7 @@ class RLConfig(BaseConfig):
     def validate_teacher_model(self):
         if (
             self.trainer.loss.type == "default" and self.trainer.loss.teacher_tau > 0
-        ) and not self.orchestrator.teacher_model:
+        ) and not self.orchestrator.teacher_model and not getattr(self.deployment, "num_teacher_gpus", None):
             raise ValueError(
                 "teacher_model must be configured when teacher_tau > 0. "
                 "Either set teacher_tau = 0, set deployment.num_teacher_gpus, or configure teacher_model manually."
@@ -1144,7 +1144,7 @@ class RLConfig(BaseConfig):
     @model_validator(mode="after")
     def auto_setup_teacher_inference(self):
         """Auto-configure teacher inference server and orchestrator teacher_model client."""
-        if self.deployment.type != "single_node":
+        if self.deployment.type not in ("single_node", "ray_cluster"):
             return self
         if self.deployment.num_teacher_gpus is None or self.deployment.num_teacher_gpus == 0:
             return self
