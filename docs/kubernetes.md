@@ -2,6 +2,8 @@
 
 This guide covers deploying PRIME-RL training infrastructure on Kubernetes clusters using the provided Helm chart.
 
+For Ray-based experimentation in this fork, see [Ray-native fork architecture](ray.md). The Kubernetes chart remains process-role based: StatefulSets provide stable names and storage for the same trainer, inference, and orchestrator roles that the `rl` entrypoint launches locally.
+
 ## Prerequisites
 
 - Kubernetes cluster with GPU nodes

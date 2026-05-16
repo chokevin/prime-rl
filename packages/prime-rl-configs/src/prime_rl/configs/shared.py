@@ -552,4 +552,32 @@ class ZMQTransportConfig(BaseTransportConfig):
     hwm: Annotated[int, Field(description="High water mark (max messages in queue) for ZMQ sockets.")] = 10
 
 
-TransportConfig: TypeAlias = Annotated[FileSystemTransportConfig | ZMQTransportConfig, Field(discriminator="type")]
+class RayTransportConfig(BaseTransportConfig):
+    """Configures Ray actor based transport for training examples."""
+
+    type: Literal["ray"] = "ray"
+    address: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Ray cluster address used by trainer/orchestrator role workers. "
+                "Use 'auto' to attach to the active local cluster."
+            )
+        ),
+    ] = "auto"
+    namespace: Annotated[str, Field(description="Ray namespace for the shared transport actor.")] = "prime-rl"
+    actor_name: Annotated[str, Field(description="Name of the Ray actor that stores rollout batches.")] = (
+        "prime-rl-transport"
+    )
+    max_queued_items: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Maximum queued training or micro-batch payloads before senders fail with backpressure.",
+        ),
+    ] = 64
+
+
+TransportConfig: TypeAlias = Annotated[
+    FileSystemTransportConfig | ZMQTransportConfig | RayTransportConfig, Field(discriminator="type")
+]

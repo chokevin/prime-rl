@@ -153,6 +153,36 @@ uv run sft --data.type fake --data.batch-size 4
 
 If you wish to configure values of the default variant, you don't need to set the `type` field.
 
+### Ray-native fork settings
+
+The fork-first Ray runtime is explicit and experimental. Enable Ray-native roles under `[experimental.ray]`:
+
+```toml
+[experimental.ray]
+enabled = true
+namespace = "prime-rl"
+```
+
+Ray-native mode is validated to local `single_node` runs without SLURM. It runs inference, orchestrator, and trainer rank workers as in-process Ray tasks. The trainer rank tasks set torch distributed rank environment and call `train(config)` directly; they do not shell out to `torchrun`.
+
+Ray-native mode requires Ray rollout transport on both trainer and orchestrator:
+
+```toml
+[trainer.rollout_transport]
+type = "ray"
+address = "auto"
+namespace = "prime-rl"
+actor_name = "prime-rl-transport"
+
+[orchestrator.rollout_transport]
+type = "ray"
+address = "auto"
+namespace = "prime-rl"
+actor_name = "prime-rl-transport"
+```
+
+Use `address = "auto"` when trainer and orchestrator Ray tasks should attach to the Ray runtime started by the native launcher.
+
 ### SFT hard distill override
 
 For hosted multi-tenant runs where the trainer image's `trainer.loss.type` is fixed, the orchestrator exposes a per-run override that forces SFT loss on every micro-batch without rebuilding the trainer. Set `orchestrator.use_sft_loss = true` alongside `orchestrator.teacher_rollout_model`; both must be configured together (the orchestrator validator enforces this). The orchestrator stamps each `TrainingSample.sft_loss = True`, which the trainer's `compute_loss` honors by dispatching to `sft_loss_fn` per batch — independent of the trainer's configured default loss.

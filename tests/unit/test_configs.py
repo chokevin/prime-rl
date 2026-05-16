@@ -3,13 +3,14 @@ from typing import Annotated, Literal
 
 import pytest
 import tomli_w
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from pydantic_config import ConfigFileError
 
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
+from prime_rl.configs.shared import TransportConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.utils.config import BaseConfig, cli
@@ -159,3 +160,87 @@ def test_removed_fused_lm_head_chunk_size_field_is_rejected():
 def test_selective_activation_checkpointing_requires_custom_impl():
     with pytest.raises(ValidationError, match="Selective activation checkpointing requires model.impl='custom'"):
         TrainerModelConfig.model_validate({"impl": "hf", "ac": {"mode": "selective"}})
+
+
+def test_ray_runtime_config_requires_ray_transport():
+    with pytest.raises(ValidationError, match="rollout_transport.type = 'ray'"):
+        cli(
+            RLConfig,
+            args=[
+                "@",
+                "examples/reverse_text/rl.toml",
+                "--experimental.ray.enabled",
+            ],
+        )
+
+
+def test_ray_runtime_config_parses_with_ray_transport():
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "--experimental.ray.enabled",
+            "--experimental.ray.namespace",
+            "test",
+            "--trainer.rollout-transport.type",
+            "ray",
+            "--orchestrator.rollout-transport.type",
+            "ray",
+        ],
+    )
+    assert config.experimental.ray.enabled
+    assert config.experimental.ray.namespace == "test"
+    assert config.experimental.ray.placement_strategy == "STRICT_PACK"
+    assert config.trainer.rollout_transport.type == "ray"
+    assert config.orchestrator.rollout_transport.type == "ray"
+
+
+def test_ray_runtime_config_requires_matching_actor_name():
+    with pytest.raises(ValidationError, match="same actor_name"):
+        cli(
+            RLConfig,
+            args=[
+                "@",
+                "examples/reverse_text/rl.toml",
+                "--experimental.ray.enabled",
+                "--trainer.rollout-transport.type",
+                "ray",
+                "--trainer.rollout-transport.actor-name",
+                "trainer-transport",
+                "--orchestrator.rollout-transport.type",
+                "ray",
+                "--orchestrator.rollout-transport.actor-name",
+                "orchestrator-transport",
+            ],
+        )
+
+
+def test_ray_runtime_config_requires_matching_namespace():
+    with pytest.raises(ValidationError, match="same namespace"):
+        cli(
+            RLConfig,
+            args=[
+                "@",
+                "examples/reverse_text/rl.toml",
+                "--experimental.ray.enabled",
+                "--trainer.rollout-transport.type",
+                "ray",
+                "--trainer.rollout-transport.namespace",
+                "trainer",
+                "--orchestrator.rollout-transport.type",
+                "ray",
+                "--orchestrator.rollout-transport.namespace",
+                "orchestrator",
+            ],
+        )
+
+
+def test_ray_transport_config_parses():
+    transport = TypeAdapter(TransportConfig).validate_python(
+        {"type": "ray", "address": "auto", "namespace": "test", "actor_name": "transport"}
+    )
+    assert transport.type == "ray"
+    assert transport.address == "auto"
+    assert transport.namespace == "test"
+    assert transport.actor_name == "transport"

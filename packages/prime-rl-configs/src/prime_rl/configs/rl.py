@@ -52,8 +52,77 @@ from prime_rl.utils.validation import (
 )
 
 
+class RayRuntimeConfig(BaseConfig):
+    """Configures experimental Ray-native RL training."""
+
+    enabled: Annotated[
+        bool,
+        Field(
+            description=(
+                "Start local single-node RL roles as in-process Ray tasks. "
+                "Inference, orchestrator, and trainer rank workers call Prime-RL Python functions directly."
+            )
+        ),
+    ] = False
+
+    address: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Ray cluster address for the launcher. If unset, ray.init starts or connects using Ray defaults."
+            )
+        ),
+    ] = None
+
+    namespace: Annotated[str, Field(description="Ray namespace for native role tasks and transport actors.")] = "prime-rl"
+
+    log_to_driver: Annotated[
+        bool,
+        Field(description="Forward Ray worker logs to the launcher driver."),
+    ] = False
+
+    role_num_cpus: Annotated[
+        float,
+        Field(
+            gt=0,
+            description="CPU resources reserved for each Ray inference/orchestrator role task.",
+        ),
+    ] = 1.0
+
+    trainer_worker_num_cpus: Annotated[
+        float,
+        Field(
+            gt=0,
+            description="CPU resources reserved for each Ray trainer rank task.",
+        ),
+    ] = 1.0
+
+    placement_strategy: Annotated[
+        Literal["PACK", "SPREAD", "STRICT_PACK", "STRICT_SPREAD"],
+        Field(
+            description=(
+                "Ray placement group strategy for the native RL role tasks. "
+                "STRICT_PACK keeps the single-node deployment on one Ray node."
+            )
+        ),
+    ] = "STRICT_PACK"
+
+    poll_interval_seconds: Annotated[
+        float,
+        Field(
+            gt=0,
+            description="Seconds between Ray role status polls.",
+        ),
+    ] = 1.0
+
+
 class RLExperimentalConfig(BaseConfig):
     """Experimental features for RL training."""
+
+    ray: Annotated[
+        RayRuntimeConfig,
+        Field(description="Experimental Ray-native runtime settings."),
+    ] = RayRuntimeConfig()
 
 
 class SharedLogConfig(BaseConfig):
@@ -384,6 +453,25 @@ class RLConfig(BaseConfig):
                     "Must use fake data (trainer.data.fake or bench = true) when num_infer_nodes = 0, "
                     "since no orchestrator or inference server will be running."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_ray_runtime(self):
+        if not self.experimental.ray.enabled:
+            return self
+        if self.slurm is not None:
+            raise ValueError("experimental.ray.enabled is only supported for local runs without SLURM.")
+        if self.deployment.type != "single_node":
+            raise ValueError("experimental.ray.enabled currently supports only single_node deployment.")
+        if self.trainer.rollout_transport.type != "ray" or self.orchestrator.rollout_transport.type != "ray":
+            raise ValueError(
+                "experimental.ray.enabled requires trainer.rollout_transport.type = 'ray' and "
+                "orchestrator.rollout_transport.type = 'ray'."
+            )
+        if self.trainer.rollout_transport.actor_name != self.orchestrator.rollout_transport.actor_name:
+            raise ValueError("Ray trainer and orchestrator rollout transports must use the same actor_name.")
+        if self.trainer.rollout_transport.namespace != self.orchestrator.rollout_transport.namespace:
+            raise ValueError("Ray trainer and orchestrator rollout transports must use the same namespace.")
         return self
 
     # TODO: fix this
