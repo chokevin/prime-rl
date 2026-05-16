@@ -163,7 +163,7 @@ enabled = true
 namespace = "prime-rl"
 ```
 
-Ray-native mode is validated to local `single_node` runs without SLURM. It runs inference, orchestrator, and trainer rank workers as in-process Ray tasks. The trainer rank tasks set torch distributed rank environment and call `train(config)` directly; they do not shell out to `torchrun`.
+Ray-native mode is validated to local `single_node` runs without SLURM. It runs inference and orchestrator workers as in-process Ray tasks. By default, trainer rank workers also run as Ray tasks and call `train(config)` directly. Set `experimental.ray.trainer_backend = "ray_train"` to run trainer workers through Ray Train's `TorchTrainer` instead.
 
 Ray-native mode requires Ray rollout transport on both trainer and orchestrator:
 
@@ -182,6 +182,17 @@ actor_name = "prime-rl-transport"
 ```
 
 Use `address = "auto"` when trainer and orchestrator Ray tasks should attach to the Ray runtime started by the native launcher.
+
+Optional Ray Train settings live under `[experimental.ray]`:
+
+```toml
+[experimental.ray]
+trainer_backend = "ray_train"
+train_run_name = "my-run"
+train_storage_path = "/shared/ray-train"
+```
+
+Use shared `train_storage_path` for future multi-node RayCluster validation. The current Ray Train backend still keeps Prime-RL's vLLM inference and filesystem/NCCL weight broadcast contracts.
 
 ### SFT hard distill override
 

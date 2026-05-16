@@ -192,8 +192,33 @@ def test_ray_runtime_config_parses_with_ray_transport():
     assert config.experimental.ray.enabled
     assert config.experimental.ray.namespace == "test"
     assert config.experimental.ray.placement_strategy == "STRICT_PACK"
+    assert config.experimental.ray.trainer_backend == "tasks"
     assert config.trainer.rollout_transport.type == "ray"
     assert config.orchestrator.rollout_transport.type == "ray"
+
+
+def test_ray_runtime_config_parses_ray_train_backend():
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "--experimental.ray.enabled",
+            "--experimental.ray.trainer-backend",
+            "ray_train",
+            "--experimental.ray.train-run-name",
+            "test-run",
+            "--experimental.ray.train-storage-path",
+            "/tmp/ray-train",
+            "--trainer.rollout-transport.type",
+            "ray",
+            "--orchestrator.rollout-transport.type",
+            "ray",
+        ],
+    )
+    assert config.experimental.ray.trainer_backend == "ray_train"
+    assert config.experimental.ray.train_run_name == "test-run"
+    assert config.experimental.ray.train_storage_path == "/tmp/ray-train"
 
 
 def test_ray_runtime_config_requires_matching_actor_name():

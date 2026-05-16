@@ -140,6 +140,10 @@ def setup_torch_distributed(timeout: timedelta = DEFAULT_TIMEOUT, enable_gloo: b
         get_logger().info("Using Gloo backend for CPU and NCCL backend for GPU")
         backend = "cpu:gloo,cuda:nccl"
 
+    if dist.is_initialized():
+        get_logger().info("Reusing existing torch.distributed process group")
+        return
+
     dist.init_process_group(backend=backend, timeout=timeout, device_id=device_id)
 
 

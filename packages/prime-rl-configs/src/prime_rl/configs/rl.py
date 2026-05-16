@@ -107,6 +107,32 @@ class RayRuntimeConfig(BaseConfig):
         ),
     ] = "STRICT_PACK"
 
+    trainer_backend: Annotated[
+        Literal["tasks", "ray_train"],
+        Field(
+            description=(
+                "Backend for trainer execution in Ray-native mode. "
+                "'tasks' launches one Ray GPU task per rank and emulates torchrun. "
+                "'ray_train' uses ray.train.torch.TorchTrainer to own trainer worker orchestration."
+            )
+        ),
+    ] = "tasks"
+
+    train_run_name: Annotated[
+        str | None,
+        Field(description="Optional Ray Train run name when trainer_backend = 'ray_train'."),
+    ] = None
+
+    train_storage_path: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional Ray Train storage_path when trainer_backend = 'ray_train'. "
+                "Use shared storage for future multi-node RayCluster validation."
+            )
+        ),
+    ] = None
+
     poll_interval_seconds: Annotated[
         float,
         Field(
@@ -472,6 +498,8 @@ class RLConfig(BaseConfig):
             raise ValueError("Ray trainer and orchestrator rollout transports must use the same actor_name.")
         if self.trainer.rollout_transport.namespace != self.orchestrator.rollout_transport.namespace:
             raise ValueError("Ray trainer and orchestrator rollout transports must use the same namespace.")
+        if self.experimental.ray.trainer_backend == "ray_train" and self.deployment.num_train_gpus < 1:
+            raise ValueError("experimental.ray.trainer_backend = 'ray_train' requires at least one trainer GPU.")
         return self
 
     # TODO: fix this

@@ -9,7 +9,7 @@ All entrypoints are run via `uv run <command>` and accept TOML configs via `@ pa
 
 ## `rl` — RL training
 
-Orchestrates the complete RL loop. By default it launches inference server, orchestrator, and trainer as subprocesses; with `experimental.ray.enabled` it runs the local single-node roles as Ray tasks.
+Orchestrates the complete RL loop. By default it launches inference server, orchestrator, and trainer as subprocesses; with `experimental.ray.enabled` it runs the local single-node roles under Ray. The default Ray trainer backend uses one Ray task per trainer rank; `experimental.ray.trainer_backend = "ray_train"` uses Ray Train's `TorchTrainer`.
 
 ```bash
 uv run rl @ examples/reverse_text/rl.toml
@@ -18,12 +18,16 @@ uv run rl @ examples/reverse_text/rl.toml --dry-run # generate scripts without r
 uv run rl @ examples/reverse_text/rl.toml --experimental.ray.enabled \
   --trainer.rollout-transport.type ray \
   --orchestrator.rollout-transport.type ray # experimental Ray-native path
+uv run rl @ examples/reverse_text/rl.toml --experimental.ray.enabled \
+  --experimental.ray.trainer-backend ray_train \
+  --trainer.rollout-transport.type ray \
+  --orchestrator.rollout-transport.type ray # experimental Ray Train trainer backend
 ```
 
 - **Config:** `RLConfig` (`src/prime_rl/configs/rl.py`)
 - **Entrypoint:** `src/prime_rl/entrypoints/rl.py`
 - **SLURM:** yes — single-node and multi-node
-- **Ray:** experimental fork path for local single-node runs only. It runs inference, orchestrator, and trainer ranks as Ray tasks. Trainer ranks call `train(config)` directly with Ray-assigned GPUs and explicit torch distributed rank env.
+- **Ray:** experimental fork path for local single-node runs only. It runs inference and orchestrator as Ray tasks. Trainer ranks either run as Ray tasks with explicit torch distributed rank env or through Ray Train's `TorchTrainer` when `experimental.ray.trainer_backend = "ray_train"`.
 
 ## `sft` — SFT training
 

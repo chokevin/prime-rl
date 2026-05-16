@@ -5,7 +5,7 @@ Prime-RL's stable runtime remains process-role based: `rl` writes resolved TOML 
 This fork adds a Ray-native runtime path. When `experimental.ray.enabled = true`, Ray launches Prime-RL roles as in-process Ray tasks instead of shelling out to the CLI role commands.
 
 ```bash
-uv pip install "ray[default]>=2.40.0"
+uv pip install "ray[default,train]>=2.40.0"
 uv run rl @ examples/reverse_text/rl.toml \
   --experimental.ray.enabled \
   --trainer.rollout-transport.type ray \
@@ -14,13 +14,13 @@ uv run rl @ examples/reverse_text/rl.toml \
 
 ## What Ray owns
 
-- **Role lifecycle**: Ray tasks run inference, orchestrator, and trainer ranks directly.
-- **Placement accounting**: a Ray placement group reserves the configured inference GPUs and one GPU per trainer rank.
-- **Distributed trainer rank env**: Ray trainer tasks set `RANK`, `WORLD_SIZE`, `LOCAL_RANK`, `LOCAL_WORLD_SIZE`, `MASTER_ADDR`, and `MASTER_PORT`, then call `train(config)`.
+- **Role lifecycle**: Ray tasks run inference and orchestrator; trainer ranks run either as direct Ray tasks or Ray Train workers.
+- **Placement accounting**: the Ray task backend reserves inference GPUs and one GPU per trainer rank in a placement group. The Ray Train backend lets `TorchTrainer` own the trainer worker placement group.
+- **Distributed trainer execution**: by default Ray trainer tasks set `RANK`, `WORLD_SIZE`, `LOCAL_RANK`, `LOCAL_WORLD_SIZE`, `MASTER_ADDR`, and `MASTER_PORT`, then call `train(config)`. With `experimental.ray.trainer_backend = "ray_train"`, `ray.train.torch.TorchTrainer` owns trainer worker orchestration and Prime-RL reuses Ray Train's distributed process group.
 - **Failure surfacing**: failed Ray role tasks fail the run and point at the role log file.
 - **Rollout transport**: `rollout_transport.type = "ray"` moves `TrainingBatch` and packed micro-batches through a named Ray actor instead of filesystem or ZMQ.
 
-Inference calls Prime-RL's Python `inference_local(config)` function inside a Ray GPU task. The orchestrator calls `asyncio.run(orchestrate(config))`. Trainer ranks call `train(config)` directly after Ray assigns GPUs and rank environment.
+Inference calls Prime-RL's Python `inference_local(config)` function inside a Ray GPU task. The orchestrator calls `asyncio.run(orchestrate(config))`. Trainer ranks call `train(config)` directly after Ray assigns GPUs and rank environment, or through Ray Train workers when `trainer_backend = "ray_train"`.
 
 ## Example config
 
@@ -29,6 +29,7 @@ Inference calls Prime-RL's Python `inference_local(config)` function inside a Ra
 enabled = true
 namespace = "prime-rl"
 placement_strategy = "STRICT_PACK"
+trainer_backend = "tasks"  # or "ray_train"
 
 [trainer.rollout_transport]
 type = "ray"
@@ -47,6 +48,26 @@ actor_name = "prime-rl-transport"
 
 Prime-RL disables Ray's automatic `uv run` runtime-env propagation for this path so Ray workers use the same active Python environment as the launcher. Install Ray into the active environment before launching `rl`.
 
+## Ray Train backend
+
+Set `experimental.ray.trainer_backend = "ray_train"` to run trainer ranks with `ray.train.torch.TorchTrainer` instead of one manual Ray task per rank:
+
+```bash
+uv run rl @ examples/reverse_text/rl.toml \
+  --experimental.ray.enabled \
+  --experimental.ray.trainer-backend ray_train \
+  --trainer.rollout-transport.type ray \
+  --orchestrator.rollout-transport.type ray
+```
+
+The Ray Train backend keeps Prime-RL's existing trainer loop and calls `train(config)` inside each Ray Train worker. The trainer setup code reuses an already-initialized Ray Train `torch.distributed` process group instead of calling `dist.init_process_group` a second time. `experimental.ray.train_run_name` and `experimental.ray.train_storage_path` are passed to Ray Train's `RunConfig` when set; use shared storage for future multi-node RayCluster validation.
+
+## Ray Serve and weight sharing assessment
+
+Ray supports vLLM through Ray Serve LLM and Ray Data LLM, but those APIs do not directly replace Prime-RL's current vLLM server contract. Prime-RL depends on custom endpoints such as `/v1/chat/completions/tokens`, `/pause`, `/resume`, `/update_weights`, `/liveness`, and `/init_broadcaster`. A Ray Serve backend needs a Prime-RL compatibility facade before it can replace the current vLLM server.
+
+Ray Train checkpoint/storage APIs are the right durable checkpoint path, but Ray's object store is not a reliable cluster-wide weight broadcast bus for full model updates. For now, Ray-native runs keep the existing filesystem or NCCL weight broadcast backends while the Ray-specific broadcast mechanism remains a separate spike.
+
 ## Current constraints
 
 - Only `deployment.type = "single_node"` is supported.
@@ -54,7 +75,7 @@ Prime-RL disables Ray's automatic `uv run` runtime-env propagation for this path
 - Ray is an optional runtime dependency for this fork; non-Ray Prime-RL paths do not import Ray.
 - `trainer.rollout_transport.type` and `orchestrator.rollout_transport.type` must both be `ray`.
 - The Ray-native `rl` launcher owns the shared transport actor; Ray transport workers fail fast if that actor is missing instead of creating disconnected queues.
-- Ray Train is not used yet; the fork maps Ray trainer tasks onto Prime-RL's existing `torch.distributed` trainer by setting rank environment explicitly.
+- Ray Train support is experimental and currently targets the same local `single_node` deployment as the Ray task backend.
 - Ray Serve is not used yet because inference is vLLM-native and relies on Prime-RL's custom vLLM endpoints.
 
 ## Verifier and rollout actor assessment

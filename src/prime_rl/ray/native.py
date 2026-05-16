@@ -1,38 +1,20 @@
 import asyncio
 import json
-import os
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.shared import RayTransportConfig
 from prime_rl.configs.trainer import TrainerConfig
+from prime_rl.ray._utils import require_ray, role_context
 from prime_rl.transport.ray import create_ray_transport_actor
 from prime_rl.utils.process import set_proc_title
 
 
-@contextmanager
-def _role_context(env: dict[str, str], log_path: Path) -> Iterator[None]:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    old_env = {key: os.environ.get(key) for key in env}
-    os.environ.update(env)
-    with open(log_path, "w") as log_file:
-        with redirect_stdout(log_file), redirect_stderr(log_file):
-            try:
-                yield
-            finally:
-                for key, value in old_env.items():
-                    if value is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = value
-
-
 def _run_inference_role(config: InferenceConfig, env: dict[str, str], log_path: Path) -> None:
-    with _role_context(env, log_path):
+    with role_context(env, log_path):
         set_proc_title("RayInference")
         from prime_rl.entrypoints.inference import inference_local
 
@@ -40,7 +22,7 @@ def _run_inference_role(config: InferenceConfig, env: dict[str, str], log_path: 
 
 
 def _run_orchestrator_role(config: OrchestratorConfig, env: dict[str, str], log_path: Path) -> None:
-    with _role_context(env, log_path):
+    with role_context(env, log_path):
         set_proc_title("RayOrchestrator")
         from prime_rl.orchestrator.orchestrator import orchestrate
 
@@ -67,7 +49,7 @@ def _run_trainer_rank(
         "PYTHONUNBUFFERED": "1",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
     }
-    with _role_context(rank_env, log_path):
+    with role_context(rank_env, log_path):
         set_proc_title(f"RayTrainerRank{rank}")
         from prime_rl.trainer.rl.train import train
         from prime_rl.trainer.world import reset_world
@@ -82,20 +64,8 @@ def _get_worker_node_ip() -> str:
     return get_node_ip_address()
 
 
-def _require_ray():
-    os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
-    try:
-        import ray
-    except ImportError as exc:
-        raise ImportError(
-            "Ray-native RL requires the optional 'ray' package. "
-            "Install Ray before setting experimental.ray.enabled = true."
-        ) from exc
-    return ray
-
-
 def _init_ray(config: RLConfig):
-    ray = _require_ray()
+    ray = require_ray()
     ray_config = config.experimental.ray
     if not ray.is_initialized():
         kwargs: dict[str, Any] = {"namespace": ray_config.namespace, "log_to_driver": ray_config.log_to_driver}
@@ -118,8 +88,9 @@ def _get_placement_strategy(ray, config: RLConfig):
         bundles.append({"CPU": ray_config.role_num_cpus, "GPU": config.deployment.num_teacher_gpus or 0})
 
     bundles.append({"CPU": ray_config.role_num_cpus})
-    for _ in range(config.deployment.num_train_gpus):
-        bundles.append({"CPU": ray_config.trainer_worker_num_cpus, "GPU": 1})
+    if ray_config.trainer_backend == "tasks":
+        for _ in range(config.deployment.num_train_gpus):
+            bundles.append({"CPU": ray_config.trainer_worker_num_cpus, "GPU": 1})
 
     pg = placement_group(bundles, strategy=ray_config.placement_strategy)
     ray.get(pg.ready())
@@ -234,33 +205,45 @@ def run_ray_native(
             "WANDB_PROGRAM": "uv run rl",
             "WANDB_ARGS": json.dumps(start_command),
         }
-        trainer_start_bundle_idx = bundle_idx
-        ip_task = ray.remote(_get_worker_node_ip).options(num_cpus=0, scheduling_strategy=strategy(trainer_start_bundle_idx))
-        master_addr = ray.get(ip_task.remote())
 
-        trainer_task = ray.remote(_run_trainer_rank)
-        for rank in range(config.deployment.num_train_gpus):
-            task = trainer_task.options(
-                num_cpus=ray_config.trainer_worker_num_cpus,
-                num_gpus=1,
-                scheduling_strategy=strategy(bundle_idx),
-            )
-            log_path = log_dir / "trainer" / f"rank_{rank}.log"
-            ref = task.remote(
-                config.trainer,
-                trainer_env,
-                log_path,
-                rank,
-                config.deployment.num_train_gpus,
-                master_addr,
-                master_port,
-            )
-            refs[ref] = (f"trainer_rank_{rank}", log_path)
-            bundle_idx += 1
+        if ray_config.trainer_backend == "ray_train":
+            from prime_rl.ray.train import run_trainer_with_ray_train
 
-        critical_names = {"orchestrator"} | {f"trainer_rank_{rank}" for rank in range(config.deployment.num_train_gpus)}
+            run_trainer_with_ray_train(config, log_dir=log_dir, shared_env=shared_env, start_command=start_command)
+            critical_names = {"orchestrator"}
+        else:
+            trainer_start_bundle_idx = bundle_idx
+            ip_task = ray.remote(_get_worker_node_ip).options(
+                num_cpus=0, scheduling_strategy=strategy(trainer_start_bundle_idx)
+            )
+            master_addr = ray.get(ip_task.remote())
+
+            trainer_task = ray.remote(_run_trainer_rank)
+            for rank in range(config.deployment.num_train_gpus):
+                task = trainer_task.options(
+                    num_cpus=ray_config.trainer_worker_num_cpus,
+                    num_gpus=1,
+                    scheduling_strategy=strategy(bundle_idx),
+                )
+                log_path = log_dir / "trainer" / f"rank_{rank}.log"
+                ref = task.remote(
+                    config.trainer,
+                    trainer_env,
+                    log_path,
+                    rank,
+                    config.deployment.num_train_gpus,
+                    master_addr,
+                    master_port,
+                )
+                refs[ref] = (f"trainer_rank_{rank}", log_path)
+                bundle_idx += 1
+
+            critical_names = {"orchestrator"} | {f"trainer_rank_{rank}" for rank in range(config.deployment.num_train_gpus)}
         _monitor_roles(ray, refs, critical_names, ray_config.poll_interval_seconds)
     except KeyboardInterrupt:
+        _cancel_refs(ray, refs)
+        raise
+    except Exception:
         _cancel_refs(ray, refs)
         raise
     finally:
