@@ -163,7 +163,7 @@ enabled = true
 namespace = "prime-rl"
 ```
 
-Ray-native mode is validated to local `single_node` runs without SLURM. It runs inference and orchestrator workers as in-process Ray tasks. Inference uses `experimental.ray.inference_backend = "prime_vllm"` by default, which runs Prime-RL's existing vLLM server inside a Ray GPU task and preserves custom inference endpoints plus filesystem/NCCL weight updates. By default, trainer rank workers also run as Ray tasks and call `train(config)` directly. Set `experimental.ray.trainer_backend = "ray_train"` to run trainer workers through Ray Train's `TorchTrainer` instead.
+Ray-native mode is validated to `single_node` Prime-RL configs without SLURM. It runs inference and orchestrator workers as in-process Ray tasks. Inference uses `experimental.ray.inference_backend = "prime_vllm"` by default, which runs Prime-RL's existing vLLM server inside a Ray GPU task and preserves custom inference endpoints plus filesystem/NCCL weight updates. If Ray places inference on a different node than the orchestrator, localhost rollout/admin URLs are rewritten to the inference Ray node IP in the orchestrator config copy. By default, trainer rank workers also run as Ray tasks and call `train(config)` directly. Set `experimental.ray.trainer_backend = "ray_train"` to run trainer workers through Ray Train's `TorchTrainer` instead.
 
 Ray-native mode requires Ray rollout transport on both trainer and orchestrator:
 
@@ -195,11 +195,11 @@ train_storage_path = "/shared/ray-train"
 
 Use shared `train_storage_path` for future multi-node RayCluster validation. The current Ray Train backend still keeps Prime-RL's vLLM inference and filesystem/NCCL weight broadcast contracts.
 
-For multi-node RayCluster validation, set `experimental.ray.address` to the Ray head service and use Ray `runtime_env` so remote worker pods can import the fork checkout:
+For multi-node RayCluster validation, run the launcher as a Ray job or from the head pod and use `address = "auto"`. A normal Kubernetes pod pointed at the head service GCS port has no local raylet and will fail during worker creation. Use Ray `runtime_env` so remote worker pods can import the fork checkout:
 
 ```toml
 [experimental.ray]
-address = "my-raycluster-head-svc.ray.svc.cluster.local:6379"
+address = "auto"
 placement_strategy = "SPREAD"
 
 [experimental.ray.runtime_env]

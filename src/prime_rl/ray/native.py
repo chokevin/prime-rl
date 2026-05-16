@@ -2,15 +2,20 @@ import asyncio
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
+from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
-from prime_rl.configs.shared import RayTransportConfig
+from prime_rl.configs.shared import ClientConfig, RayTransportConfig
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.ray._utils import require_ray, role_context
 from prime_rl.ray.inference import start_prime_vllm_inference
 from prime_rl.transport.ray import create_ray_transport_actor
+from prime_rl.utils.logger import get_logger
 from prime_rl.utils.process import set_proc_title
+
+LOCAL_INFERENCE_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
 
 def _run_orchestrator_role(config: OrchestratorConfig, env: dict[str, str], log_path: Path) -> None:
@@ -54,6 +59,55 @@ def _get_worker_node_ip() -> str:
     from ray.util import get_node_ip_address
 
     return get_node_ip_address()
+
+
+def _is_local_inference_url(url: str) -> bool:
+    return urlparse(url).hostname in LOCAL_INFERENCE_HOSTS
+
+
+def _replace_inference_url_host(url: str, host: str, port: int) -> str:
+    parsed = urlparse(url)
+    scheme = parsed.scheme or "http"
+    path = parsed.path or "/v1"
+    netloc = f"{host}:{port}"
+    return urlunparse((scheme, netloc, path, "", parsed.query, parsed.fragment))
+
+
+def _rewrite_local_client_urls(client: ClientConfig, host: str, port: int) -> bool:
+    if client.is_elastic:
+        return False
+
+    changed = False
+    base_url = []
+    for url in client.base_url:
+        if _is_local_inference_url(url):
+            base_url.append(_replace_inference_url_host(url, host, port))
+            changed = True
+        else:
+            base_url.append(url)
+    client.base_url = base_url
+
+    if client.admin_base_url is not None:
+        admin_base_url = []
+        for url in client.admin_base_url:
+            if _is_local_inference_url(url):
+                admin_base_url.append(_replace_inference_url_host(url, host, port))
+                changed = True
+            else:
+                admin_base_url.append(url)
+        client.admin_base_url = admin_base_url
+
+    return changed
+
+
+def _orchestrator_with_ray_inference_endpoint(
+    config: OrchestratorConfig, inference_config: InferenceConfig, host: str
+) -> OrchestratorConfig:
+    config = config.model_copy(deep=True)
+    port = inference_config.server.port
+    if _rewrite_local_client_urls(config.client, host, port):
+        get_logger().info(f"Using Ray inference endpoint http://{host}:{port}/v1 for orchestrator rollouts")
+    return config
 
 
 def _init_ray(config: RLConfig):
@@ -162,6 +216,11 @@ def run_ray_native(
         if config.inference is not None:
             if ray_config.inference_backend != "prime_vllm":
                 raise ValueError(f"Unsupported Ray inference backend: {ray_config.inference_backend}")
+            ip_task = ray.remote(_get_worker_node_ip).options(num_cpus=0, scheduling_strategy=strategy(bundle_idx))
+            inference_host = ray.get(ip_task.remote())
+            orchestrator_config = _orchestrator_with_ray_inference_endpoint(
+                config.orchestrator, config.inference, inference_host
+            )
             log_path = log_dir / "inference.log"
             ref = start_prime_vllm_inference(
                 ray,
@@ -175,6 +234,8 @@ def run_ray_native(
             )
             refs[ref] = ("inference", log_path)
             bundle_idx += 1
+        else:
+            orchestrator_config = config.orchestrator
 
         if config.teacher_inference is not None:
             if ray_config.inference_backend != "prime_vllm":
@@ -205,7 +266,7 @@ def run_ray_native(
             scheduling_strategy=strategy(bundle_idx),
         )
         log_path = log_dir / "orchestrator.log"
-        ref = orchestrator_task.remote(config.orchestrator, orchestrator_env, log_path)
+        ref = orchestrator_task.remote(orchestrator_config, orchestrator_env, log_path)
         refs[ref] = ("orchestrator", log_path)
         bundle_idx += 1
 

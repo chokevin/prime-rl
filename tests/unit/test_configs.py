@@ -13,6 +13,7 @@ from prime_rl.configs.sft import SFTConfig
 from prime_rl.configs.shared import TransportConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
+from prime_rl.ray.native import _orchestrator_with_ray_inference_endpoint
 from prime_rl.utils.config import BaseConfig, cli
 
 # All config config classes
@@ -318,3 +319,27 @@ def test_ray_transport_config_parses():
     assert transport.address == "auto"
     assert transport.namespace == "test"
     assert transport.actor_name == "transport"
+
+
+def test_ray_native_rewrites_local_inference_client_urls():
+    orchestrator = OrchestratorConfig()
+    inference = InferenceConfig()
+    inference.server.port = 8123
+    orchestrator.client.admin_base_url = ["http://127.0.0.1:8000/v1"]
+
+    rewritten = _orchestrator_with_ray_inference_endpoint(orchestrator, inference, "10.0.4.184")
+
+    assert rewritten.client.base_url == ["http://10.0.4.184:8123/v1"]
+    assert rewritten.client.admin_base_url == ["http://10.0.4.184:8123/v1"]
+    assert orchestrator.client.base_url == ["http://localhost:8000/v1"]
+    assert orchestrator.client.admin_base_url == ["http://127.0.0.1:8000/v1"]
+
+
+def test_ray_native_preserves_external_inference_client_urls():
+    orchestrator = OrchestratorConfig()
+    inference = InferenceConfig()
+    orchestrator.client.base_url = ["http://inference.ray.svc.cluster.local:8000/v1"]
+
+    rewritten = _orchestrator_with_ray_inference_endpoint(orchestrator, inference, "10.0.4.184")
+
+    assert rewritten.client.base_url == ["http://inference.ray.svc.cluster.local:8000/v1"]
