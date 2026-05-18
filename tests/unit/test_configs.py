@@ -409,6 +409,191 @@ def test_ray_cluster_num_teacher_gpus_auto_configures_teacher_model(tmp_path):
     assert config.orchestrator.teacher_model.model.name == config.teacher_inference.model.name
 
 
+def test_ray_cluster_auto_setup_orchestrator_num_train_workers(tmp_path):
+    """Multi-GPU trainer in ray_cluster auto-sets orchestrator.num_train_workers."""
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "gpus_per_node": 8,
+                "num_train_gpus": 8,
+                "num_infer_gpus": 1,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {"rollout_transport": {"type": "ray"}},
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster.toml"),
+        ],
+    )
+
+    assert config.deployment.type == "ray_cluster"
+    assert config.orchestrator.num_train_workers == 8
+
+
+def test_ray_cluster_auto_setup_inference_dp_from_num_infer_gpus(tmp_path):
+    """num_infer_gpus / tp drives inference.parallel.dp and api_server_count."""
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "gpus_per_node": 8,
+                "num_train_gpus": 1,
+                "num_infer_gpus": 4,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {"rollout_transport": {"type": "ray"}},
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+            "inference": {"parallel": {"tp": 2}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster.toml"),
+        ],
+    )
+
+    assert config.deployment.type == "ray_cluster"
+    assert config.inference.parallel.tp == 2
+    assert config.inference.parallel.dp == 2  # 4 / 2
+    assert config.inference.api_server_count >= 2
+
+
+def test_ray_cluster_auto_setup_dp_replicate_for_multi_node_trainer(tmp_path):
+    """num_train_gpus > gpus_per_node defaults trainer.model.dp_replicate to HSDP."""
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "gpus_per_node": 8,
+                "num_train_gpus": 16,
+                "num_infer_gpus": 8,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {"rollout_transport": {"type": "ray"}},
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+            "inference": {"parallel": {"tp": 8}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster.toml"),
+        ],
+    )
+
+    assert config.deployment.type == "ray_cluster"
+    assert config.trainer.model.dp_replicate == 2  # 16 / 8
+
+
+def test_ray_cluster_user_dp_replicate_is_preserved(tmp_path):
+    """Explicit trainer.model.dp_replicate is not clobbered by ray_cluster auto-setup."""
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "gpus_per_node": 8,
+                "num_train_gpus": 16,
+                "num_infer_gpus": 8,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {
+                "rollout_transport": {"type": "ray"},
+                "model": {"dp_replicate": 4},
+            },
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+            "inference": {"parallel": {"tp": 8}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster.toml"),
+        ],
+    )
+
+    assert config.trainer.model.dp_replicate == 4
+
+
+def test_ray_cluster_auto_setup_dp_replicate_skipped_for_single_node_trainer(tmp_path):
+    """num_train_gpus <= gpus_per_node leaves trainer.model.dp_replicate at the default."""
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "gpus_per_node": 8,
+                "num_train_gpus": 8,
+                "num_infer_gpus": 1,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {"rollout_transport": {"type": "ray"}},
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster.toml"),
+        ],
+    )
+
+    assert config.trainer.model.dp_replicate == 1
+
+
+def test_ray_cluster_16gpu_example_config_parses():
+    """The shipped 16-GPU example config parses and auto-setup runs end to end."""
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            "k8s/raycluster/rl-16gpu-example.toml",
+        ],
+    )
+
+    assert config.deployment.type == "ray_cluster"
+    assert config.deployment.num_train_gpus == 8
+    assert config.deployment.num_infer_gpus == 8
+    assert config.deployment.gpus_per_node == 8
+    assert config.experimental.ray.enabled
+    assert config.inference is not None
+    assert config.inference.parallel.tp == 8
+    assert config.inference.parallel.dp == 1
+    assert config.orchestrator.num_train_workers == 8
+    assert config.trainer.model.dp_replicate == 1
+
+
 def test_ray_runtime_config_parses_runtime_env(tmp_path):
     config = cli(
         RLConfig,

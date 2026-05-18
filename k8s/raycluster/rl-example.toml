@@ -31,7 +31,7 @@ working_dir = "/shared/checkouts/prime-rl"
 PYTHONPATH = "/shared/checkouts/prime-rl/src:/shared/checkouts/prime-rl/packages/prime-rl-configs/src"
 
 [trainer]
-total_steps = 1
+max_steps = 1
 # model, data, optimizer, loss, etc. come from your chosen example config.
 # Layer this file with `--include examples/reverse_text/rl.toml` if you want
 # the rest of the reverse-text settings, or copy fields here directly.

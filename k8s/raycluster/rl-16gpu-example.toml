@@ -1,0 +1,61 @@
+# Ray-native Prime-RL config for a 16-GPU run.
+#
+# Layout:
+#   - 8 training GPUs (Ray Train, FSDP) on one RayCluster worker pod.
+#   - 8 inference GPUs (Prime-vLLM, TP=8) on another RayCluster worker pod.
+#   - placement_strategy = "SPREAD" puts the trainer and inference Ray bundles on
+#     distinct workers so each role gets a full 8-GPU node.
+#
+# Pairs with `raycluster-16gpu.yaml` (2 worker pods, 8 GPUs each).
+#
+# The RL auto-setup validators for `ray_cluster` will derive:
+#   - orchestrator.num_train_workers     = num_train_gpus / trainer.model.cp  (=8)
+#   - inference.parallel.dp              = num_infer_gpus / inference.parallel.tp
+#   - inference.api_server_count         = parallel.dp
+#   - trainer.weight_broadcast.inference_world_size (NCCL only)
+# so you do not need to set those by hand.
+
+[deployment]
+type = "ray_cluster"
+gpus_per_node = 8
+num_train_gpus = 8
+num_infer_gpus = 8
+# num_teacher_gpus = 8  # uncomment to add a teacher (needs a third 8-GPU worker pod)
+
+[experimental.ray]
+enabled = true
+namespace = "prime-rl"
+placement_strategy = "SPREAD"
+address = "auto"
+trainer_backend = "ray_train"
+inference_backend = "prime_vllm"
+train_storage_path = "/shared/outputs/ray-train"
+
+[experimental.ray.runtime_env]
+working_dir = "/shared/checkouts/prime-rl"
+
+[experimental.ray.runtime_env.env_vars]
+PYTHONPATH = "/shared/checkouts/prime-rl/src:/shared/checkouts/prime-rl/packages/prime-rl-configs/src"
+
+[trainer]
+max_steps = 100
+# model, data, optimizer, loss, etc. come from your chosen example config.
+# Layer this file with `--include examples/<your-experiment>/rl.toml` if you want
+# to inherit the rest of the experiment settings.
+
+[trainer.rollout_transport]
+type = "ray"
+address = "auto"
+namespace = "prime-rl"
+actor_name = "prime-rl-transport"
+
+[orchestrator.rollout_transport]
+type = "ray"
+address = "auto"
+namespace = "prime-rl"
+actor_name = "prime-rl-transport"
+
+# Eight-way tensor parallel inference on one 8-GPU pod. DP is auto-derived
+# (num_infer_gpus / parallel.tp == 1) and api_server_count follows.
+[inference.parallel]
+tp = 8

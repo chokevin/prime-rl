@@ -43,6 +43,9 @@ resource claims as overlays for your environment.
 - `raycluster.yaml` — KubeRay `RayCluster` with a CPU head group and a GPU worker
   group. Edit `replicas`, `nodeSelector`, `image`, and `claimName` for your
   cluster.
+- `raycluster-16gpu.yaml` — same shape, sized for a 16-GPU run: two GPU worker
+  pods, eight GPUs each, with `num-gpus = 8` per worker so an 8-way TP or FSDP
+  role fits on one pod.
 - `rl-launch-job.yaml` — `batch/v1` `Job` that runs on the CPU head pool, clones
   the fork into `/shared/checkouts/prime-rl` if absent, and submits the `rl`
   launcher to the RayCluster via `ray job submit --address auto`.
@@ -51,6 +54,9 @@ resource claims as overlays for your environment.
   `experimental.ray.enabled`, `ray_train` trainer backend, `prime_vllm` inference
   backend, Ray rollout transport. Adapt model/dataset/`gpus_per_node` for your
   experiment.
+- `rl-16gpu-example.toml` — 16-GPU split: `num_train_gpus = 8`,
+  `num_infer_gpus = 8`, `inference.parallel.tp = 8`. Pairs with
+  `raycluster-16gpu.yaml`.
 
 ## Launch
 
@@ -102,6 +108,46 @@ A successful run logs `Ray-native RL training finished!` from the launcher.
   outside the RayCluster that calls `ray.init(address="<head-svc>:6379")` can
   connect to GCS but has no local raylet, so worker placement fails. Running the
   launcher from a head-affinitized Job avoids that footgun.
+
+## Scaling to 16 GPUs
+
+The two-GPU validated run uses one Ray worker per role. To scale up, the
+RayCluster needs enough GPUs to host each role's bundle on a single Ray worker
+node — Prime-vLLM inference is one Ray task and must fit on one pod.
+
+For a 16-GPU run split as 8 train + 8 infer:
+
+```bash
+kubectl apply -f k8s/raycluster/raycluster-16gpu.yaml   # 2 workers x 8 GPU
+# edit rl-launch-job.yaml to submit rl-16gpu-example.toml
+kubectl apply -f k8s/raycluster/rl-launch-job.yaml
+```
+
+`rl-16gpu-example.toml` sets `num_train_gpus = 8`, `num_infer_gpus = 8`, and
+`inference.parallel.tp = 8`. The `ray_cluster` auto-setup validators then derive
+`orchestrator.num_train_workers`, `inference.parallel.dp`, and
+`inference.api_server_count`. If you opt into NCCL weight broadcast, the
+trainer's `inference_world_size` is also set automatically.
+
+Trainer FSDP shape on the 8 train GPUs defaults to pure FSDP (dp_replicate = 1,
+dp_shard = 8). For runs where `num_train_gpus > gpus_per_node`, the validators
+auto-set `trainer.model.dp_replicate = num_train_gpus // gpus_per_node` so each
+FSDP island stays on intra-node NVLINK. Override by setting
+`trainer.model.dp_replicate` explicitly in your config.
+
+Other splits work as long as no single role exceeds `gpus_per_node`. Examples:
+
+- `num_train_gpus = 14`, `num_infer_gpus = 2` — distillation-heavy with small
+  inference; needs at least one worker that holds the trainer plus an inference
+  worker, so two 8-GPU pods are the minimum.
+- `num_train_gpus = 8`, `num_infer_gpus = 4`, `num_teacher_gpus = 4` — three
+  roles, three 8-GPU worker pods.
+
+Validation status: the two-GPU A100 and three-GPU same-node H200 runs are
+confirmed end to end. `num_train_gpus > 1` via Ray Train and `num_infer_gpus > 1`
+via Prime-vLLM TP exercise code paths that have not yet been run at this scale
+on RayCluster. The config and manifests are in place; the next milestone is an
+end-to-end 16-GPU run logged in the PR description.
 
 ## H200 / FP8 cluster notes
 

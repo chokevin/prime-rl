@@ -1025,6 +1025,56 @@ class RLConfig(BaseConfig):
                 if self.inference.api_server_count < dp and not self.inference.enable_lora:
                     self.inference.api_server_count = dp
 
+        elif self.deployment.type == "ray_cluster":
+            # Mirror the single_node logic: every trainer rank is one data parallel
+            # replica modulo context-parallel sharding. Ray places ranks across
+            # RayCluster workers via the placement group, but the orchestrator's
+            # accounting is the same as single_node.
+            non_data_parallel_size = self.trainer.model.cp
+            if self.deployment.num_train_gpus > 1:
+                self.orchestrator.num_train_workers = self.deployment.num_train_gpus // non_data_parallel_size
+
+            # When the trainer spans more than one RayCluster worker node, default to
+            # HSDP with one FSDP island per node so all-gather/reduce-scatter stay on
+            # intra-node NVLINK and only the dp_replicate all-reduce crosses pods.
+            # Mirrors the multi_node nodes_per_fsdp_group helper. Opt out by setting
+            # trainer.model.dp_replicate explicitly.
+            if (
+                "dp_replicate" not in self.trainer.model.model_fields_set
+                and self.deployment.num_train_gpus > self.deployment.gpus_per_node
+                and self.deployment.num_train_gpus % self.deployment.gpus_per_node == 0
+            ):
+                self.trainer.model.dp_replicate = (
+                    self.deployment.num_train_gpus // self.deployment.gpus_per_node
+                )
+
+            # Auto-fill inference DP from num_infer_gpus / tp, matching single_node
+            # behavior. The whole Prime-vLLM server runs as one Ray task that holds
+            # num_infer_gpus GPUs on a single Ray worker node, so DP and TP are
+            # local-only.
+            if self.inference is not None:
+                num_infer_gpus = self.deployment.num_infer_gpus
+                if num_infer_gpus != self.inference.parallel.dp * self.inference.parallel.tp:
+                    assert num_infer_gpus % self.inference.parallel.tp == 0, (
+                        "Ray-native deployment.num_infer_gpus must be divisible by inference.parallel.tp"
+                    )
+                    self.inference.parallel.dp = num_infer_gpus // self.inference.parallel.tp
+                dp = self.inference.parallel.dp
+                if self.inference.api_server_count < dp and not self.inference.enable_lora:
+                    self.inference.api_server_count = dp
+
+            # NCCL weight broadcast world size: all DP/TP workers on the inference task
+            # participate in the broadcast collective.
+            if self.weight_broadcast is not None and self.weight_broadcast.type == "nccl":
+                api_server_count = self.inference.api_server_count if self.inference is not None else 1
+                tp = self.inference.parallel.tp if self.inference is not None else 1
+                total_infer_workers = api_server_count * tp
+                assert self.trainer.weight_broadcast.type == "nccl"
+                self.trainer.weight_broadcast.host = "0.0.0.0"
+                self.trainer.weight_broadcast.inference_world_size = total_infer_workers
+                assert self.orchestrator.weight_broadcast.type == "nccl"
+                self.orchestrator.weight_broadcast.inference_world_size = total_infer_workers
+
         elif self.deployment.type == "multi_node":  # multi-node
             self.orchestrator.num_train_workers = self.deployment.num_train_nodes * self.deployment.gpus_per_node
 
