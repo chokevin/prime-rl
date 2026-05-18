@@ -149,18 +149,16 @@ Other splits work as long as no single role exceeds `gpus_per_node`. Examples:
 - `num_train_gpus = 8`, `num_infer_gpus = 4`, `num_teacher_gpus = 4` — three
   roles, three 8-GPU worker pods.
 
-Validation status: the two-GPU A100, three-GPU same-node H200, and TP=4
-Prime-vLLM H200 paths are confirmed end to end. `num_train_gpus > 1` via Ray
-Train still needs a clean multi-rank validation; the H200 attempt surfaced a
-checkpoint-load hang on shared storage that should be investigated separately.
-The config and manifests are in place; the next milestone is an end-to-end
-16-GPU run after the target cluster's cross-node networking is healthy.
+Validation status: the two-GPU A100, three-GPU same-node H200, TP=4 Prime-vLLM
+H200, and 16-GPU H200 paths are confirmed end to end. The validated 16-GPU H200
+shape used two 8-GPU Ray workers, `num_train_gpus = 8`, `num_infer_gpus = 8`,
+`inference.parallel.tp = 8`, Ray Train, Prime-vLLM with the `mp` executor, and
+filesystem weight broadcast.
 
 ## H200 / FP8 cluster notes
 
-Validated on A100 multi-node. H200 multi-node RayCluster was attempted but blocked
-by **node-pool networking** (kubelet logs/exec 504s and pod DNS failures), not by
-Prime-RL. When running on H200 you may also need:
+Validated on A100 multi-node and H200 multi-node. When running on H200 you may
+also need:
 
 - `VLLM_DEEP_GEMM_WARMUP=skip` in the launch Job's `env:` if vLLM enters Hopper
   FP8 DeepGEMM warmup paths.

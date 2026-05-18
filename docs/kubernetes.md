@@ -14,7 +14,7 @@ backwards compatibility with the original SLURM-shaped topology.
 | Cross-node inference URL | Auto-rewritten by the Ray-native runtime | Resolved via the pod DNS env vars on each role |
 | Weight broadcast | Shared `RWX` PVC + Prime-vLLM `/update_weights` | Shared `RWX` PVC + Prime-vLLM `/update_weights` |
 | Teacher inference | Driven by `deployment.num_teacher_gpus` | Manual extra `inference` StatefulSet |
-| Maturity | Validated end-to-end on multi-node A100; single-node validated on H200 | Long-standing chart used by the upstream `kubernetes.md` flow |
+| Maturity | Validated end-to-end on multi-node A100 and H200 | Long-standing chart used by the upstream `kubernetes.md` flow |
 | When to choose | New k8s deployments, especially when you want Ray Train, Ray transport, and logical resource modeling | Clusters that already mirror SLURM topology, or workflows already invested in the chart |
 
 If you do not have a strong reason to stay on the StatefulSet chart, prefer the
@@ -70,10 +70,10 @@ the `experimental.ray.*` config reference.
   `Ray-native RL training finished!` logged).
 - Same-node H200: Prime-RL runtime path validated with trainer + primary
   Prime-vLLM + teacher Prime-vLLM on three H200 GPUs.
-- Multi-node H200 RayCluster: **not yet validated**. Blocked by node-pool
-  networking on the available H200 pool (kubelet logs/exec 504s and pod DNS
-  failures); not a Prime-RL bug. Fix the node networking first, then the same
-  `k8s/raycluster/` manifests should apply.
+- Multi-node H200 RayCluster: validated end to end with two 8-GPU Ray workers,
+  `num_train_gpus = 8`, `num_infer_gpus = 8`, `inference.parallel.tp = 8`,
+  checkpoint/broadcast/final weights produced, and `Ray-native RL training
+  finished!` logged.
 
 ### Cloud-specific notes
 

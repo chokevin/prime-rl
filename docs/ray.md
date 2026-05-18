@@ -101,7 +101,7 @@ uv run rl @ examples/reverse_text/rl.toml \
   --orchestrator.rollout-transport.type ray
 ```
 
-The Ray Train backend keeps Prime-RL's existing trainer loop and calls `train(config)` inside each Ray Train worker. The trainer setup code reuses an already-initialized Ray Train `torch.distributed` process group instead of calling `dist.init_process_group` a second time. `experimental.ray.train_run_name` and `experimental.ray.train_storage_path` are passed to Ray Train's `RunConfig` when set; use shared storage for future multi-node RayCluster validation.
+The Ray Train backend keeps Prime-RL's existing trainer loop and calls `train(config)` inside each Ray Train worker. The trainer setup code reuses an already-initialized Ray Train `torch.distributed` process group instead of calling `dist.init_process_group` a second time, and Ray Train owns process-group shutdown. `experimental.ray.train_run_name` and `experimental.ray.train_storage_path` are passed to Ray Train's `RunConfig` when set; use shared storage for multi-node RayCluster runs.
 
 ## Ray inference backend
 

@@ -4,7 +4,7 @@ This guide overlays Azure Kubernetes Service (AKS) specifics onto the
 vendor-neutral RayCluster example in this directory. The base manifests
 (`raycluster.yaml`, `rl-launch-job.yaml`, `rl-example.toml`) stay portable;
 this page documents the AKS-specific knobs that the validated multi-node
-A100 and same-node H200 Prime-RL runs actually used.
+A100 and H200 Prime-RL runs actually used.
 
 The guide is descriptive of what worked, not prescriptive about the only way
 to run on AKS. Substitute your own ACR, storage, and node-pool conventions
@@ -47,10 +47,9 @@ Optional, depending on your cluster:
 ## AKS overlay on `raycluster.yaml`
 
 Start from `raycluster.yaml` in this directory and apply these AKS-specific
-changes. The validated topology was: CPU head on the CPU agent pool, two
-A100 workers (multi-node) or three H200 workers (same-node) on the GPU agent
-pool, anti-affinity to put workers on distinct nodes, Azure Blob CSI PVC at
-`/shared`.
+changes. The validated topology was: CPU head on the CPU agent pool, GPU
+workers on the GPU agent pool, anti-affinity to put workers on distinct nodes,
+and Azure Blob CSI PVC at `/shared`.
 
 ### Head pool selector
 
@@ -227,9 +226,8 @@ spec:
   DRA is not available on your AKS version, use the `nvidia.com/gpu` shape
   instead — the rest of the manifest is unchanged.
 
-H200 / Hopper FP8 cluster caveats (DeepGEMM warmup, H200 node-pool networking
-quirks observed during validation) are not AKS-specific. See
-[`README.md`](./README.md) → "H200 / FP8 cluster notes" for those.
+H200 / Hopper FP8 caveats such as DeepGEMM warmup behavior are not AKS-specific.
+See [`README.md`](./README.md) → "H200 / FP8 cluster notes" for those.
 
 ## See also
 
