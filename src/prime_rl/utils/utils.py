@@ -67,7 +67,7 @@ def clean_exit(func: Callable) -> Callable:
                 # the event loop swallows it and the process hangs indefinitely.
                 sys.exit(1)
             finally:
-                if dist.is_initialized():
+                if dist.is_initialized() and os.environ.get("PRIME_RL_SKIP_DIST_DESTROY") != "1":
                     dist.destroy_process_group()
 
         return async_wrapper
@@ -85,7 +85,7 @@ def clean_exit(func: Callable) -> Callable:
                 # sys.exit raises SystemExit so the finally block still runs.
                 sys.exit(1)
             finally:
-                if dist.is_initialized():
+                if dist.is_initialized() and os.environ.get("PRIME_RL_SKIP_DIST_DESTROY") != "1":
                     dist.destroy_process_group()
 
         return sync_wrapper

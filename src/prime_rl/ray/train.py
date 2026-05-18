@@ -36,6 +36,7 @@ def _run_ray_train_worker(train_loop_config: dict[str, Any]) -> None:
         "WORLD_SIZE": str(world_size),
         "LOCAL_RANK": str(local_rank),
         "LOCAL_WORLD_SIZE": str(local_world_size),
+        "PRIME_RL_SKIP_DIST_DESTROY": "1",
         "PYTHONUNBUFFERED": "1",
     }
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
