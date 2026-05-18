@@ -6,6 +6,7 @@
 # Adapt before applying:
 #   - metadata.namespace                  -> match the RayCluster namespace
 #   - PRIME_RL_REPO / PRIME_RL_REF        -> your fork checkout
+#   - CONFIG_PATH                         -> config path, relative to checkout or absolute
 #   - RAY_HEAD_SVC                        -> KubeRay head service name
 #   - volumes[].persistentVolumeClaim     -> the same RWX PVC as the RayCluster
 #   - container image                     -> same image as the RayCluster head
@@ -40,6 +41,7 @@ spec:
           env:
             - { name: PRIME_RL_REPO, value: "https://github.com/chokevin/prime-rl.git" }
             - { name: PRIME_RL_REF,  value: "chokevin/chore-ray-native-architecture" }
+            - { name: CONFIG_PATH,   value: "k8s/raycluster/rl-example.toml" }
             - { name: RAY_HEAD_SVC,  value: "prime-rl-raycluster-head-svc" }
             - { name: RAY_ADDRESS,   value: "auto" }
             # Set this on H200 / Hopper FP8 paths where vLLM picks
@@ -50,15 +52,17 @@ spec:
             - |
               set -euo pipefail
 
-              CHECKOUT=/shared/checkouts/prime-rl
               RUN_ID="${RUN_ID:-prime-rl-$(date -u +%Y%m%dT%H%M%SZ)}"
-              OUT=/shared/outputs/${RUN_ID}
-              mkdir -p "${OUT}"
+              ATTEMPT_ID="${ATTEMPT_ID:-$(date -u +%H%M%S)}"
+              SUBMISSION_ID="${SUBMISSION_ID:-${RUN_ID}-${ATTEMPT_ID}}"
+              CHECKOUT=/shared/checkouts/${RUN_ID}/${ATTEMPT_ID}/prime-rl
+              OUT=/shared/outputs/${RUN_ID}/${ATTEMPT_ID}
+              mkdir -p "$(dirname "${CHECKOUT}")" "${OUT}"
 
-              # Stage the fork once per shared PVC; subsequent runs reuse it.
-              if [ ! -d "${CHECKOUT}/.git" ]; then
-                git clone --depth 1 --branch "${PRIME_RL_REF}" \
-                  "${PRIME_RL_REPO}" "${CHECKOUT}"
+              git clone --depth 1 --branch "${PRIME_RL_REF}" \
+                "${PRIME_RL_REPO}" "${CHECKOUT}"
+              if [[ "${CONFIG_PATH}" != /* ]]; then
+                CONFIG_PATH="${CHECKOUT}/${CONFIG_PATH}"
               fi
               ( cd "${CHECKOUT}" && git rev-parse HEAD ) > "${OUT}/prime-rl-commit.txt"
 
@@ -71,9 +75,9 @@ spec:
                 --address "http://${RAY_HEAD_SVC}:8265" \
                 --working-dir "${CHECKOUT}" \
                 --no-wait=false \
-                --submission-id "${RUN_ID}" \
+                --submission-id "${SUBMISSION_ID}" \
                 -- \
-                uv run rl @ /shared/checkouts/prime-rl/k8s/raycluster/rl-example.toml \
+                uv run rl @ "${CONFIG_PATH}" \
                   --output-dir "${OUT}" \
                   --run-name "${RUN_ID}"
           volumeMounts:

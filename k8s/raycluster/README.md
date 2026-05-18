@@ -47,8 +47,10 @@ resource claims as overlays for your environment.
   pods, eight GPUs each, with `num-gpus = 8` per worker so an 8-way TP or FSDP
   role fits on one pod.
 - `rl-launch-job.yaml` — `batch/v1` `Job` that runs on the CPU head pool, clones
-  the fork into `/shared/checkouts/prime-rl` if absent, and submits the `rl`
-  launcher to the RayCluster via `ray job submit --address auto`.
+  the fork into a per-attempt directory under `/shared/checkouts/`, and submits
+  the `rl` launcher to the RayCluster via `ray job submit`.
+  Set `CONFIG_PATH` to choose a config file relative to the checkout, such as
+  `k8s/raycluster/rl-16gpu-example.toml`.
 - `rl-example.toml` — minimal `ray_cluster`-shaped Prime-RL config that mirrors
   the validated reverse-text run: one trainer GPU, one inference GPU,
   `experimental.ray.enabled`, `ray_train` trainer backend, `prime_vllm` inference
@@ -75,10 +77,10 @@ kubectl logs -f -n prime-rl job/prime-rl-launch
 ```
 
 The launch Job writes resolved configs and per-role logs under
-`/shared/outputs/<run-id>/` exactly like the validated A100 run:
+`/shared/outputs/<run-id>/<attempt-id>/` exactly like the validated A100 run:
 
 ```
-/shared/outputs/<run-id>/
+/shared/outputs/<run-id>/<attempt-id>/
   configs/{inference,orchestrator,trainer}.toml
   logs/{inference.log,orchestrator.log,trainer/rank_0.log}
   checkpoints/step_*/...
@@ -119,7 +121,7 @@ For a 16-GPU run split as 8 train + 8 infer:
 
 ```bash
 kubectl apply -f k8s/raycluster/raycluster-16gpu.yaml   # 2 workers x 8 GPU
-# edit rl-launch-job.yaml to submit rl-16gpu-example.toml
+# set CONFIG_PATH in rl-launch-job.yaml to k8s/raycluster/rl-16gpu-example.toml
 kubectl apply -f k8s/raycluster/rl-launch-job.yaml
 ```
 
@@ -143,11 +145,12 @@ Other splits work as long as no single role exceeds `gpus_per_node`. Examples:
 - `num_train_gpus = 8`, `num_infer_gpus = 4`, `num_teacher_gpus = 4` — three
   roles, three 8-GPU worker pods.
 
-Validation status: the two-GPU A100 and three-GPU same-node H200 runs are
-confirmed end to end. `num_train_gpus > 1` via Ray Train and `num_infer_gpus > 1`
-via Prime-vLLM TP exercise code paths that have not yet been run at this scale
-on RayCluster. The config and manifests are in place; the next milestone is an
-end-to-end 16-GPU run logged in the PR description.
+Validation status: the two-GPU A100, three-GPU same-node H200, and TP=4
+Prime-vLLM H200 paths are confirmed end to end. `num_train_gpus > 1` via Ray
+Train still needs a clean multi-rank validation; the H200 attempt surfaced a
+checkpoint-load hang on shared storage that should be investigated separately.
+The config and manifests are in place; the next milestone is an end-to-end
+16-GPU run after the target cluster's cross-node networking is healthy.
 
 ## H200 / FP8 cluster notes
 
