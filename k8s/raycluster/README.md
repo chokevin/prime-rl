@@ -110,6 +110,10 @@ A successful run logs `Ray-native RL training finished!` from the launcher.
   outside the RayCluster that calls `ray.init(address="<head-svc>:6379")` can
   connect to GCS but has no local raylet, so worker placement fails. Running the
   launcher from a head-affinitized Job avoids that footgun.
+- **Ray Train GPU visibility.** The launcher sets
+  `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` for the Ray job runtime so
+  Ray Train's distributed bootstrap can map local ranks to physical GPUs before
+  Prime-RL enters its trainer loop.
 
 ## Scaling to 16 GPUs
 

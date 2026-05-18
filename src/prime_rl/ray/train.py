@@ -9,6 +9,15 @@ from prime_rl.ray._utils import require_ray, role_context
 from prime_rl.utils.process import set_proc_title
 
 
+def _get_ray_train_local_topology(context: Any) -> tuple[int, int]:
+    local_rank = context.get_local_rank()
+    local_world_size = context.get_local_world_size()
+    visible_devices = [device for device in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if device]
+    if len(visible_devices) == 1:
+        return 0, 1
+    return local_rank, local_world_size
+
+
 def _run_ray_train_worker(train_loop_config: dict[str, Any]) -> None:
     from ray import train as ray_train
 
@@ -19,17 +28,14 @@ def _run_ray_train_worker(train_loop_config: dict[str, Any]) -> None:
     context = ray_train.get_context()
     rank = context.get_world_rank()
     world_size = context.get_world_size()
+    local_rank, local_world_size = _get_ray_train_local_topology(context)
 
     env = {
         **shared_env,
         "RANK": str(rank),
         "WORLD_SIZE": str(world_size),
-        # Ray Train with use_gpu=True restricts each worker's CUDA_VISIBLE_DEVICES to a
-        # single GPU, so torch.cuda.device_count() == 1 inside the worker. Local rank/size
-        # must therefore be 0/1 even when multiple workers share a node — otherwise
-        # torch.cuda.set_device(local_rank) hits "invalid device ordinal".
-        "LOCAL_RANK": "0",
-        "LOCAL_WORLD_SIZE": "1",
+        "LOCAL_RANK": str(local_rank),
+        "LOCAL_WORLD_SIZE": str(local_world_size),
         "PYTHONUNBUFFERED": "1",
     }
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -65,6 +71,7 @@ def run_trainer_with_ray_train(
         ) from exc
 
     ray_config = config.experimental.ray
+    os.environ.setdefault("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", "1")
     run_config_kwargs: dict[str, Any] = {}
     if ray_config.train_run_name is not None:
         run_config_kwargs["name"] = ray_config.train_run_name

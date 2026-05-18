@@ -70,10 +70,12 @@ spec:
               # raylet; RAY_ADDRESS=auto then attaches without GCS-port hacks.
               cd "${CHECKOUT}"
               export PYTHONPATH="${CHECKOUT}/src:${CHECKOUT}/packages/prime-rl-configs/src:${PYTHONPATH:-}"
+              RUNTIME_ENV_JSON='{"env_vars":{"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES":"1"}}'
 
               ray job submit \
                 --address "http://${RAY_HEAD_SVC}:8265" \
                 --working-dir "${CHECKOUT}" \
+                --runtime-env-json "${RUNTIME_ENV_JSON}" \
                 --no-wait=false \
                 --submission-id "${SUBMISSION_ID}" \
                 -- \
