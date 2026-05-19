@@ -196,7 +196,8 @@ def setup_clients(
             "preserve_all_thinking": preserve_all_thinking,
             "preserve_thinking_between_tool_calls": preserve_thinking_between_tool_calls,
         }
-    for base_url in client_config.base_url:
+    generation_urls = [client_config.router_url] if client_config.router_url else client_config.base_url
+    for base_url in generation_urls:
         for dp_rank in range(client_config.dp_rank_count):
             headers = client_config.headers.copy()
             if client_config.dp_rank_count > 1:

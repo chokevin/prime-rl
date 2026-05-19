@@ -59,3 +59,16 @@ actor_name = "prime-rl-transport"
 # (num_infer_gpus / parallel.tp == 1) and api_server_count follows.
 [inference.parallel]
 tp = 8
+
+# Optional: route rollout generation through an external llm-d router while
+# keeping Prime-vLLM admin/weight calls direct to the Ray-hosted backend.
+# llm-d routes OpenAI-compatible generation traffic, so disable the renderer
+# client and use MITO/chat-completions rollouts.
+#
+# [experimental.llmd_router]
+# enabled = true
+# router_url = "http://llmd-gateway.prime-rl.svc.cluster.local/v1"
+# run_id = "h200-rl"
+#
+# [orchestrator]
+# use_renderer = false

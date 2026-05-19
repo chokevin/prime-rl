@@ -227,6 +227,29 @@ Do not use `deployment.type = "multi_node"` for Ray. That remains the SLURM temp
 
 The accepted Ray-native weight update path reuses Prime-RL's HF-compatible filesystem broadcast by default; do not add `weight_broadcast.type = "ray"` unless a separate design proves a better full-model live update path.
 
+### llm-d router rollouts
+
+Prime-RL treats llm-d as an external OpenAI-compatible generation router. Enable it under
+`[experimental.llmd_router]`; this wires `orchestrator.client.router_url` for rollout/eval
+generation while admin calls still go directly to `orchestrator.client.admin_base_url` or
+`orchestrator.client.base_url`.
+
+```toml
+[experimental.llmd_router]
+enabled = true
+router_url = "http://llmd-gateway.prime-rl.svc.cluster.local/v1"
+run_id = "my-run"  # optional; defaults to output_dir.name
+
+[orchestrator]
+use_renderer = false
+```
+
+llm-d mode requires `orchestrator.use_renderer = false` because llm-d should route
+OpenAI-compatible `/v1/chat/completions` traffic, not Prime-RL's renderer-only
+`/v1/generate` endpoint. Prime-RL adds routing metadata headers for run id, session id,
+rollout id, and required policy/weight version; cluster-side llm-d/EPP config is
+responsible for interpreting those headers against backend status.
+
 ### SFT hard distill override
 
 For hosted multi-tenant runs where the trainer image's `trainer.loss.type` is fixed, the orchestrator exposes a per-run override that forces SFT loss on every micro-batch without rebuilding the trainer. Set `orchestrator.use_sft_loss = true` alongside `orchestrator.teacher_rollout_model`; both must be configured together (the orchestrator validator enforces this). The orchestrator stamps each `TrainingSample.sft_loss = True`, which the trainer's `compute_loss` honors by dispatching to `sft_loss_fn` per batch — independent of the trainer's configured default loss.

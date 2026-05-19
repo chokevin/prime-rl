@@ -6,6 +6,14 @@ from pydantic import BaseModel, Field, model_validator
 
 from prime_rl.utils.config import BaseConfig
 
+LLMD_RUN_ID_HEADER = "X-Prime-RL-Run-ID"
+LLMD_ROLLOUT_ID_HEADER = "X-Prime-RL-Rollout-ID"
+LLMD_SESSION_ID_HEADER = "X-Prime-RL-Session-ID"
+LLMD_REQUIRED_WEIGHT_VERSION_HEADER = "X-Prime-RL-Required-Weight-Version"
+
+LLMD_ROLLOUT_ID_STATE_KEY = "prime_rl_rollout_id"
+LLMD_REQUIRED_WEIGHT_VERSION_STATE_KEY = "prime_rl_required_weight_version"
+
 
 class SlurmConfig(BaseConfig):
     """Configures SLURM scheduling."""
@@ -351,7 +359,11 @@ class ClientConfig(BaseConfig):
     router_url: Annotated[
         str | None,
         Field(
-            description="URL of a vllm-router for load-aware inference routing. When set with elastic mode, inference requests go through the router while admin operations (weight updates, LoRA loading) still go directly to discovered pods.",
+            description=(
+                "Optional OpenAI-compatible generation router URL. When set, rollout/eval generation "
+                "requests go through the router while admin operations (weight updates, LoRA loading, "
+                "health/model checks) still go directly to admin_base_url or base_url."
+            ),
         ),
     ] = None
 

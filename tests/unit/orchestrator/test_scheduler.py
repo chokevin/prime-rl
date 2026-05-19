@@ -5,7 +5,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import verifiers as vf
 
-from prime_rl.orchestrator.scheduler import InflightRequest, Scheduler
+from prime_rl.configs.shared import (
+    LLMD_REQUIRED_WEIGHT_VERSION_HEADER,
+    LLMD_REQUIRED_WEIGHT_VERSION_STATE_KEY,
+    LLMD_ROLLOUT_ID_HEADER,
+    LLMD_ROLLOUT_ID_STATE_KEY,
+)
+from prime_rl.orchestrator.scheduler import GroupState, InflightRequest, Scheduler
 from prime_rl.utils.async_utils import safe_cancel
 
 
@@ -25,12 +31,14 @@ def make_scheduler() -> Scheduler:
     scheduler.wait_for_ckpt_time = 0
     scheduler.inflight_requests = {}
     scheduler.groups = {}
+    scheduler.next_rollout_request_id = 0
     scheduler.max_off_policy_steps = 1
     scheduler.cancelled_rollouts_count = 0
     scheduler.policy_update_lock = asyncio.Lock()
     scheduler.inflight_policy_update_task = None
     scheduler.update_policy_task = None
     scheduler.enable_policy_updates = True
+    scheduler.rate_limiter = None
     return scheduler
 
 
@@ -174,3 +182,70 @@ def test_client_identity_distinguishes_base_url_and_dp_rank():
     )
 
     assert Scheduler._client_identity(client_a) != Scheduler._client_identity(client_b)
+
+
+def test_llmd_routing_metadata_is_added_only_when_client_requests_state_headers():
+    scheduler = make_scheduler()
+    example = {"env_name": "test-env", "example_id": "example-123"}
+    plain_client = vf.ClientConfig(
+        api_base_url="http://worker-a:8000/v1",
+        extra_headers_from_state={"X-Session-ID": "example_id"},
+    )
+    llmd_client = vf.ClientConfig(
+        api_base_url="http://llmd-router:8000/v1",
+        extra_headers_from_state={
+            LLMD_ROLLOUT_ID_HEADER: LLMD_ROLLOUT_ID_STATE_KEY,
+            LLMD_REQUIRED_WEIGHT_VERSION_HEADER: LLMD_REQUIRED_WEIGHT_VERSION_STATE_KEY,
+        },
+    )
+
+    unchanged = scheduler._example_with_llmd_routing_metadata(
+        example,
+        plain_client,
+        group_id=3,
+        request_id=4,
+    )
+    enriched = scheduler._example_with_llmd_routing_metadata(
+        example,
+        llmd_client,
+        group_id=3,
+        request_id=4,
+    )
+
+    assert unchanged is example
+    assert LLMD_ROLLOUT_ID_STATE_KEY not in example
+    assert enriched[LLMD_ROLLOUT_ID_STATE_KEY] == "step-9-policy-7-group-3-request-4"
+    assert enriched[LLMD_REQUIRED_WEIGHT_VERSION_STATE_KEY] == "7"
+    assert enriched["example_id"] == "example-123"
+
+
+def test_schedule_rollout_passes_llmd_routing_metadata_to_env():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        client = vf.ClientConfig(
+            api_base_url="http://llmd-router:8000/v1",
+            extra_headers_from_state={
+                LLMD_ROLLOUT_ID_HEADER: LLMD_ROLLOUT_ID_STATE_KEY,
+                LLMD_REQUIRED_WEIGHT_VERSION_HEADER: LLMD_REQUIRED_WEIGHT_VERSION_STATE_KEY,
+            },
+        )
+        env = SimpleNamespace(
+            requires_group_scoring=False,
+            run_rollout=AsyncMock(return_value={"error": None, "trajectory": [{"role": "assistant"}]}),
+        )
+        scheduler.inference_pool = SimpleNamespace(train_clients=[client])
+        scheduler.train_envs = {"test-env": env}
+        scheduler.groups[0] = GroupState(
+            example={"env_name": "test-env", "example_id": "example-123"},
+            rollouts_to_schedule=1,
+        )
+
+        await scheduler.schedule_rollout(0)
+        task = next(iter(scheduler.inflight_requests))
+        await task
+
+        call_kwargs = env.run_rollout.call_args.kwargs
+        assert call_kwargs["example"][LLMD_ROLLOUT_ID_STATE_KEY] == "step-9-policy-7-group-0-request-0"
+        assert call_kwargs["example"][LLMD_REQUIRED_WEIGHT_VERSION_STATE_KEY] == "7"
+
+    asyncio.run(run())

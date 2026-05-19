@@ -10,7 +10,15 @@ from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig, TeacherModelConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
-from prime_rl.configs.shared import TransportConfig
+from prime_rl.configs.shared import (
+    LLMD_REQUIRED_WEIGHT_VERSION_HEADER,
+    LLMD_REQUIRED_WEIGHT_VERSION_STATE_KEY,
+    LLMD_ROLLOUT_ID_HEADER,
+    LLMD_ROLLOUT_ID_STATE_KEY,
+    LLMD_RUN_ID_HEADER,
+    LLMD_SESSION_ID_HEADER,
+    TransportConfig,
+)
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.ray.native import (
@@ -273,6 +281,81 @@ def test_ray_runtime_config_parses_ray_train_backend():
     assert config.experimental.ray.trainer_backend == "ray_train"
     assert config.experimental.ray.train_run_name == "test-run"
     assert config.experimental.ray.train_storage_path == "/tmp/ray-train"
+
+
+def test_llmd_router_defaults_leave_orchestrator_client_unchanged():
+    config = cli(RLConfig, args=["@", "examples/reverse_text/rl.toml"])
+
+    assert not config.experimental.llmd_router.enabled
+    assert config.orchestrator.client.router_url is None
+    assert LLMD_RUN_ID_HEADER not in config.orchestrator.client.headers
+    assert LLMD_SESSION_ID_HEADER not in config.orchestrator.client.extra_headers_from_state
+    assert LLMD_ROLLOUT_ID_HEADER not in config.orchestrator.client.extra_headers_from_state
+    assert LLMD_REQUIRED_WEIGHT_VERSION_HEADER not in config.orchestrator.client.extra_headers_from_state
+    assert config.orchestrator.client.extra_headers_from_state["X-Session-ID"] == "example_id"
+
+
+def test_llmd_router_config_merges_router_and_headers(tmp_path):
+    write_toml(
+        tmp_path / "llmd.toml",
+        {
+            "output_dir": (tmp_path / "run-dir").as_posix(),
+            "experimental": {
+                "llmd_router": {
+                    "enabled": True,
+                    "router_url": "http://llmd-router.prime-rl.svc.cluster.local/v1",
+                    "run_id": "run-123",
+                    "headers": {"X-Test-Static": "yes"},
+                    "extra_headers_from_state": {"X-Test-State": "env_name"},
+                }
+            },
+            "orchestrator": {"use_renderer": False, "renderer": {"name": "auto"}},
+        },
+    )
+
+    config = cli(RLConfig, args=["@", "examples/reverse_text/rl.toml", "@", str(tmp_path / "llmd.toml")])
+
+    assert config.orchestrator.client.router_url == "http://llmd-router.prime-rl.svc.cluster.local/v1"
+    assert config.orchestrator.client.headers[LLMD_RUN_ID_HEADER] == "run-123"
+    assert config.orchestrator.client.headers["X-Test-Static"] == "yes"
+    assert config.orchestrator.client.extra_headers_from_state["X-Session-ID"] == "example_id"
+    assert config.orchestrator.client.extra_headers_from_state[LLMD_SESSION_ID_HEADER] == "example_id"
+    assert config.orchestrator.client.extra_headers_from_state[LLMD_ROLLOUT_ID_HEADER] == LLMD_ROLLOUT_ID_STATE_KEY
+    assert (
+        config.orchestrator.client.extra_headers_from_state[LLMD_REQUIRED_WEIGHT_VERSION_HEADER]
+        == LLMD_REQUIRED_WEIGHT_VERSION_STATE_KEY
+    )
+    assert config.orchestrator.client.extra_headers_from_state["X-Test-State"] == "env_name"
+
+
+def test_llmd_router_requires_router_url(tmp_path):
+    write_toml(
+        tmp_path / "llmd.toml",
+        {
+            "experimental": {"llmd_router": {"enabled": True}},
+            "orchestrator": {"use_renderer": False, "renderer": {"name": "auto"}},
+        },
+    )
+
+    with pytest.raises(ConfigFileError, match="experimental.llmd_router.router_url"):
+        cli(RLConfig, args=["@", "examples/reverse_text/rl.toml", "@", str(tmp_path / "llmd.toml")])
+
+
+def test_llmd_router_requires_openai_compatible_rollouts(tmp_path):
+    write_toml(
+        tmp_path / "llmd.toml",
+        {
+            "experimental": {
+                "llmd_router": {
+                    "enabled": True,
+                    "router_url": "http://llmd-router.prime-rl.svc.cluster.local/v1",
+                }
+            },
+        },
+    )
+
+    with pytest.raises(ConfigFileError, match="orchestrator.use_renderer = false"):
+        cli(RLConfig, args=["@", "examples/reverse_text/rl.toml", "@", str(tmp_path / "llmd.toml")])
 
 
 def test_ray_runtime_config_parses_ray_cluster_deployment(tmp_path):
@@ -708,13 +791,16 @@ def test_ray_native_rewrites_local_inference_client_urls():
     inference = InferenceConfig()
     inference.server.port = 8123
     orchestrator.client.admin_base_url = ["http://127.0.0.1:8000/v1"]
+    orchestrator.client.router_url = "http://llmd-router.prime-rl.svc.cluster.local/v1"
 
     rewritten = _orchestrator_with_ray_inference_endpoint(orchestrator, inference, "10.0.4.184")
 
     assert rewritten.client.base_url == ["http://10.0.4.184:8123/v1"]
     assert rewritten.client.admin_base_url == ["http://10.0.4.184:8123/v1"]
+    assert rewritten.client.router_url == "http://llmd-router.prime-rl.svc.cluster.local/v1"
     assert orchestrator.client.base_url == ["http://localhost:8000/v1"]
     assert orchestrator.client.admin_base_url == ["http://127.0.0.1:8000/v1"]
+    assert orchestrator.client.router_url == "http://llmd-router.prime-rl.svc.cluster.local/v1"
 
 
 def test_ray_native_preserves_external_inference_client_urls():

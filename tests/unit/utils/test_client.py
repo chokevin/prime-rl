@@ -6,7 +6,7 @@ import httpx
 import verifiers as vf
 
 from prime_rl.configs.shared import ClientConfig
-from prime_rl.utils.client import _is_retryable_lora_error, load_lora_adapter, setup_clients
+from prime_rl.utils.client import _is_retryable_lora_error, load_lora_adapter, setup_admin_clients, setup_clients
 
 
 def test_is_retryable_lora_error_returns_true_for_404():
@@ -114,3 +114,21 @@ def test_setup_clients_preserves_chat_client_defaults():
             extra_headers_from_state={},
         )
     ]
+
+
+def test_setup_clients_routes_generation_through_router_but_admin_direct():
+    client_config = ClientConfig(
+        base_url=["http://worker-a:8000/v1"],
+        admin_base_url=["http://admin-a:8000/v1"],
+        router_url="http://llmd-router:8000/v1",
+        api_key_var="PRIME_API_KEY",
+    )
+
+    clients = setup_clients(client_config)
+    admin_clients = setup_admin_clients(client_config)
+
+    try:
+        assert [client.api_base_url for client in clients] == ["http://llmd-router:8000/v1"]
+        assert [str(client.base_url).rstrip("/") for client in admin_clients] == ["http://admin-a:8000"]
+    finally:
+        asyncio.run(admin_clients[0].aclose())

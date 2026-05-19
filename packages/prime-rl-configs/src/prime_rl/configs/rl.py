@@ -19,6 +19,12 @@ from prime_rl.configs.orchestrator import (
     OrchestratorConfig,
 )
 from prime_rl.configs.shared import (
+    LLMD_REQUIRED_WEIGHT_VERSION_HEADER,
+    LLMD_REQUIRED_WEIGHT_VERSION_STATE_KEY,
+    LLMD_ROLLOUT_ID_HEADER,
+    LLMD_ROLLOUT_ID_STATE_KEY,
+    LLMD_RUN_ID_HEADER,
+    LLMD_SESSION_ID_HEADER,
     SlurmConfig,
     VLMConfig,
     WandbConfig,
@@ -179,6 +185,59 @@ class RayRuntimeConfig(BaseConfig):
     ] = 1.0
 
 
+class LLMDRouterConfig(BaseConfig):
+    """Configures experimental llm-d routing for rollout generation."""
+
+    enabled: Annotated[
+        bool,
+        Field(
+            description=(
+                "Route rollout/eval generation through an external llm-d router. "
+                "Prime-vLLM admin and weight-update calls still go directly to the configured backend URLs."
+            ),
+        ),
+    ] = False
+
+    router_url: Annotated[
+        str | None,
+        Field(description="OpenAI-compatible llm-d router base URL, usually ending in /v1."),
+    ] = None
+
+    require_weight_version: Annotated[
+        bool,
+        Field(
+            description=(
+                f"When true, send {LLMD_REQUIRED_WEIGHT_VERSION_HEADER} from rollout state so the router can "
+                "select backends serving the required policy/weight version."
+            ),
+        ),
+    ] = True
+
+    run_id: Annotated[
+        str | None,
+        Field(
+            description=(
+                f"Run identifier to send as {LLMD_RUN_ID_HEADER}. Defaults to the resolved top-level output_dir name."
+            ),
+        ),
+    ] = None
+
+    headers: Annotated[
+        dict[str, str],
+        Field(description="Static headers to merge into orchestrator.client.headers when llm-d routing is enabled."),
+    ] = {}
+
+    extra_headers_from_state: Annotated[
+        dict[str, str],
+        Field(
+            description=(
+                "Additional dynamic header mappings to merge into orchestrator.client.extra_headers_from_state "
+                "when llm-d routing is enabled. Keys are HTTP header names, values are rollout state field names."
+            ),
+        ),
+    ] = {}
+
+
 class RLExperimentalConfig(BaseConfig):
     """Experimental features for RL training."""
 
@@ -186,6 +245,11 @@ class RLExperimentalConfig(BaseConfig):
         RayRuntimeConfig,
         Field(description="Experimental Ray-native runtime settings."),
     ] = RayRuntimeConfig()
+
+    llmd_router: Annotated[
+        LLMDRouterConfig,
+        Field(description="Experimental llm-d router settings for rollout generation."),
+    ] = LLMDRouterConfig()
 
 
 class SharedLogConfig(BaseConfig):
@@ -987,6 +1051,70 @@ class RLConfig(BaseConfig):
     def auto_setup_session_headers(self):
         """Ensure X-Session-ID header is always set for sticky DP-aware routing at the inference router."""
         self.orchestrator.client.extra_headers_from_state.setdefault("X-Session-ID", "example_id")
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_llmd_router(self):
+        """Wire llm-d routing through the existing orchestrator client config."""
+        llmd_router = self.experimental.llmd_router
+        if not llmd_router.enabled:
+            return self
+
+        if llmd_router.router_url is None:
+            raise ValueError(
+                "experimental.llmd_router.router_url must be set when experimental.llmd_router.enabled = true."
+            )
+
+        if self.orchestrator.teacher_rollout_model is not None:
+            raise ValueError(
+                "experimental.llmd_router.enabled does not support orchestrator.teacher_rollout_model. "
+                "llm-d routing is for student rollout generation with policy updates."
+            )
+
+        if self.orchestrator.use_renderer:
+            raise ValueError(
+                "experimental.llmd_router.enabled requires orchestrator.use_renderer = false because llm-d "
+                "routes OpenAI-compatible generation endpoints, not Prime-RL renderer /v1/generate traffic."
+            )
+
+        client = self.orchestrator.client
+        if client.router_url is not None and client.router_url != llmd_router.router_url:
+            raise ValueError(
+                "orchestrator.client.router_url conflicts with experimental.llmd_router.router_url. "
+                "Set only one router URL or make them match."
+            )
+        client.router_url = llmd_router.router_url
+
+        run_id = llmd_router.run_id or self.output_dir.name
+        llmd_headers = {LLMD_RUN_ID_HEADER: run_id, **llmd_router.headers}
+        for header, value in llmd_headers.items():
+            existing = client.headers.get(header)
+            if existing is not None and existing != value:
+                raise ValueError(
+                    f"orchestrator.client.headers[{header!r}] conflicts with experimental.llmd_router.headers."
+                )
+            client.headers[header] = value
+
+        llmd_state_headers = {
+            LLMD_SESSION_ID_HEADER: "example_id",
+            LLMD_ROLLOUT_ID_HEADER: LLMD_ROLLOUT_ID_STATE_KEY,
+            **llmd_router.extra_headers_from_state,
+        }
+        if llmd_router.require_weight_version:
+            llmd_state_headers.setdefault(
+                LLMD_REQUIRED_WEIGHT_VERSION_HEADER,
+                LLMD_REQUIRED_WEIGHT_VERSION_STATE_KEY,
+            )
+
+        for header, state_key in llmd_state_headers.items():
+            existing = client.extra_headers_from_state.get(header)
+            if existing is not None and existing != state_key:
+                raise ValueError(
+                    f"orchestrator.client.extra_headers_from_state[{header!r}] conflicts with "
+                    "experimental.llmd_router.extra_headers_from_state."
+                )
+            client.extra_headers_from_state[header] = state_key
+
         return self
 
     @model_validator(mode="after")

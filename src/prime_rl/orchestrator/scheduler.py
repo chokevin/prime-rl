@@ -4,23 +4,34 @@ import asyncio
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import verifiers as vf
 from aiolimiter import AsyncLimiter
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
-from prime_rl.orchestrator.buffer import Buffer
-from prime_rl.orchestrator.envs import TrainEnvs
+from prime_rl.configs.shared import LLMD_REQUIRED_WEIGHT_VERSION_STATE_KEY, LLMD_ROLLOUT_ID_STATE_KEY
 from prime_rl.orchestrator.vf_utils import get_seq_len
 from prime_rl.utils.async_utils import safe_cancel, safe_cancel_all
 from prime_rl.utils.client import InferencePool
 from prime_rl.utils.logger import ProgressTracker, get_logger
-from prime_rl.utils.utils import (
-    get_broadcast_dir,
-    get_latest_ckpt_step,
-    get_step_path,
-    wait_for_path,
-)
+from prime_rl.utils.pathing import get_broadcast_dir, get_step_path, wait_for_path
+
+if TYPE_CHECKING:
+    from prime_rl.orchestrator.buffer import Buffer
+    from prime_rl.orchestrator.envs import TrainEnvs
+
+
+def get_latest_ckpt_step(weights_dir: Path) -> int | None:
+    step_dirs = list(weights_dir.glob("step_*"))
+    if len(step_dirs) == 0:
+        return None
+    steps = sorted([int(step_dir.name.split("_")[-1]) for step_dir in step_dirs])
+    for latest_step in reversed(steps):
+        if (weights_dir / f"step_{latest_step}" / "STABLE").exists():
+            return latest_step
+    return None
 
 
 @dataclass
@@ -57,6 +68,12 @@ class GroupState:
     # Highest round already counted as failed; used to dedupe failures from
     # multiple rollouts in the same round.
     last_failed_round: int = -1
+
+
+LLMD_ROUTING_METADATA_STATE_KEYS = {
+    LLMD_ROLLOUT_ID_STATE_KEY,
+    LLMD_REQUIRED_WEIGHT_VERSION_STATE_KEY,
+}
 
 
 class Scheduler:
@@ -116,6 +133,7 @@ class Scheduler:
 
         # Track in-progress groups while rollouts are generated independently.
         self.next_group_id = 0
+        self.next_rollout_request_id = 0
         self.groups: dict[int, GroupState] = {}
 
         self.step, self.ckpt_step = 0, 0
@@ -182,6 +200,30 @@ class Scheduler:
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
         return min(clients, key=lambda c: inflight[self._client_identity(c)])
 
+    @staticmethod
+    def _client_needs_llmd_routing_metadata(client_config: vf.ClientConfig) -> bool:
+        state_keys = set(client_config.extra_headers_from_state.values())
+        return bool(LLMD_ROUTING_METADATA_STATE_KEYS & state_keys)
+
+    def _example_with_llmd_routing_metadata(
+        self,
+        example: dict,
+        client_config: vf.ClientConfig,
+        *,
+        group_id: int,
+        request_id: int,
+    ) -> dict:
+        if not self._client_needs_llmd_routing_metadata(client_config):
+            return example
+
+        return {
+            **example,
+            LLMD_ROLLOUT_ID_STATE_KEY: (
+                f"step-{self.step}-policy-{self.ckpt_step}-group-{group_id}-request-{request_id}"
+            ),
+            LLMD_REQUIRED_WEIGHT_VERSION_STATE_KEY: str(self.ckpt_step),
+        }
+
     async def drop_group(self, group_id: int) -> int:
         """Drop a group and cancel any remaining in-flight rollouts for it. Returns the number of cancelled rollouts."""
         tasks_to_cancel = []
@@ -214,6 +256,14 @@ class Scheduler:
 
         env_name = group.example["env_name"]
         env = self.train_envs.get(env_name)
+        request_id = self.next_rollout_request_id
+        self.next_rollout_request_id += 1
+        example = self._example_with_llmd_routing_metadata(
+            group.example,
+            client_config,
+            group_id=group_id,
+            request_id=request_id,
+        )
 
         cache_salt = str(self.ckpt_step)
         if env.requires_group_scoring:
@@ -222,7 +272,7 @@ class Scheduler:
             task = asyncio.create_task(
                 env.run_group(
                     client=client_config,
-                    example=group.example,
+                    example=example,
                     model_name=self.model_name,
                     rollouts_per_example=rollout_count,
                     cache_salt=cache_salt,
@@ -234,7 +284,7 @@ class Scheduler:
             task = asyncio.create_task(
                 env.run_rollout(
                     client=client_config,
-                    example=group.example,
+                    example=example,
                     model_name=self.model_name,
                     cache_salt=cache_salt,
                 )

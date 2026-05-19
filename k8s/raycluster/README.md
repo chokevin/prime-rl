@@ -133,6 +133,47 @@ orchestrator and inference worker counts.
 Other splits work as long as each Prime-vLLM task has enough GPUs on one worker
 pod and the RayCluster has enough total GPUs for all roles.
 
+## Optional llm-d routing
+
+Prime-RL can send rollout/eval generation through an external llm-d router while
+keeping Prime-vLLM admin calls direct to each backend. Enable it in the RL config,
+and force MITO/OpenAI chat completions because llm-d should not route Prime-RL's
+renderer-only `/v1/generate` traffic:
+
+```toml
+[experimental.llmd_router]
+enabled = true
+router_url = "http://<llmd-gateway-or-route>/v1"
+run_id = "h200-smoke"  # optional; defaults to output_dir.name
+
+[orchestrator]
+use_renderer = false
+```
+
+`experimental.llmd_router` wires the existing
+`orchestrator.client.router_url`. Generation clients use that router URL, but
+admin clients continue to use `orchestrator.client.admin_base_url` when set or
+`orchestrator.client.base_url` otherwise. In Ray-native mode, local direct
+backend URLs are rewritten to the Prime-vLLM Ray worker pod IP; the external
+router URL is preserved.
+
+On Kubernetes, llm-d's preferred backend discovery path is the Gateway API
+Inference Extension `InferencePool`: the pool selects ready backend pods by
+labels, forwards to its `targetPorts`, and delegates routing decisions to an
+Endpoint Picker service. The EPP watches matching pods, honors the
+`inference.networking.k8s.io/active-ports` annotation for multi-port pods, and
+scrapes model-server metrics for load/LoRA/cache-aware routing. For Prime-RL
+RayCluster runs this means the Ray worker pod template, not the Ray task, must
+carry labels that match the `InferencePool` selector, and the Prime-vLLM server
+port must match the pool target port.
+
+Prime-RL adds request metadata headers for run id, rollout id, session id, and
+required policy/weight version. The cluster-side llm-d configuration must decide
+how those headers map to backend eligibility. Do not point llm-d at Prime-vLLM
+admin endpoints; `/pause`, `/resume`, `/update_weights`, `/init_broadcaster`,
+health, model checks, and LoRA admin calls remain direct Prime-RL control-plane
+traffic.
+
 ## See also
 
 - `docs/ray.md` — Ray-native architecture and config reference.
