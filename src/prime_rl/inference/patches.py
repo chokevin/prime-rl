@@ -1,3 +1,5 @@
+from importlib.metadata import PackageNotFoundError, version
+
 import torch
 
 
@@ -616,6 +618,14 @@ def monkey_patch_dp_engine_core_pause_resume_deadlock():
     from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
     from vllm.v1.request import Request
 
+    _require_vllm_attrs_for_patch(
+        {
+            EngineCore: ("add_request",),
+            EngineCoreProc: ("_handle_client_request", "_pause_complete", "resume_scheduler"),
+            DPEngineCoreProc: ("_has_global_unfinished_reqs",),
+        }
+    )
+
     _base_add_request = EngineCore.add_request
     _base_handle_client_request = EngineCoreProc._handle_client_request
     _base_pause_complete = EngineCoreProc._pause_complete
@@ -668,6 +678,32 @@ def monkey_patch_dp_engine_core_pause_resume_deadlock():
     DPEngineCoreProc._pause_complete = _patched_pause_complete
     DPEngineCoreProc.resume_scheduler = _patched_resume_scheduler
     DPEngineCoreProc._has_global_unfinished_reqs = _patched_has_global_unfinished_reqs
+
+
+def _get_vllm_version() -> str:
+    try:
+        return version("vllm")
+    except PackageNotFoundError:
+        import vllm
+
+        return getattr(vllm, "__version__", "unknown")
+
+
+def _require_vllm_attrs_for_patch(required_attrs: dict[type, tuple[str, ...]]) -> None:
+    missing = {
+        cls.__name__: [name for name in attrs if not hasattr(cls, name)] for cls, attrs in required_attrs.items()
+    }
+    missing = {cls_name: attrs for cls_name, attrs in missing.items() if attrs}
+    if not missing:
+        return
+
+    missing_text = ", ".join(f"{cls_name}.{attr}" for cls_name, attrs in missing.items() for attr in attrs)
+    raise RuntimeError(
+        "Prime-RL's vLLM DP pause/resume patch requires vLLM >=0.21.0 with expected EngineCore APIs. "
+        f"Installed vLLM version: {_get_vllm_version()}. Missing: {missing_text}. "
+        "Use a runtime image whose vLLM version matches the Prime-RL fork, or disable this fork/runtime mismatch before "
+        "launching."
+    )
 
 
 def monkey_patch_no_moe_lora():
