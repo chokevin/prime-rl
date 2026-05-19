@@ -131,14 +131,19 @@ def get_ckpt_disk_metrics(output_dir: Path) -> dict[str, float]:
 
 
 def setup_torch_distributed(timeout: timedelta = DEFAULT_TIMEOUT, enable_gloo: bool = False):
-    device_id = get_world().local_rank
-    torch.cuda.set_device(device_id)
+    device_index = get_world().local_rank
+    torch.cuda.set_device(device_index)
+    device_id = torch.device("cuda", device_index)
     # Use Gloo backend for CPU and NCCL for GPU when CPU offloading is enabled
     # Otherwise use NCCL for better GPU performance
     backend = None  # by default nccl
     if enable_gloo:
         get_logger().info("Using Gloo backend for CPU and NCCL backend for GPU")
         backend = "cpu:gloo,cuda:nccl"
+
+    if dist.is_initialized():
+        get_logger().info("Reusing existing torch.distributed process group")
+        return
 
     dist.init_process_group(backend=backend, timeout=timeout, device_id=device_id)
 

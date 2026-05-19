@@ -52,8 +52,140 @@ from prime_rl.utils.validation import (
 )
 
 
+class RayRuntimeEnvConfig(BaseConfig):
+    """Configures Ray runtime_env for remote RayCluster workers."""
+
+    working_dir: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional Ray runtime_env working_dir. Use this for RayCluster validation when worker pods "
+                "need the fork checkout uploaded from the launcher."
+            )
+        ),
+    ] = None
+
+    env_vars: Annotated[
+        dict[str, str],
+        Field(description="Optional Ray runtime_env env_vars to set on remote Ray workers."),
+    ] = {}
+
+
+class RayRuntimeConfig(BaseConfig):
+    """Configures experimental Ray-native RL training."""
+
+    enabled: Annotated[
+        bool,
+        Field(
+            description=(
+                "Start local single-node RL roles as in-process Ray tasks. "
+                "Inference, orchestrator, and trainer rank workers call Prime-RL Python functions directly."
+            )
+        ),
+    ] = False
+
+    address: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Ray cluster address for the launcher. If unset, ray.init starts or connects using Ray defaults."
+            )
+        ),
+    ] = None
+
+    namespace: Annotated[str, Field(description="Ray namespace for native role tasks and transport actors.")] = (
+        "prime-rl"
+    )
+
+    log_to_driver: Annotated[
+        bool,
+        Field(description="Forward Ray worker logs to the launcher driver."),
+    ] = False
+
+    runtime_env: Annotated[
+        RayRuntimeEnvConfig,
+        Field(description="Optional Ray runtime_env settings for remote workers."),
+    ] = RayRuntimeEnvConfig()
+
+    role_num_cpus: Annotated[
+        float,
+        Field(
+            gt=0,
+            description="CPU resources reserved for each Ray inference/orchestrator role task.",
+        ),
+    ] = 1.0
+
+    trainer_worker_num_cpus: Annotated[
+        float,
+        Field(
+            gt=0,
+            description="CPU resources reserved for each Ray trainer rank task.",
+        ),
+    ] = 1.0
+
+    placement_strategy: Annotated[
+        Literal["PACK", "SPREAD", "STRICT_PACK", "STRICT_SPREAD"],
+        Field(
+            description=(
+                "Ray placement group strategy for the native RL role tasks. "
+                "STRICT_PACK keeps the single-node deployment on one Ray node."
+            )
+        ),
+    ] = "STRICT_PACK"
+
+    trainer_backend: Annotated[
+        Literal["tasks", "ray_train"],
+        Field(
+            description=(
+                "Backend for trainer execution in Ray-native mode. "
+                "'tasks' launches one Ray GPU task per rank and emulates torchrun. "
+                "'ray_train' uses ray.train.torch.TorchTrainer to own trainer worker orchestration."
+            )
+        ),
+    ] = "tasks"
+
+    inference_backend: Annotated[
+        Literal["prime_vllm"],
+        Field(
+            description=(
+                "Backend for inference execution in Ray-native mode. "
+                "'prime_vllm' runs Prime-RL's existing vLLM server inside a Ray GPU task, "
+                "preserving custom endpoints and filesystem/NCCL weight-update behavior."
+            )
+        ),
+    ] = "prime_vllm"
+
+    train_run_name: Annotated[
+        str | None,
+        Field(description="Optional Ray Train run name when trainer_backend = 'ray_train'."),
+    ] = None
+
+    train_storage_path: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional Ray Train storage_path when trainer_backend = 'ray_train'. "
+                "Use shared storage for future multi-node RayCluster validation."
+            )
+        ),
+    ] = None
+
+    poll_interval_seconds: Annotated[
+        float,
+        Field(
+            gt=0,
+            description="Seconds between Ray role status polls.",
+        ),
+    ] = 1.0
+
+
 class RLExperimentalConfig(BaseConfig):
     """Experimental features for RL training."""
+
+    ray: Annotated[
+        RayRuntimeConfig,
+        Field(description="Experimental Ray-native runtime settings."),
+    ] = RayRuntimeConfig()
 
 
 class SharedLogConfig(BaseConfig):
@@ -197,6 +329,51 @@ class SingleNodeDeploymentConfig(BaseDeploymentConfig):
         return self
 
 
+class RayClusterDeploymentConfig(BaseDeploymentConfig):
+    """Configures logical role resources for Ray-native RayCluster deployment."""
+
+    type: Literal["ray_cluster"] = "ray_cluster"
+
+    num_train_gpus: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Number of trainer GPU workers to launch through Ray. These workers may be spread across "
+                "RayCluster nodes by the Ray placement strategy."
+            ),
+        ),
+    ] = 1
+    num_infer_gpus: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Number of GPUs reserved by the Prime-vLLM inference Ray task. Must fit on one Ray worker node."
+            ),
+        ),
+    ] = 1
+    num_teacher_gpus: Annotated[
+        int | None,
+        Field(description="Number of GPUs reserved by the teacher inference Ray task, if configured."),
+    ] = None
+
+    @model_validator(mode="after")
+    def validate_role_bundle_gpu_count(self):
+        if self.num_infer_gpus > self.gpus_per_node:
+            raise ValueError(
+                f"Ray inference GPU count ({self.num_infer_gpus}) exceeds gpus_per_node ({self.gpus_per_node}). "
+                "Prime-vLLM inference is scheduled as one Ray task and must fit on one Ray worker node."
+            )
+        if self.num_teacher_gpus is not None and self.num_teacher_gpus > self.gpus_per_node:
+            raise ValueError(
+                f"Ray teacher inference GPU count ({self.num_teacher_gpus}) exceeds gpus_per_node "
+                f"({self.gpus_per_node}). Teacher inference is scheduled as one Ray task and must fit on one "
+                "Ray worker node."
+            )
+        return self
+
+
 class MultiNodeDeploymentConfig(BaseDeploymentConfig):
     """Configures a multi node deployment."""
 
@@ -238,7 +415,7 @@ class MultiNodeDeploymentConfig(BaseDeploymentConfig):
 
 
 DeploymentConfig: TypeAlias = Annotated[
-    SingleNodeDeploymentConfig | MultiNodeDeploymentConfig, Field(discriminator="type")
+    SingleNodeDeploymentConfig | RayClusterDeploymentConfig | MultiNodeDeploymentConfig, Field(discriminator="type")
 ]
 
 
@@ -370,6 +547,11 @@ class RLConfig(BaseConfig):
     @model_validator(mode="after")
     def validate_deployment(self):
         if self.deployment.type == "multi_node":
+            if self.experimental.ray.enabled:
+                raise ValueError(
+                    "deployment.type = 'multi_node' is the SLURM multi-node path. "
+                    "Use deployment.type = 'ray_cluster' with experimental.ray.enabled for Ray-native multi-node runs."
+                )
             if self.slurm is None:
                 raise ValueError("Must use SLURM for multi-node deployment.")
             if self.deployment.num_infer_nodes > 0 and not self.inference:
@@ -384,6 +566,37 @@ class RLConfig(BaseConfig):
                     "Must use fake data (trainer.data.fake or bench = true) when num_infer_nodes = 0, "
                     "since no orchestrator or inference server will be running."
                 )
+        if self.deployment.type == "ray_cluster":
+            if self.slurm is not None:
+                raise ValueError("deployment.type = 'ray_cluster' cannot be combined with SLURM.")
+            if self.inference is not None and self.deployment.num_infer_gpus < 1:
+                raise ValueError("Ray-native inference requires deployment.num_infer_gpus >= 1.")
+            if self.teacher_inference is not None and not self.deployment.num_teacher_gpus:
+                raise ValueError("Ray-native teacher inference requires deployment.num_teacher_gpus >= 1.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_ray_runtime(self):
+        if not self.experimental.ray.enabled:
+            return self
+        if self.slurm is not None:
+            raise ValueError("experimental.ray.enabled is only supported for local runs without SLURM.")
+        if self.deployment.type not in ("single_node", "ray_cluster"):
+            raise ValueError(
+                "experimental.ray.enabled supports deployment.type = 'single_node' or 'ray_cluster'. "
+                "Use 'ray_cluster' for Ray-native multi-node placement."
+            )
+        if self.trainer.rollout_transport.type != "ray" or self.orchestrator.rollout_transport.type != "ray":
+            raise ValueError(
+                "experimental.ray.enabled requires trainer.rollout_transport.type = 'ray' and "
+                "orchestrator.rollout_transport.type = 'ray'."
+            )
+        if self.trainer.rollout_transport.actor_name != self.orchestrator.rollout_transport.actor_name:
+            raise ValueError("Ray trainer and orchestrator rollout transports must use the same actor_name.")
+        if self.trainer.rollout_transport.namespace != self.orchestrator.rollout_transport.namespace:
+            raise ValueError("Ray trainer and orchestrator rollout transports must use the same namespace.")
+        if self.experimental.ray.trainer_backend == "ray_train" and self.deployment.num_train_gpus < 1:
+            raise ValueError("experimental.ray.trainer_backend = 'ray_train' requires at least one trainer GPU.")
         return self
 
     # TODO: fix this
@@ -398,7 +611,7 @@ class RLConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_enough_devices_for_nccl(self):
-        if self.deployment.type == "single_node":
+        if self.deployment.type in ("single_node", "ray_cluster"):
             if self.trainer.weight_broadcast.type == "nccl":
                 if self.deployment.num_train_gpus + self.deployment.num_infer_gpus < 2:
                     raise ValueError(
@@ -425,8 +638,10 @@ class RLConfig(BaseConfig):
     @model_validator(mode="after")
     def validate_teacher_model(self):
         if (
-            self.trainer.loss.type == "default" and self.trainer.loss.teacher_tau > 0
-        ) and not self.orchestrator.teacher_model:
+            (self.trainer.loss.type == "default" and self.trainer.loss.teacher_tau > 0)
+            and not self.orchestrator.teacher_model
+            and not getattr(self.deployment, "num_teacher_gpus", None)
+        ):
             raise ValueError(
                 "teacher_model must be configured when teacher_tau > 0. "
                 "Either set teacher_tau = 0, set deployment.num_teacher_gpus, or configure teacher_model manually."
@@ -814,6 +1029,54 @@ class RLConfig(BaseConfig):
                 if self.inference.api_server_count < dp and not self.inference.enable_lora:
                     self.inference.api_server_count = dp
 
+        elif self.deployment.type == "ray_cluster":
+            # Mirror the single_node logic: every trainer rank is one data parallel
+            # replica modulo context-parallel sharding. Ray places ranks across
+            # RayCluster workers via the placement group, but the orchestrator's
+            # accounting is the same as single_node.
+            non_data_parallel_size = self.trainer.model.cp
+            if self.deployment.num_train_gpus > 1:
+                self.orchestrator.num_train_workers = self.deployment.num_train_gpus // non_data_parallel_size
+
+            # When the trainer spans more than one RayCluster worker node, default to
+            # HSDP with one FSDP island per node so all-gather/reduce-scatter stay on
+            # intra-node NVLINK and only the dp_replicate all-reduce crosses pods.
+            # Mirrors the multi_node nodes_per_fsdp_group helper. Opt out by setting
+            # trainer.model.dp_replicate explicitly.
+            if (
+                "dp_replicate" not in self.trainer.model.model_fields_set
+                and self.deployment.num_train_gpus > self.deployment.gpus_per_node
+                and self.deployment.num_train_gpus % self.deployment.gpus_per_node == 0
+            ):
+                self.trainer.model.dp_replicate = self.deployment.num_train_gpus // self.deployment.gpus_per_node
+
+            # Auto-fill inference DP from num_infer_gpus / tp, matching single_node
+            # behavior. The whole Prime-vLLM server runs as one Ray task that holds
+            # num_infer_gpus GPUs on a single Ray worker node, so DP and TP are
+            # local-only.
+            if self.inference is not None:
+                num_infer_gpus = self.deployment.num_infer_gpus
+                if num_infer_gpus != self.inference.parallel.dp * self.inference.parallel.tp:
+                    assert num_infer_gpus % self.inference.parallel.tp == 0, (
+                        "Ray-native deployment.num_infer_gpus must be divisible by inference.parallel.tp"
+                    )
+                    self.inference.parallel.dp = num_infer_gpus // self.inference.parallel.tp
+                dp = self.inference.parallel.dp
+                if self.inference.api_server_count < dp and not self.inference.enable_lora:
+                    self.inference.api_server_count = dp
+
+            # NCCL weight broadcast world size: all DP/TP workers on the inference task
+            # participate in the broadcast collective.
+            if self.weight_broadcast is not None and self.weight_broadcast.type == "nccl":
+                api_server_count = self.inference.api_server_count if self.inference is not None else 1
+                tp = self.inference.parallel.tp if self.inference is not None else 1
+                total_infer_workers = api_server_count * tp
+                assert self.trainer.weight_broadcast.type == "nccl"
+                self.trainer.weight_broadcast.host = "0.0.0.0"
+                self.trainer.weight_broadcast.inference_world_size = total_infer_workers
+                assert self.orchestrator.weight_broadcast.type == "nccl"
+                self.orchestrator.weight_broadcast.inference_world_size = total_infer_workers
+
         elif self.deployment.type == "multi_node":  # multi-node
             self.orchestrator.num_train_workers = self.deployment.num_train_nodes * self.deployment.gpus_per_node
 
@@ -933,7 +1196,7 @@ class RLConfig(BaseConfig):
     @model_validator(mode="after")
     def auto_setup_teacher_inference(self):
         """Auto-configure teacher inference server and orchestrator teacher_model client."""
-        if self.deployment.type != "single_node":
+        if self.deployment.type not in ("single_node", "ray_cluster"):
             return self
         if self.deployment.num_teacher_gpus is None or self.deployment.num_teacher_gpus == 0:
             return self

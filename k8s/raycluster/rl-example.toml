@@ -1,0 +1,49 @@
+# Minimal Ray-native Prime-RL config for the RayCluster example.
+#
+# Small example:
+#   - deployment.type = "ray_cluster": logical role GPU resources placed by Ray.
+#   - experimental.ray.enabled = true with Ray Train trainer + Prime-vLLM inference.
+#   - Ray rollout transport so trainer and orchestrator do not need shared FS for
+#     batches (checkpoints and weight broadcasts still go through /shared).
+#
+# Edit `model`, `data`, `total_steps`, and the GPU counts for your experiment.
+
+[deployment]
+type = "ray_cluster"
+gpus_per_node = 1
+num_train_gpus = 1
+num_infer_gpus = 1
+# num_teacher_gpus = 1  # uncomment to add a teacher Prime-vLLM task
+
+[experimental.ray]
+enabled = true
+namespace = "prime-rl"
+placement_strategy = "SPREAD"
+address = "auto"
+trainer_backend = "ray_train"
+inference_backend = "prime_vllm"
+train_storage_path = "/shared/outputs/ray-train"
+
+[experimental.ray.runtime_env]
+working_dir = "/shared/checkouts/prime-rl"
+
+[experimental.ray.runtime_env.env_vars]
+PYTHONPATH = "/shared/checkouts/prime-rl/src:/shared/checkouts/prime-rl/packages/prime-rl-configs/src"
+
+[trainer]
+max_steps = 1
+# model, data, optimizer, loss, etc. come from your chosen example config.
+# Layer this file with `--include examples/reverse_text/rl.toml` if you want
+# the rest of the reverse-text settings, or copy fields here directly.
+
+[trainer.rollout_transport]
+type = "ray"
+address = "auto"
+namespace = "prime-rl"
+actor_name = "prime-rl-transport"
+
+[orchestrator.rollout_transport]
+type = "ray"
+address = "auto"
+namespace = "prime-rl"
+actor_name = "prime-rl-transport"

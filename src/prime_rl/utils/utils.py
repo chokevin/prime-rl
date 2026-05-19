@@ -46,6 +46,10 @@ def capitalize(s: str) -> str:
     return s[0].upper() + s[1:]
 
 
+def should_destroy_process_group() -> bool:
+    return dist.is_initialized() and os.environ.get("PRIME_RL_SKIP_DIST_DESTROY") != "1"
+
+
 def clean_exit(func: Callable) -> Callable:
     """
     A decorator that ensures the a torch.distributed process group is properly
@@ -67,7 +71,7 @@ def clean_exit(func: Callable) -> Callable:
                 # the event loop swallows it and the process hangs indefinitely.
                 sys.exit(1)
             finally:
-                if dist.is_initialized():
+                if should_destroy_process_group():
                     dist.destroy_process_group()
 
         return async_wrapper
@@ -85,7 +89,7 @@ def clean_exit(func: Callable) -> Callable:
                 # sys.exit raises SystemExit so the finally block still runs.
                 sys.exit(1)
             finally:
-                if dist.is_initialized():
+                if should_destroy_process_group():
                     dist.destroy_process_group()
 
         return sync_wrapper

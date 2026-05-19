@@ -1,10 +1,37 @@
-# Kubernetes Deployment with Helm
+# Kubernetes deployment
 
-This directory contains a Helm chart for deploying PRIME-RL training infrastructure on Kubernetes clusters.
+Prime-RL ships two Kubernetes paths. New deployments should use the Ray-native
+RayCluster path under [`raycluster/`](./raycluster/). The legacy StatefulSet
+Helm chart under [`prime-rl/`](./prime-rl/) is the SLURM-shaped topology kept
+for backwards compatibility.
 
-For complete documentation, see the [Kubernetes guide](https://docs.primeintellect.ai/prime-rl/kubernetes).
+See [`docs/kubernetes.md`](../docs/kubernetes.md) for the decision matrix and
+[`docs/ray.md`](../docs/ray.md) for the Ray-native architecture reference.
 
-## Quick Start
+## Ray-native RayCluster (recommended)
+
+KubeRay `RayCluster` with a CPU head, a GPU worker group, and a launch Job that
+submits the Prime-RL `rl` entrypoint from the head pool.
+
+```bash
+# 1. Bring up the cluster (edit namespace, image, nodeSelectors, PVC first).
+kubectl apply -f raycluster/raycluster.yaml
+
+# 2. Submit the Prime-RL launcher from the head pool.
+kubectl apply -f raycluster/rl-launch-job.yaml
+
+# 3. Follow the launcher.
+kubectl logs -f -n prime-rl job/prime-rl-launch
+```
+
+See [`raycluster/README.md`](./raycluster/README.md) for prerequisites
+(KubeRay operator, NVIDIA GPU Operator, shared `ReadWriteMany` PVC).
+
+## Legacy StatefulSet Helm chart
+
+Process-role Helm chart with one `StatefulSet` per Prime-RL role. Use this only
+when your cluster already mirrors SLURM topology or you have existing workflows
+around the chart.
 
 ```bash
 # Deploy with the reverse-text example

@@ -98,6 +98,32 @@ def check_gpus_available(gpu_ids: list[int]) -> None:
         raise RuntimeError(msg)
 
 
+def build_wandb_shared_env(config: RLConfig) -> dict[str, str]:
+    wandb_shared_env: dict[str, str] = {}
+    if config.wandb and config.wandb.shared:
+        wandb_shared_env["WANDB_SHARED_MODE"] = "1"
+        wandb_shared_env["WANDB_SHARED_RUN_ID"] = os.environ.get("WANDB_SHARED_RUN_ID", uuid.uuid4().hex)
+    return wandb_shared_env
+
+
+def validate_inference_client_port(config: RLConfig) -> None:
+    if config.inference is None or config.orchestrator.client.is_elastic:
+        return
+
+    from urllib.parse import urlparse
+
+    base_url = config.orchestrator.client.base_url[0]
+    parsed = urlparse(base_url)
+    client_port = parsed.port
+    expected_port = config.inference.server.port
+    if client_port != expected_port:
+        raise ValueError(
+            f"orchestrator.client.base_url port ({client_port}) does not match "
+            f"inference.server.port ({expected_port}). "
+            f"Update the base_url to use port {expected_port} to match the inference server."
+        )
+
+
 def rl_local(config: RLConfig):
     assert config.deployment.type == "single_node"
 
@@ -143,29 +169,14 @@ def rl_local(config: RLConfig):
     logger.debug(f"RL start command: {' '.join(start_command)}")
 
     # Build shared W&B env vars for subprocesses
-    wandb_shared_env: dict[str, str] = {}
-    if config.wandb and config.wandb.shared:
-        wandb_shared_env["WANDB_SHARED_MODE"] = "1"
-        wandb_shared_env["WANDB_SHARED_RUN_ID"] = os.environ.get("WANDB_SHARED_RUN_ID", uuid.uuid4().hex)
+    wandb_shared_env = build_wandb_shared_env(config)
 
     # Check for existing processes on GPUs
     all_gpu_ids = list(set(infer_gpu_ids + trainer_gpu_ids + teacher_gpu_ids))
     check_gpus_available(all_gpu_ids)
 
     # Validate client port matches inference server port
-    if config.inference is not None and not config.orchestrator.client.is_elastic:
-        from urllib.parse import urlparse
-
-        base_url = config.orchestrator.client.base_url[0]
-        parsed = urlparse(base_url)
-        client_port = parsed.port
-        expected_port = config.inference.server.port
-        if client_port != expected_port:
-            raise ValueError(
-                f"orchestrator.client.base_url port ({client_port}) does not match "
-                f"inference.server.port ({expected_port}). "
-                f"Update the base_url to use port {expected_port} to match the inference server."
-            )
+    validate_inference_client_port(config)
 
     # Prepare paths to communicate with the trainer
     log_dir = get_log_dir(config.output_dir)
@@ -401,6 +412,66 @@ def rl_local(config: RLConfig):
         raise
 
 
+def rl_ray(config: RLConfig):
+    if config.deployment.type not in ("single_node", "ray_cluster"):
+        raise ValueError("Ray-native RL requires deployment.type = 'single_node' or 'ray_cluster'.")
+
+    from prime_rl.ray import run_ray_native
+
+    logger = setup_logger(
+        config.log.level or os.environ.get("PRIME_LOG_LEVEL", "info"),
+        json_logging=config.log.json_logging,
+    )
+
+    config_dir = config.output_dir / "configs"
+    write_subconfigs(config, config_dir)
+    logger.info(f"Wrote subconfigs to {config_dir}")
+
+    if config.dry_run:
+        logger.success("Dry run complete. To start a Ray-native RL run, remove --dry-run from your command.")
+        return
+
+    validate_inference_client_port(config)
+
+    wandb_shared_env = build_wandb_shared_env(config)
+    log_dir = get_log_dir(config.output_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    if config.inference is None and config.orchestrator.teacher_rollout_model is None:
+        logger.warning(
+            "No inference config specified, skipping starting inference server. "
+            "Make sure your inference server is running."
+        )
+    elif config.inference is None:
+        logger.info("No inference config specified, using orchestrator.teacher_rollout_model for rollout generation.")
+
+    if config.teacher_inference:
+        num_teacher_gpus = config.deployment.num_teacher_gpus or 0
+        if num_teacher_gpus == 0:
+            raise ValueError(
+                "teacher_inference is configured but deployment.num_teacher_gpus is not set. "
+                "Either set deployment.num_teacher_gpus to start a teacher inference server, "
+                "or omit teacher_inference and configure orchestrator.teacher_model to use an existing server."
+            )
+    elif (
+        config.trainer.loss.type == "default" and config.trainer.loss.teacher_tau > 0
+    ) or config.orchestrator.teacher_model:
+        logger.warning(
+            "No teacher_inference config specified, skipping starting teacher inference server. "
+            "Is your teacher inference server running? Make sure orchestrator.teacher_model is configured."
+        )
+
+    logger.info("Starting Ray-native RL run")
+    run_ray_native(
+        config,
+        log_dir=log_dir,
+        shared_env=wandb_shared_env,
+        master_port=get_free_port(),
+        start_command=sys.argv,
+    )
+    logger.success("Ray-native RL training finished!")
+
+
 def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) -> None:
     """Write the SLURM script to disk."""
     from jinja2 import Environment, FileSystemLoader
@@ -573,7 +644,12 @@ def rl(config: RLConfig):
     if not config.dry_run:
         pre_download_model(config.trainer.model.name)
 
-    if config.slurm is not None:
+    if config.deployment.type == "ray_cluster" and not config.experimental.ray.enabled:
+        raise ValueError("deployment.type = 'ray_cluster' requires experimental.ray.enabled = true.")
+
+    if config.experimental.ray.enabled:
+        rl_ray(config)
+    elif config.slurm is not None:
         rl_slurm(config)
     else:
         rl_local(config)

@@ -3,15 +3,22 @@ from typing import Annotated, Literal
 
 import pytest
 import tomli_w
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 from pydantic_config import ConfigFileError
 
 from prime_rl.configs.inference import InferenceConfig
-from prime_rl.configs.orchestrator import OrchestratorConfig
+from prime_rl.configs.orchestrator import OrchestratorConfig, TeacherModelConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
+from prime_rl.configs.shared import TransportConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
+from prime_rl.ray.native import (
+    _monitor_roles,
+    _orchestrator_with_ray_inference_endpoint,
+    _orchestrator_with_ray_teacher_endpoint,
+)
+from prime_rl.transport.ray import _RayTransportStore
 from prime_rl.utils.config import BaseConfig, cli
 
 # All config config classes
@@ -188,6 +195,662 @@ def test_orchestrator_vlm_configs_must_disable_renderer():
 def test_selective_activation_checkpointing_requires_custom_impl():
     with pytest.raises(ValidationError, match="Selective activation checkpointing requires model.impl='custom'"):
         TrainerModelConfig.model_validate({"impl": "hf", "ac": {"mode": "selective"}})
+
+
+def test_ray_runtime_config_requires_ray_transport():
+    with pytest.raises(ValidationError, match="rollout_transport.type = 'ray'"):
+        cli(
+            RLConfig,
+            args=[
+                "@",
+                "examples/reverse_text/rl.toml",
+                "--experimental.ray.enabled",
+            ],
+        )
+
+
+def test_ray_runtime_config_parses_with_ray_transport():
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "--experimental.ray.enabled",
+            "--experimental.ray.namespace",
+            "test",
+            "--trainer.rollout-transport.type",
+            "ray",
+            "--orchestrator.rollout-transport.type",
+            "ray",
+        ],
+    )
+    assert config.experimental.ray.enabled
+    assert config.experimental.ray.namespace == "test"
+    assert config.experimental.ray.placement_strategy == "STRICT_PACK"
+    assert config.experimental.ray.trainer_backend == "tasks"
+    assert config.experimental.ray.inference_backend == "prime_vllm"
+    assert config.trainer.rollout_transport.type == "ray"
+    assert config.orchestrator.rollout_transport.type == "ray"
+
+
+def test_ray_runtime_config_parses_prime_vllm_inference_backend():
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "--experimental.ray.enabled",
+            "--experimental.ray.inference-backend",
+            "prime_vllm",
+            "--trainer.rollout-transport.type",
+            "ray",
+            "--orchestrator.rollout-transport.type",
+            "ray",
+        ],
+    )
+    assert config.experimental.ray.inference_backend == "prime_vllm"
+
+
+def test_ray_runtime_config_parses_ray_train_backend():
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "--experimental.ray.enabled",
+            "--experimental.ray.trainer-backend",
+            "ray_train",
+            "--experimental.ray.train-run-name",
+            "test-run",
+            "--experimental.ray.train-storage-path",
+            "/tmp/ray-train",
+            "--trainer.rollout-transport.type",
+            "ray",
+            "--orchestrator.rollout-transport.type",
+            "ray",
+        ],
+    )
+    assert config.experimental.ray.trainer_backend == "ray_train"
+    assert config.experimental.ray.train_run_name == "test-run"
+    assert config.experimental.ray.train_storage_path == "/tmp/ray-train"
+
+
+def test_ray_runtime_config_parses_ray_cluster_deployment(tmp_path):
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "gpus_per_node": 1,
+                "num_train_gpus": 1,
+                "num_infer_gpus": 1,
+            },
+            "experimental": {
+                "ray": {
+                    "enabled": True,
+                    "address": "auto",
+                    "namespace": "test",
+                    "placement_strategy": "SPREAD",
+                    "trainer_backend": "ray_train",
+                    "inference_backend": "prime_vllm",
+                }
+            },
+            "trainer": {"rollout_transport": {"type": "ray", "address": "auto", "namespace": "test"}},
+            "orchestrator": {"rollout_transport": {"type": "ray", "address": "auto", "namespace": "test"}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster.toml"),
+        ],
+    )
+
+    assert config.deployment.type == "ray_cluster"
+    assert config.deployment.num_train_gpus == 1
+    assert config.deployment.num_infer_gpus == 1
+    assert config.experimental.ray.enabled
+    assert config.experimental.ray.placement_strategy == "SPREAD"
+    assert config.experimental.ray.trainer_backend == "ray_train"
+
+
+def test_ray_cluster_deployment_can_be_selected_before_ray_cli_flags(tmp_path):
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "num_train_gpus": 1,
+                "num_infer_gpus": 1,
+            },
+            "trainer": {"rollout_transport": {"type": "ray"}},
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster.toml"),
+            "--experimental.ray.enabled",
+        ],
+    )
+    assert config.deployment.type == "ray_cluster"
+    assert config.experimental.ray.enabled
+
+
+def test_ray_runtime_rejects_slurm_multinode_deployment(tmp_path):
+    write_toml(
+        tmp_path / "ray_multinode.toml",
+        {
+            "deployment": {
+                "type": "multi_node",
+                "num_train_nodes": 1,
+                "num_infer_nodes": 1,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {"rollout_transport": {"type": "ray"}},
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+        },
+    )
+
+    with pytest.raises(ConfigFileError, match="Use deployment.type = 'ray_cluster'"):
+        cli(
+            RLConfig,
+            args=[
+                "@",
+                "examples/reverse_text/rl.toml",
+                "@",
+                str(tmp_path / "ray_multinode.toml"),
+            ],
+        )
+
+
+def test_ray_cluster_inference_bundle_must_fit_one_node(tmp_path):
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "gpus_per_node": 1,
+                "num_train_gpus": 1,
+                "num_infer_gpus": 2,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {"rollout_transport": {"type": "ray"}},
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+        },
+    )
+
+    with pytest.raises(ConfigFileError, match="Prime-vLLM inference is scheduled as one Ray task"):
+        cli(
+            RLConfig,
+            args=[
+                "@",
+                "examples/reverse_text/rl.toml",
+                "@",
+                str(tmp_path / "ray_cluster.toml"),
+            ],
+        )
+
+
+def test_ray_cluster_num_teacher_gpus_auto_configures_teacher_model(tmp_path):
+    write_toml(
+        tmp_path / "ray_cluster_teacher.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "num_train_gpus": 1,
+                "num_infer_gpus": 1,
+                "num_teacher_gpus": 1,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {
+                "rollout_transport": {"type": "ray"},
+                "loss": {"teacher_tau": 1.0},
+            },
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster_teacher.toml"),
+        ],
+    )
+
+    assert config.deployment.type == "ray_cluster"
+    assert config.teacher_inference is not None
+    assert config.teacher_inference.server.port == config.inference.server.port + 1
+    assert config.orchestrator.teacher_model is not None
+    assert config.orchestrator.teacher_model.client.base_url == ["http://localhost:8001/v1"]
+    assert config.orchestrator.teacher_model.model.name == config.teacher_inference.model.name
+
+
+def test_ray_cluster_auto_setup_orchestrator_num_train_workers(tmp_path):
+    """Multi-GPU trainer in ray_cluster auto-sets orchestrator.num_train_workers."""
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "gpus_per_node": 8,
+                "num_train_gpus": 8,
+                "num_infer_gpus": 1,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {"rollout_transport": {"type": "ray"}},
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster.toml"),
+        ],
+    )
+
+    assert config.deployment.type == "ray_cluster"
+    assert config.orchestrator.num_train_workers == 8
+
+
+def test_ray_cluster_auto_setup_inference_dp_from_num_infer_gpus(tmp_path):
+    """num_infer_gpus / tp drives inference.parallel.dp and api_server_count."""
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "gpus_per_node": 8,
+                "num_train_gpus": 1,
+                "num_infer_gpus": 4,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {"rollout_transport": {"type": "ray"}},
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+            "inference": {"parallel": {"tp": 2}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster.toml"),
+        ],
+    )
+
+    assert config.deployment.type == "ray_cluster"
+    assert config.inference.parallel.tp == 2
+    assert config.inference.parallel.dp == 2  # 4 / 2
+    assert config.inference.api_server_count >= 2
+
+
+def test_ray_cluster_auto_setup_dp_replicate_for_multi_node_trainer(tmp_path):
+    """num_train_gpus > gpus_per_node defaults trainer.model.dp_replicate to HSDP."""
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "gpus_per_node": 8,
+                "num_train_gpus": 16,
+                "num_infer_gpus": 8,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {"rollout_transport": {"type": "ray"}},
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+            "inference": {"parallel": {"tp": 8}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster.toml"),
+        ],
+    )
+
+    assert config.deployment.type == "ray_cluster"
+    assert config.trainer.model.dp_replicate == 2  # 16 / 8
+
+
+def test_ray_cluster_user_dp_replicate_is_preserved(tmp_path):
+    """Explicit trainer.model.dp_replicate is not clobbered by ray_cluster auto-setup."""
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "gpus_per_node": 8,
+                "num_train_gpus": 16,
+                "num_infer_gpus": 8,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {
+                "rollout_transport": {"type": "ray"},
+                "model": {"dp_replicate": 4},
+            },
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+            "inference": {"parallel": {"tp": 8}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster.toml"),
+        ],
+    )
+
+    assert config.trainer.model.dp_replicate == 4
+
+
+def test_ray_cluster_auto_setup_dp_replicate_skipped_for_single_node_trainer(tmp_path):
+    """num_train_gpus <= gpus_per_node leaves trainer.model.dp_replicate at the default."""
+    write_toml(
+        tmp_path / "ray_cluster.toml",
+        {
+            "deployment": {
+                "type": "ray_cluster",
+                "gpus_per_node": 8,
+                "num_train_gpus": 8,
+                "num_infer_gpus": 1,
+            },
+            "experimental": {"ray": {"enabled": True}},
+            "trainer": {"rollout_transport": {"type": "ray"}},
+            "orchestrator": {"rollout_transport": {"type": "ray"}},
+        },
+    )
+
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            str(tmp_path / "ray_cluster.toml"),
+        ],
+    )
+
+    assert config.trainer.model.dp_replicate == 1
+
+
+def test_ray_cluster_16gpu_example_config_parses():
+    """The shipped 16-GPU example config parses and auto-setup runs end to end."""
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "@",
+            "k8s/raycluster/rl-16gpu-example.toml",
+        ],
+    )
+
+    assert config.deployment.type == "ray_cluster"
+    assert config.deployment.num_train_gpus == 8
+    assert config.deployment.num_infer_gpus == 8
+    assert config.deployment.gpus_per_node == 8
+    assert config.experimental.ray.enabled
+    assert config.inference is not None
+    assert config.inference.parallel.tp == 8
+    assert config.inference.parallel.dp == 1
+    assert config.orchestrator.num_train_workers == 8
+    assert config.trainer.model.dp_replicate == 1
+
+
+def test_ray_runtime_config_parses_runtime_env(tmp_path):
+    config = cli(
+        RLConfig,
+        args=[
+            "@",
+            "examples/reverse_text/rl.toml",
+            "--experimental.ray.enabled",
+            "--experimental.ray.address",
+            "ray-head.ray.svc.cluster.local:6379",
+            "--experimental.ray.runtime-env.working-dir",
+            tmp_path.as_posix(),
+            "--experimental.ray.runtime-env.env-vars",
+            '{"PYTHONPATH": "/repo/src:/repo/packages/prime-rl-configs/src"}',
+            "--trainer.rollout-transport.type",
+            "ray",
+            "--trainer.rollout-transport.address",
+            "ray-head.ray.svc.cluster.local:6379",
+            "--orchestrator.rollout-transport.type",
+            "ray",
+            "--orchestrator.rollout-transport.address",
+            "ray-head.ray.svc.cluster.local:6379",
+        ],
+    )
+    assert config.experimental.ray.address == "ray-head.ray.svc.cluster.local:6379"
+    assert config.experimental.ray.runtime_env.working_dir == tmp_path.as_posix()
+    assert config.experimental.ray.runtime_env.env_vars["PYTHONPATH"] == "/repo/src:/repo/packages/prime-rl-configs/src"
+    assert config.trainer.rollout_transport.address == "ray-head.ray.svc.cluster.local:6379"
+    assert config.orchestrator.rollout_transport.address == "ray-head.ray.svc.cluster.local:6379"
+
+
+def test_ray_runtime_config_requires_matching_actor_name():
+    with pytest.raises(ValidationError, match="same actor_name"):
+        cli(
+            RLConfig,
+            args=[
+                "@",
+                "examples/reverse_text/rl.toml",
+                "--experimental.ray.enabled",
+                "--trainer.rollout-transport.type",
+                "ray",
+                "--trainer.rollout-transport.actor-name",
+                "trainer-transport",
+                "--orchestrator.rollout-transport.type",
+                "ray",
+                "--orchestrator.rollout-transport.actor-name",
+                "orchestrator-transport",
+            ],
+        )
+
+
+def test_ray_runtime_config_requires_matching_namespace():
+    with pytest.raises(ValidationError, match="same namespace"):
+        cli(
+            RLConfig,
+            args=[
+                "@",
+                "examples/reverse_text/rl.toml",
+                "--experimental.ray.enabled",
+                "--trainer.rollout-transport.type",
+                "ray",
+                "--trainer.rollout-transport.namespace",
+                "trainer",
+                "--orchestrator.rollout-transport.type",
+                "ray",
+                "--orchestrator.rollout-transport.namespace",
+                "orchestrator",
+            ],
+        )
+
+
+def test_ray_transport_config_parses():
+    transport = TypeAdapter(TransportConfig).validate_python(
+        {"type": "ray", "address": "auto", "namespace": "test", "actor_name": "transport"}
+    )
+    assert transport.type == "ray"
+    assert transport.address == "auto"
+    assert transport.namespace == "test"
+    assert transport.actor_name == "transport"
+
+
+def test_ray_native_rewrites_local_inference_client_urls():
+    orchestrator = OrchestratorConfig()
+    inference = InferenceConfig()
+    inference.server.port = 8123
+    orchestrator.client.admin_base_url = ["http://127.0.0.1:8000/v1"]
+
+    rewritten = _orchestrator_with_ray_inference_endpoint(orchestrator, inference, "10.0.4.184")
+
+    assert rewritten.client.base_url == ["http://10.0.4.184:8123/v1"]
+    assert rewritten.client.admin_base_url == ["http://10.0.4.184:8123/v1"]
+    assert orchestrator.client.base_url == ["http://localhost:8000/v1"]
+    assert orchestrator.client.admin_base_url == ["http://127.0.0.1:8000/v1"]
+
+
+def test_ray_native_preserves_external_inference_client_urls():
+    orchestrator = OrchestratorConfig()
+    inference = InferenceConfig()
+    orchestrator.client.base_url = ["http://inference.ray.svc.cluster.local:8000/v1"]
+
+    rewritten = _orchestrator_with_ray_inference_endpoint(orchestrator, inference, "10.0.4.184")
+
+    assert rewritten.client.base_url == ["http://inference.ray.svc.cluster.local:8000/v1"]
+
+
+def test_ray_native_rewrites_local_teacher_inference_client_urls():
+    orchestrator = OrchestratorConfig()
+    orchestrator.teacher_model = TeacherModelConfig()
+    orchestrator.teacher_model.client.base_url = ["http://0.0.0.0:8001/v1"]
+    teacher_inference = InferenceConfig()
+    teacher_inference.server.port = 8124
+
+    rewritten = _orchestrator_with_ray_teacher_endpoint(orchestrator, teacher_inference, "10.0.9.162")
+
+    assert rewritten.teacher_model.client.base_url == ["http://10.0.9.162:8124/v1"]
+    assert orchestrator.teacher_model.client.base_url == ["http://0.0.0.0:8001/v1"]
+
+
+def test_ray_transport_config_reclaim_stale_actor_defaults_false():
+    transport = TypeAdapter(TransportConfig).validate_python({"type": "ray"})
+    assert transport.type == "ray"
+    assert transport.reclaim_stale_actor is False
+
+
+def test_ray_transport_store_per_rank_micro_batch_cap():
+    """Regression: max_queued_items applies per data_rank, not globally."""
+    store = _RayTransportStore(max_queued_items=2)
+
+    store.put_micro_batch(data_rank=0, step=0, payload=b"a")
+    store.put_micro_batch(data_rank=0, step=1, payload=b"b")
+    store.put_micro_batch(data_rank=1, step=0, payload=b"c")
+    store.put_micro_batch(data_rank=1, step=1, payload=b"d")
+
+    with pytest.raises(RuntimeError, match="data_rank=0"):
+        store.put_micro_batch(data_rank=0, step=2, payload=b"e")
+
+    assert store.pop_micro_batch(data_rank=1, step=0) == b"c"
+    store.put_micro_batch(data_rank=1, step=2, payload=b"f")
+
+
+def test_ray_transport_store_per_sender_training_batch_cap():
+    """Regression: training-batch cap is per sender_id, not globally."""
+    store = _RayTransportStore(max_queued_items=2)
+
+    store.put_training_batch("sender-a", b"a0")
+    store.put_training_batch("sender-a", b"a1")
+    store.put_training_batch("sender-b", b"b0")
+    store.put_training_batch("sender-b", b"b1")
+
+    with pytest.raises(RuntimeError, match="sender-a"):
+        store.put_training_batch("sender-a", b"a2")
+
+
+class _FakeRay:
+    """Minimal stub used to drive _monitor_roles without a live Ray cluster."""
+
+    def __init__(self, ready_order: list[object], failure_map: dict[object, BaseException] | None = None) -> None:
+        self._ready_order = list(ready_order)
+        self._failures = failure_map or {}
+        self.cancelled: list[object] = []
+
+    def wait(self, refs, num_returns: int = 1, timeout: float = 0.0):
+        ref_set = set(refs)
+        for ref in list(self._ready_order):
+            if ref in ref_set:
+                self._ready_order.remove(ref)
+                return [ref], [r for r in refs if r is not ref]
+        return [], list(refs)
+
+    def get(self, ref):
+        if ref in self._failures:
+            raise self._failures[ref]
+        return None
+
+    def cancel(self, ref, force: bool = False) -> None:
+        self.cancelled.append(ref)
+
+
+def test_monitor_roles_surfaces_real_exception_from_failed_role():
+    """When a role's Ray task raises, _monitor_roles must chain that exception so
+    operators see the real cause (e.g. vLLM stack trace) and not just a launcher message."""
+    inference_ref = object()
+    orchestrator_ref = object()
+    real_failure = RuntimeError("vLLM engine OOM")
+    refs = {
+        inference_ref: ("inference", Path("/tmp/inference.log")),
+        orchestrator_ref: ("orchestrator", Path("/tmp/orchestrator.log")),
+    }
+    fake = _FakeRay(ready_order=[inference_ref], failure_map={inference_ref: real_failure})
+
+    with pytest.raises(RuntimeError, match="Ray-native role inference failed") as excinfo:
+        _monitor_roles(fake, refs, critical_names={"orchestrator"}, poll_interval_seconds=0.0)
+
+    assert excinfo.value.__cause__ is real_failure
+    assert orchestrator_ref in fake.cancelled
+
+
+def test_monitor_roles_raises_when_long_running_role_returns_cleanly():
+    """When a non-critical role returns cleanly before training finishes (e.g. inference
+    exits 0 unexpectedly), _monitor_roles must raise and cancel remaining roles."""
+    inference_ref = object()
+    orchestrator_ref = object()
+    refs = {
+        inference_ref: ("inference", Path("/tmp/inference.log")),
+        orchestrator_ref: ("orchestrator", Path("/tmp/orchestrator.log")),
+    }
+    fake = _FakeRay(ready_order=[inference_ref])
+
+    with pytest.raises(RuntimeError, match="exited before training finished"):
+        _monitor_roles(fake, refs, critical_names={"orchestrator"}, poll_interval_seconds=0.0)
+
+    assert orchestrator_ref in fake.cancelled
+
+
+def test_monitor_roles_cancels_non_critical_after_critical_completes():
+    """When all critical roles finish, _monitor_roles must cancel remaining non-critical
+    roles instead of waiting on them forever."""
+    orchestrator_ref = object()
+    inference_ref = object()
+    refs = {
+        orchestrator_ref: ("orchestrator", Path("/tmp/orchestrator.log")),
+        inference_ref: ("inference", Path("/tmp/inference.log")),
+    }
+    fake = _FakeRay(ready_order=[orchestrator_ref])
+
+    _monitor_roles(fake, refs, critical_names={"orchestrator"}, poll_interval_seconds=0.0)
+
+    assert inference_ref in fake.cancelled
+    assert orchestrator_ref not in fake.cancelled
 
 
 def test_orchestrator_renderer_auto_rejects_unmapped_model():

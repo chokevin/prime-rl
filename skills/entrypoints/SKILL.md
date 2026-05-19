@@ -9,17 +9,25 @@ All entrypoints are run via `uv run <command>` and accept TOML configs via `@ pa
 
 ## `rl` — RL training
 
-Orchestrates the complete RL loop: launches inference server, orchestrator, and trainer as subprocesses.
+Orchestrates the complete RL loop. By default it launches inference server, orchestrator, and trainer as subprocesses; with `experimental.ray.enabled` it runs `single_node` or `ray_cluster` deployment configs under Ray tasks/Ray Train. Ray inference uses `experimental.ray.inference_backend = "prime_vllm"` to run Prime-RL's existing vLLM server inside a Ray GPU task. If Ray places inference away from the orchestrator, the launcher rewrites default localhost rollout URLs to the inference node IP; when `deployment.num_teacher_gpus` starts teacher inference, localhost teacher-model URLs are rewritten to the teacher node IP. The default Ray trainer backend uses one Ray task per trainer rank; `experimental.ray.trainer_backend = "ray_train"` uses Ray Train's `TorchTrainer`.
 
 ```bash
 uv run rl @ examples/reverse_text/rl.toml
 uv run rl @ examples/reverse_text/rl.toml @ examples/reverse_text/slurm_rl.toml # with SLURM
 uv run rl @ examples/reverse_text/rl.toml --dry-run # generate scripts without running
+uv run rl @ examples/reverse_text/rl.toml --experimental.ray.enabled \
+  --trainer.rollout-transport.type ray \
+  --orchestrator.rollout-transport.type ray # experimental Ray-native path
+uv run rl @ examples/reverse_text/rl.toml --experimental.ray.enabled \
+  --experimental.ray.trainer-backend ray_train \
+  --trainer.rollout-transport.type ray \
+  --orchestrator.rollout-transport.type ray # experimental Ray Train trainer backend
 ```
 
 - **Config:** `RLConfig` (`src/prime_rl/configs/rl.py`)
 - **Entrypoint:** `src/prime_rl/entrypoints/rl.py`
 - **SLURM:** yes — single-node and multi-node
+- **Ray:** experimental path for `deployment.type = "single_node"` and `deployment.type = "ray_cluster"`. The old `multi_node` deployment remains SLURM-shaped. Ray mode runs Prime-RL's vLLM inference server and orchestrator as Ray tasks, rewrites local inference/teacher client URLs when tasks land on different nodes, and runs trainer ranks either as Ray tasks with explicit torch distributed rank env or through Ray Train's `TorchTrainer` when `experimental.ray.trainer_backend = "ray_train"`.
 
 ## `sft` — SFT training
 
