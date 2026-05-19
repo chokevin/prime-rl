@@ -93,7 +93,9 @@ class RayRuntimeConfig(BaseConfig):
         ),
     ] = None
 
-    namespace: Annotated[str, Field(description="Ray namespace for native role tasks and transport actors.")] = "prime-rl"
+    namespace: Annotated[str, Field(description="Ray namespace for native role tasks and transport actors.")] = (
+        "prime-rl"
+    )
 
     log_to_driver: Annotated[
         bool,
@@ -636,8 +638,10 @@ class RLConfig(BaseConfig):
     @model_validator(mode="after")
     def validate_teacher_model(self):
         if (
-            self.trainer.loss.type == "default" and self.trainer.loss.teacher_tau > 0
-        ) and not self.orchestrator.teacher_model and not getattr(self.deployment, "num_teacher_gpus", None):
+            (self.trainer.loss.type == "default" and self.trainer.loss.teacher_tau > 0)
+            and not self.orchestrator.teacher_model
+            and not getattr(self.deployment, "num_teacher_gpus", None)
+        ):
             raise ValueError(
                 "teacher_model must be configured when teacher_tau > 0. "
                 "Either set teacher_tau = 0, set deployment.num_teacher_gpus, or configure teacher_model manually."
@@ -649,7 +653,7 @@ class RLConfig(BaseConfig):
         """Forbid configuring a local inference server when rollouts come from an external teacher.
 
         Orchestrator-only invariants (``use_sft_loss`` paired with ``teacher_rollout_model``,
-        and ``use_token_client`` coupling) live on ``OrchestratorConfig`` so the hosted
+        and ``use_renderer`` coupling) live on ``OrchestratorConfig`` so the hosted
         orchestrator entrypoint also enforces them.
         """
         if self.orchestrator.teacher_rollout_model is not None and self.inference is not None:
@@ -1044,9 +1048,7 @@ class RLConfig(BaseConfig):
                 and self.deployment.num_train_gpus > self.deployment.gpus_per_node
                 and self.deployment.num_train_gpus % self.deployment.gpus_per_node == 0
             ):
-                self.trainer.model.dp_replicate = (
-                    self.deployment.num_train_gpus // self.deployment.gpus_per_node
-                )
+                self.trainer.model.dp_replicate = self.deployment.num_train_gpus // self.deployment.gpus_per_node
 
             # Auto-fill inference DP from num_infer_gpus / tp, matching single_node
             # behavior. The whole Prime-vLLM server runs as one Ray task that holds
