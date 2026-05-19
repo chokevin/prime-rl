@@ -5,7 +5,7 @@
 #
 # Adapt before applying:
 #   - metadata.namespace                  -> match the RayCluster namespace
-#   - PRIME_RL_REPO / PRIME_RL_REF        -> your fork checkout
+#   - PRIME_RL_REPO / PRIME_RL_REF        -> your Prime-RL checkout
 #   - CONFIG_PATH                         -> config path, relative to checkout or absolute
 #   - RAY_HEAD_SVC                        -> KubeRay head service name
 #   - volumes[].persistentVolumeClaim     -> the same RWX PVC as the RayCluster
@@ -44,9 +44,6 @@ spec:
             - { name: CONFIG_PATH,   value: "k8s/raycluster/rl-example.toml" }
             - { name: RAY_HEAD_SVC,  value: "prime-rl-raycluster-head-svc" }
             - { name: RAY_ADDRESS,   value: "auto" }
-            # Set this on H200 / Hopper FP8 paths where vLLM picks
-            # DeepGEMM warmup. Harmless on A100.
-            # - { name: VLLM_DEEP_GEMM_WARMUP, value: "skip" }
           command: ["/bin/bash", "-lc"]
           args:
             - |

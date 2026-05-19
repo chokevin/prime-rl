@@ -153,9 +153,9 @@ uv run sft --data.type fake --data.batch-size 4
 
 If you wish to configure values of the default variant, you don't need to set the `type` field.
 
-### Ray-native fork settings
+### Ray-native settings
 
-The fork-first Ray runtime is explicit and experimental. Enable Ray-native roles under `[experimental.ray]`:
+The Ray runtime is explicit and experimental. Enable Ray-native roles under `[experimental.ray]`:
 
 ```toml
 [experimental.ray]
@@ -193,9 +193,9 @@ train_run_name = "my-run"
 train_storage_path = "/shared/ray-train"
 ```
 
-Use shared `train_storage_path` for future multi-node RayCluster validation. The current Ray Train backend still keeps Prime-RL's vLLM inference and filesystem/NCCL weight broadcast contracts.
+Use shared `train_storage_path` for multi-node RayCluster runs. The current Ray Train backend still keeps Prime-RL's vLLM inference and filesystem/NCCL weight broadcast contracts.
 
-For multi-node RayCluster validation, use the Ray-native deployment variant, run the launcher as a Ray job or from the head pod, and use `address = "auto"`. A normal Kubernetes pod pointed at the head service GCS port has no local raylet and will fail during worker creation. Use Ray `runtime_env` so remote worker pods can import the fork checkout:
+For multi-node RayCluster runs, use the Ray-native deployment variant, run the launcher as a Ray job or from the head pod, and use `address = "auto"`. A normal Kubernetes pod pointed at the head service GCS port has no local raylet and will fail during worker creation. Use Ray `runtime_env` so remote worker pods can import the Prime-RL checkout:
 
 ```toml
 [deployment]

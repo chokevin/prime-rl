@@ -1,6 +1,6 @@
 # Kubernetes
 
-PRIME-RL on Kubernetes has two paths in this fork. New deployments should use the
+PRIME-RL on Kubernetes has two paths. New deployments should use the
 **Ray-native RayCluster** path. The **legacy StatefulSet Helm chart** is kept for
 backwards compatibility with the original SLURM-shaped topology.
 
@@ -14,7 +14,7 @@ backwards compatibility with the original SLURM-shaped topology.
 | Cross-node inference URL | Auto-rewritten by the Ray-native runtime | Resolved via the pod DNS env vars on each role |
 | Weight broadcast | Shared `RWX` PVC + Prime-vLLM `/update_weights` | Shared `RWX` PVC + Prime-vLLM `/update_weights` |
 | Teacher inference | Driven by `deployment.num_teacher_gpus` | Manual extra `inference` StatefulSet |
-| Maturity | Validated end-to-end on multi-node A100 and H200 | Long-standing chart used by the upstream `kubernetes.md` flow |
+| Maturity | Experimental Ray-native path | Long-standing chart used by the upstream `kubernetes.md` flow |
 | When to choose | New k8s deployments, especially when you want Ray Train, Ray transport, and logical resource modeling | Clusters that already mirror SLURM topology, or workflows already invested in the chart |
 
 If you do not have a strong reason to stay on the StatefulSet chart, prefer the
@@ -62,25 +62,6 @@ the `experimental.ray.*` config reference.
   pool as the Ray head so `RAY_ADDRESS=auto` resolves via a local raylet. A
   plain Kubernetes pod that hits the GCS port directly can connect but cannot
   place workers.
-
-### Validation status
-
-- Multi-node A100 RayCluster: validated end to end (trainer step completed,
-  checkpoint/broadcast/final weights produced, custom Prime-vLLM routes served,
-  `Ray-native RL training finished!` logged).
-- Same-node H200: Prime-RL runtime path validated with trainer + primary
-  Prime-vLLM + teacher Prime-vLLM on three H200 GPUs.
-- Multi-node H200 RayCluster: validated end to end with two 8-GPU Ray workers,
-  `num_train_gpus = 8`, `num_infer_gpus = 8`, `inference.parallel.tp = 8`,
-  checkpoint/broadcast/final weights produced, and `Ray-native RL training
-  finished!` logged.
-
-### Cloud-specific notes
-
-For Azure Kubernetes Service (AKS) — GPU node pool selectors, DRA vs
-`nvidia.com/gpu` resource shape, ACR images, Azure Files / Azure Blob CSI for
-`RWX` storage, optional Kueue, and H200/DeepGEMM caveats from the validation
-runs — see [`k8s/raycluster/aks.md`](../k8s/raycluster/aks.md).
 
 ---
 

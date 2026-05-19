@@ -27,7 +27,7 @@ uv run rl @ examples/reverse_text/rl.toml --experimental.ray.enabled \
 - **Config:** `RLConfig` (`src/prime_rl/configs/rl.py`)
 - **Entrypoint:** `src/prime_rl/entrypoints/rl.py`
 - **SLURM:** yes — single-node and multi-node
-- **Ray:** experimental fork path for `deployment.type = "single_node"` and `deployment.type = "ray_cluster"`. The old `multi_node` deployment remains SLURM-shaped. Ray mode runs Prime-RL's vLLM inference server and orchestrator as Ray tasks, rewrites local inference/teacher client URLs when tasks land on different nodes, and runs trainer ranks either as Ray tasks with explicit torch distributed rank env or through Ray Train's `TorchTrainer` when `experimental.ray.trainer_backend = "ray_train"`.
+- **Ray:** experimental path for `deployment.type = "single_node"` and `deployment.type = "ray_cluster"`. The old `multi_node` deployment remains SLURM-shaped. Ray mode runs Prime-RL's vLLM inference server and orchestrator as Ray tasks, rewrites local inference/teacher client URLs when tasks land on different nodes, and runs trainer ranks either as Ray tasks with explicit torch distributed rank env or through Ray Train's `TorchTrainer` when `experimental.ray.trainer_backend = "ray_train"`.
 
 ## `sft` — SFT training
 

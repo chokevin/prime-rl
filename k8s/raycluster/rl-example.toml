@@ -1,6 +1,6 @@
 # Minimal Ray-native Prime-RL config for the RayCluster example.
 #
-# Mirrors the validated multi-node A100 reverse-text run:
+# Small example:
 #   - deployment.type = "ray_cluster": logical role GPU resources placed by Ray.
 #   - experimental.ray.enabled = true with Ray Train trainer + Prime-vLLM inference.
 #   - Ray rollout transport so trainer and orchestrator do not need shared FS for

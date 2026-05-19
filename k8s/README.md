@@ -1,6 +1,6 @@
 # Kubernetes deployment
 
-This fork ships two Kubernetes paths. New deployments should use the Ray-native
+Prime-RL ships two Kubernetes paths. New deployments should use the Ray-native
 RayCluster path under [`raycluster/`](./raycluster/). The legacy StatefulSet
 Helm chart under [`prime-rl/`](./prime-rl/) is the SLURM-shaped topology kept
 for backwards compatibility.
@@ -11,8 +11,7 @@ See [`docs/kubernetes.md`](../docs/kubernetes.md) for the decision matrix and
 ## Ray-native RayCluster (recommended)
 
 KubeRay `RayCluster` with a CPU head, a GPU worker group, and a launch Job that
-submits the Prime-RL `rl` entrypoint from the head pool. Mirrors the validated
-multi-node A100 run.
+submits the Prime-RL `rl` entrypoint from the head pool.
 
 ```bash
 # 1. Bring up the cluster (edit namespace, image, nodeSelectors, PVC first).
@@ -26,8 +25,7 @@ kubectl logs -f -n prime-rl job/prime-rl-launch
 ```
 
 See [`raycluster/README.md`](./raycluster/README.md) for prerequisites
-(KubeRay operator, NVIDIA GPU Operator, shared `ReadWriteMany` PVC) and for the
-H200 / FP8 cluster notes.
+(KubeRay operator, NVIDIA GPU Operator, shared `ReadWriteMany` PVC).
 
 ## Legacy StatefulSet Helm chart
 
