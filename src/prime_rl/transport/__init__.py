@@ -12,17 +12,17 @@ if TYPE_CHECKING:
         FileSystemTrainingBatchReceiver,
         FileSystemTrainingBatchSender,
     )
-    from prime_rl.transport.zmq import (
-        ZMQMicroBatchReceiver,
-        ZMQMicroBatchSender,
-        ZMQTrainingBatchReceiver,
-        ZMQTrainingBatchSender,
-    )
     from prime_rl.transport.ray import (
         RayMicroBatchReceiver,
         RayMicroBatchSender,
         RayTrainingBatchReceiver,
         RayTrainingBatchSender,
+    )
+    from prime_rl.transport.zmq import (
+        ZMQMicroBatchReceiver,
+        ZMQMicroBatchSender,
+        ZMQTrainingBatchReceiver,
+        ZMQTrainingBatchSender,
     )
 
 
