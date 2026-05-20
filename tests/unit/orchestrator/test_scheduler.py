@@ -31,6 +31,7 @@ def make_scheduler() -> Scheduler:
     scheduler.inflight_policy_update_task = None
     scheduler.update_policy_task = None
     scheduler.enable_policy_updates = True
+    scheduler.rate_limiter = None
     return scheduler
 
 
@@ -125,6 +126,46 @@ def test_maybe_update_policy_reuses_inflight_update_after_cancellation():
 
         assert applied_steps == [8]
         assert scheduler.ckpt_step == 8
+
+    asyncio.run(run())
+
+
+def test_apply_policy_update_cancels_stale_rollouts_before_update_weights():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        stale_task = asyncio.create_task(asyncio.sleep(60))
+        survivor_task = asyncio.create_task(asyncio.sleep(60))
+        client = SimpleNamespace(api_base_url="http://test", extra_headers={})
+        scheduler.groups = {
+            1: GroupState(example={"env_name": "test"}, rollouts_to_schedule=0),
+            2: GroupState(example={"env_name": "test"}, rollouts_to_schedule=0),
+        }
+        scheduler.inflight_requests = {
+            stale_task: InflightRequest(off_policy_steps=1, client_config=client, env_name="test", group_id=1),
+            survivor_task: InflightRequest(off_policy_steps=0, client_config=client, env_name="test", group_id=2),
+        }
+        observed_at_update = {}
+
+        async def update_weights(weight_dir, lora_name=None, step=0) -> None:
+            observed_at_update["stale_present"] = stale_task in scheduler.inflight_requests
+            observed_at_update["survivor_steps"] = scheduler.inflight_requests[survivor_task].off_policy_steps
+
+        scheduler.inference_pool = SimpleNamespace(
+            update_weights=update_weights,
+            update_model_name=MagicMock(),
+        )
+
+        with patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()):
+            await scheduler._apply_policy_update(8)
+
+        assert observed_at_update == {"stale_present": False, "survivor_steps": 1}
+        assert stale_task not in scheduler.inflight_requests
+        assert survivor_task in scheduler.inflight_requests
+        assert scheduler.ckpt_step == 8
+
+        if not survivor_task.done():
+            survivor_task.cancel()
+        await asyncio.sleep(0)
 
     asyncio.run(run())
 

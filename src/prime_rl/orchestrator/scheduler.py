@@ -322,8 +322,10 @@ class Scheduler:
             )
 
         self.logger.debug(
-            f"Got new policy with step {next_ckpt_step}. Updating weights and cancelling old rollout requests."
+            f"Got new policy with step {next_ckpt_step}. Cancelling old rollout requests and updating weights."
         )
+
+        await self._update_off_policy()
 
         update_weights_start_time = time.perf_counter()
         weights_path = get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step)
@@ -337,7 +339,6 @@ class Scheduler:
             self.inference_pool.update_model_name(self.model_name)
 
         self.checkpoint_ready.set()
-        await self._update_off_policy()
 
     async def _get_or_start_policy_update_task(self, next_ckpt_step: int) -> asyncio.Task:
         async with self.policy_update_lock:
