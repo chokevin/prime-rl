@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import verifiers as vf
 
-from prime_rl.orchestrator.scheduler import InflightRequest, Scheduler
+from prime_rl.orchestrator.scheduler import GroupState, InflightRequest, Scheduler
 from prime_rl.utils.async_utils import safe_cancel
 
 
@@ -174,3 +174,54 @@ def test_client_identity_distinguishes_base_url_and_dp_rank():
     )
 
     assert Scheduler._client_identity(client_a) != Scheduler._client_identity(client_b)
+
+
+def test_schedule_rollout_uses_configured_request_picker():
+    async def run() -> None:
+        client_a = vf.ClientConfig(
+            client_idx=0,
+            api_base_url="http://worker-a:8000/v1",
+            extra_headers={"X-data-parallel-rank": "0"},
+        )
+        client_b = vf.ClientConfig(
+            client_idx=1,
+            api_base_url="http://worker-a:8000/v1",
+            extra_headers={"X-data-parallel-rank": "1"},
+        )
+        selected_contexts = []
+
+        class PickSecondClient:
+            async def select_client(self, candidates, inflight, context):
+                selected_contexts.append(context)
+                assert candidates == [client_a, client_b]
+                assert inflight[Scheduler._client_identity(client_a)] == 0
+                assert inflight[Scheduler._client_identity(client_b)] == 0
+                return client_b
+
+        class Env:
+            requires_group_scoring = False
+
+            async def run_rollout(self, **kwargs):
+                return {"error": None, "trajectory": [{"role": "assistant", "content": "ok"}]}
+
+        scheduler = make_scheduler()
+        scheduler.request_picker = PickSecondClient()
+        scheduler.inference_pool = SimpleNamespace(train_clients=[client_a, client_b])
+        scheduler.train_envs = SimpleNamespace(get=MagicMock(return_value=Env()))
+        scheduler.groups = {123: GroupState(example={"env_name": "test-env"}, rollouts_to_schedule=1)}
+
+        await scheduler.schedule_rollout(123)
+
+        assert scheduler.groups[123].pinned_client == client_b
+        assert len(scheduler.inflight_requests) == 1
+        task, info = next(iter(scheduler.inflight_requests.items()))
+        assert info.client_config == client_b
+        assert info.env_name == "test-env"
+        assert selected_contexts[0].env_name == "test-env"
+        assert selected_contexts[0].group_id == 123
+        assert selected_contexts[0].model_name == "test-model"
+        assert selected_contexts[0].ckpt_step == 7
+
+        await task
+
+    asyncio.run(run())

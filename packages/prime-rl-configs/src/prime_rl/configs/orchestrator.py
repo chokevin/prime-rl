@@ -876,8 +876,46 @@ WeightBroadcastConfig: TypeAlias = Annotated[
 ]
 
 
+class LeastLoadedRequestPickerConfig(BaseConfig):
+    """Prime's built-in rollout client picker."""
+
+    type: Literal["least_loaded"] = "least_loaded"
+
+
+class ExternalRequestPickerConfig(BaseConfig):
+    """HTTP adapter for EPP-style request picking outside the inference data path."""
+
+    type: Literal["external"] = "external"
+
+    adapter_url: Annotated[
+        str,
+        Field(
+            description=(
+                "HTTP endpoint that accepts Prime's logical rollout-client candidates and returns one selected "
+                "candidate. This is an adapter boundary, not an llm-d/Envoy ext-proc endpoint."
+            )
+        ),
+    ]
+
+    timeout: Annotated[
+        float,
+        Field(gt=0, description="Timeout in seconds for request-picker adapter calls."),
+    ] = 1.0
+
+
+RequestPickerConfig: TypeAlias = Annotated[
+    LeastLoadedRequestPickerConfig | ExternalRequestPickerConfig,
+    Field(discriminator="type"),
+]
+
+
 class OrchestratorExperimentalConfig(BaseConfig):
     """Experimental features for the orchestrator."""
+
+    request_picker: Annotated[
+        RequestPickerConfig,
+        Field(description="Experimental rollout request picker. Default keeps Prime's least-loaded client picker."),
+    ] = LeastLoadedRequestPickerConfig()
 
 
 class TeacherModelConfig(BaseConfig):

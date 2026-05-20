@@ -703,6 +703,24 @@ def test_ray_transport_config_parses():
     assert transport.actor_name == "transport"
 
 
+def test_orchestrator_external_request_picker_config_parses():
+    config = cli(
+        OrchestratorConfig,
+        args=[
+            "--experimental.request-picker.type",
+            "external",
+            "--experimental.request-picker.adapter-url",
+            "http://localhost:9000/pick",
+            "--experimental.request-picker.timeout",
+            "0.25",
+        ],
+    )
+
+    assert config.experimental.request_picker.type == "external"
+    assert config.experimental.request_picker.adapter_url == "http://localhost:9000/pick"
+    assert config.experimental.request_picker.timeout == 0.25
+
+
 def test_ray_native_rewrites_local_inference_client_urls():
     orchestrator = OrchestratorConfig()
     inference = InferenceConfig()

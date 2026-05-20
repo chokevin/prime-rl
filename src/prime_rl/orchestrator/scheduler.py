@@ -11,6 +11,7 @@ from aiolimiter import AsyncLimiter
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.buffer import Buffer
 from prime_rl.orchestrator.envs import TrainEnvs
+from prime_rl.orchestrator.request_picker import RequestPickContext, client_identity, setup_request_picker
 from prime_rl.orchestrator.vf_utils import get_seq_len
 from prime_rl.utils.async_utils import safe_cancel, safe_cancel_all
 from prime_rl.utils.client import InferencePool
@@ -103,6 +104,7 @@ class Scheduler:
         self.lora_name = lora_name
         self.model_name = self.config.model.name
         self.json_logging = config.log.json_logging
+        self.request_picker = setup_request_picker(config.experimental.request_picker)
 
         # Inference pool - used for admin operations (adapter sync) and metrics
         self.inference_pool = inference_pool
@@ -164,13 +166,10 @@ class Scheduler:
 
     @staticmethod
     def _client_identity(c: vf.ClientConfig) -> tuple[str, str | None]:
-        return (
-            c.api_base_url,
-            c.extra_headers.get("X-data-parallel-rank"),
-        )
+        return client_identity(c)
 
-    async def _select_least_loaded_client(self) -> vf.ClientConfig:
-        """Select the client with the fewest in-flight tasks.
+    async def _select_request_client(self, context: RequestPickContext) -> vf.ClientConfig:
+        """Select a rollout client.
 
         Uses (api_base_url, dp_rank) as identity rather than client_idx so that
         load tracking survives elastic pool refreshes (which reassign indices).
@@ -180,7 +179,7 @@ class Scheduler:
             await asyncio.sleep(1)
             clients = self.inference_pool.train_clients
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
-        return min(clients, key=lambda c: inflight[self._client_identity(c)])
+        return await self.request_picker.select_client(clients, inflight, context)
 
     async def drop_group(self, group_id: int) -> int:
         """Drop a group and cancel any remaining in-flight rollouts for it. Returns the number of cancelled rollouts."""
@@ -204,18 +203,26 @@ class Scheduler:
         if group is None or group.rollouts_to_schedule <= 0:
             return
 
+        env_name = group.example["env_name"]
+        cache_salt = str(self.ckpt_step)
         if group.pinned_client is not None:
             client_config = group.pinned_client
         else:
-            client_config = await self._select_least_loaded_client()
+            client_config = await self._select_request_client(
+                RequestPickContext(
+                    env_name=env_name,
+                    group_id=group_id,
+                    model_name=self.model_name,
+                    ckpt_step=self.ckpt_step,
+                    cache_salt=cache_salt,
+                )
+            )
             if group_id not in self.groups:
                 return
             group.pinned_client = client_config
 
-        env_name = group.example["env_name"]
         env = self.train_envs.get(env_name)
 
-        cache_salt = str(self.ckpt_step)
         if env.requires_group_scoring:
             rollout_count = group.rollouts_to_schedule
             group.rollouts_to_schedule = 0

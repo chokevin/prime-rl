@@ -235,6 +235,8 @@ For hosted multi-tenant runs where the trainer image's `trainer.loss.type` is fi
 
 For text-only RL rollouts, the orchestrator defaults to renderer-backed TITO (`use_renderer = true`). VLM configs must explicitly fall back to MITO (`use_renderer = false`) so image preprocessing and chat templating stay server-side. External teacher rollouts must also set `use_renderer = false`.
 
+The rollout scheduler defaults to Prime's built-in least-loaded request picker. Experimental picker adapters live under `[orchestrator.experimental.request_picker]`; `type = "external"` expects an adapter that chooses among Prime logical clients (`api_base_url` plus optional `X-data-parallel-rank`) and does not proxy inference or admin/update-weight traffic.
+
 ### Model fields
 
 For `BaseModel | None` fields (like `[ckpt]`, `[wandb]`, `[compile]`), a bare flag enables them with defaults:

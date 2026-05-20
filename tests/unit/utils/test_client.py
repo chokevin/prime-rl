@@ -6,6 +6,7 @@ import httpx
 import verifiers as vf
 
 from prime_rl.configs.shared import ClientConfig
+from prime_rl.orchestrator.request_picker import _match_decision
 from prime_rl.utils.client import _is_retryable_lora_error, load_lora_adapter, setup_clients
 
 
@@ -114,3 +115,21 @@ def test_setup_clients_preserves_chat_client_defaults():
             extra_headers_from_state={},
         )
     ]
+
+
+def test_external_request_picker_matches_logical_dp_rank_decision():
+    clients = setup_clients(
+        ClientConfig(
+            base_url=["http://worker-a:8000/v1"],
+            api_key_var="PRIME_API_KEY",
+            dp_rank_count=2,
+        )
+    )
+
+    selected = _match_decision(
+        clients,
+        {"api_base_url": "http://worker-a:8000/v1", "dp_rank": "1"},
+    )
+
+    assert selected.client_idx == 1
+    assert selected.extra_headers["X-data-parallel-rank"] == "1"
