@@ -1,3 +1,4 @@
+import time
 from typing import Generator, Iterable
 
 import torch
@@ -15,12 +16,20 @@ def load_weights_checkpoint_layerwise(
     model_config,
     vllm_config,
 ) -> None:
+    start = time.perf_counter()
     logger.info("Reloading checkpoint-format weights with vLLM layerwise processing")
     device = next(model.parameters()).device
     with torch.device(device), set_current_vllm_config(vllm_config):
+        phase_start = time.perf_counter()
         initialize_layerwise_reload(model)
+        logger.info(f"Initialized vLLM layerwise reload in {time.perf_counter() - phase_start:.2f}s")
+        phase_start = time.perf_counter()
         model.load_weights(state_iter)  # type: ignore
+        logger.info(f"Loaded checkpoint-format weights in {time.perf_counter() - phase_start:.2f}s")
+        phase_start = time.perf_counter()
         finalize_layerwise_reload(model, model_config)
+        logger.info(f"Finalized vLLM layerwise reload in {time.perf_counter() - phase_start:.2f}s")
+    logger.info(f"Completed checkpoint-format layerwise reload in {time.perf_counter() - start:.2f}s")
 
 
 def _invert_logical_to_physical_map(logical_to_physical_map: torch.Tensor, num_physical_experts: int) -> torch.Tensor:

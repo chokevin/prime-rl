@@ -33,33 +33,56 @@ def receive_integer(communicator: PyNcclCommunicator) -> int:
     return cast(int, integer_tensor.item())
 
 
-def receive_state_dict(communicator: PyNcclCommunicator) -> Generator[tuple[str, torch.Tensor], None, None]:
+def receive_state_dict(
+    communicator: PyNcclCommunicator, label: str | None = None
+) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream tensors in a state dict broadcasted over NCCL."""
+    start = time.perf_counter()
+    prefix = f"{label} " if label else ""
+    logger.info(f"{prefix}receive_state_dict metadata start")
     size_tensor = torch.tensor([10], dtype=torch.long).to(communicator.device)
     communicator.broadcast(size_tensor, src=0)
     state_tensor = torch.empty(cast(int, size_tensor.item()), dtype=torch.uint8).to(communicator.device)
     communicator.broadcast(state_tensor, src=0)
 
     metadata = pickle.loads(bytes(state_tensor.cpu().numpy()))
+    num_tensors = sum(len(tensor_info_list) for tensor_info_list in metadata.values())
+    logger.info(
+        f"{prefix}receive_state_dict metadata complete in {time.perf_counter() - start:.2f}s "
+        f"(dtype_groups={len(metadata)}, tensors={num_tensors})"
+    )
 
     # Receive concatenated tensors per dtype and split them back
     for dtype, tensor_info_list in metadata.items():
         # Receive concatenated tensor for this dtype
+        dtype_start = time.perf_counter()
         total_elements = sum(numel for _, _, numel in tensor_info_list)
         concatenated = torch.empty(total_elements, dtype=dtype, device=communicator.device)
         communicator.broadcast(concatenated, src=0)
+        broadcast_elapsed = time.perf_counter() - dtype_start
 
         # Split concatenated tensor back into individual tensors
+        split_start = time.perf_counter()
+        consumer_elapsed = 0.0
         offset = 0
         for key, shape, numel in tensor_info_list:
             tensor = concatenated[offset : offset + numel].view(shape).clone()
             offset += numel
+            yield_start = time.perf_counter()
             try:
                 yield key, tensor
             finally:
+                consumer_elapsed += time.perf_counter() - yield_start
                 del tensor
 
+        logger.info(
+            f"{prefix}receive_state_dict dtype={dtype} tensors={len(tensor_info_list)} "
+            f"elements={total_elements} broadcast={broadcast_elapsed:.2f}s "
+            f"split_and_consume={time.perf_counter() - split_start:.2f}s "
+            f"consumer={consumer_elapsed:.2f}s"
+        )
         del concatenated
+    logger.info(f"{prefix}receive_state_dict complete in {time.perf_counter() - start:.2f}s")
 
 
 class NCCLWeightBroadcastReceiver:
@@ -88,7 +111,9 @@ class NCCLWeightBroadcastReceiver:
         for layer_id in range(num_state_dict_to_receive):
             layer_start = time.perf_counter()
             logger.info(f"Receiving state dict {layer_id + 1}/{num_state_dict_to_receive}")
-            for key, value in receive_state_dict(self.communicator):
+            for key, value in receive_state_dict(
+                self.communicator, label=f"state_dict={layer_id + 1}/{num_state_dict_to_receive}"
+            ):
                 yield key, value
             logger.info(
                 f"Received state dict {layer_id + 1}/{num_state_dict_to_receive} "
