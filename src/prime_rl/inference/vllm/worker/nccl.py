@@ -1,4 +1,5 @@
 import pickle
+import time
 from typing import TYPE_CHECKING, Generator, cast
 
 import torch
@@ -80,13 +81,20 @@ class NCCLWeightBroadcastReceiver:
     @torch.no_grad()
     def receive_state_dict(self):
         """Receives the state dict of a model from the trainer master rank using NCCL communicator."""
+        start = time.perf_counter()
         logger.info("Receiving weights from trainer")
         num_state_dict_to_receive = receive_integer(self.communicator)
         logger.info(f"Receiving {num_state_dict_to_receive} layer state dicts")
         for layer_id in range(num_state_dict_to_receive):
+            layer_start = time.perf_counter()
             logger.info(f"Receiving state dict {layer_id + 1}/{num_state_dict_to_receive}")
             for key, value in receive_state_dict(self.communicator):
                 yield key, value
+            logger.info(
+                f"Received state dict {layer_id + 1}/{num_state_dict_to_receive} "
+                f"in {time.perf_counter() - layer_start:.2f}s"
+            )
+        logger.info(f"Received all trainer weights in {time.perf_counter() - start:.2f}s")
 
 
 class NCCLWeightUpdateWorker(Worker):
@@ -135,6 +143,8 @@ class NCCLWeightUpdateWorker(Worker):
 
     def update_weights_from_path(self, weight_dir: str) -> None:
         """Update weights with the nccl communicator."""
+        start = time.perf_counter()
+        logger.info(f"NCCL worker update_weights_from_path start (weight_dir={weight_dir})")
         model_runner = self.model_runner
         if hasattr(model_runner.model, "runnable"):
             model = model_runner.model.runnable
@@ -146,6 +156,7 @@ class NCCLWeightUpdateWorker(Worker):
         if self.quantize_in_weight_transfer:
             load_weights_kernel(model, state_iter)
             update_mla_absorbed_weights(model)
+            logger.info(f"NCCL worker update_weights_from_path complete in {time.perf_counter() - start:.2f}s")
             return
 
         load_weights_checkpoint_layerwise(
@@ -154,3 +165,4 @@ class NCCLWeightUpdateWorker(Worker):
             self.model_runner.model_config,
             self.vllm_config,
         )
+        logger.info(f"NCCL worker update_weights_from_path complete in {time.perf_counter() - start:.2f}s")

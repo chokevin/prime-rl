@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from itertools import cycle
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -302,17 +303,24 @@ async def check_health(
 NCCL_READY_MARKER = "NCCL_READY"
 
 
+def _admin_client_label(client: AsyncClient) -> str:
+    return str(client.base_url)
+
+
 async def _pause_engines(admin_clients: list[AsyncClient]) -> None:
     """Pause all inference engines, waiting for in-flight requests to drain."""
     logger = get_logger()
     logger.info("Pausing inference engines for weight update")
 
     async def _pause(client: AsyncClient) -> None:
+        start = time.perf_counter()
         response = await client.post("/pause", params={"mode": "keep", "clear_cache": "false"})
         response.raise_for_status()
+        logger.info(f"Paused inference engine {_admin_client_label(client)} in {time.perf_counter() - start:.2f}s")
 
+    start = time.perf_counter()
     await asyncio.gather(*[_pause(client) for client in admin_clients])
-    logger.info("All inference engines paused")
+    logger.info(f"All inference engines paused in {time.perf_counter() - start:.2f}s")
 
 
 async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
@@ -320,11 +328,14 @@ async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
     logger = get_logger()
 
     async def _resume(client: AsyncClient) -> None:
+        start = time.perf_counter()
         response = await client.post("/resume")
         response.raise_for_status()
+        logger.info(f"Resumed inference engine {_admin_client_label(client)} in {time.perf_counter() - start:.2f}s")
 
+    start = time.perf_counter()
     await asyncio.gather(*[_resume(client) for client in admin_clients])
-    logger.info("All inference engines resumed")
+    logger.info(f"All inference engines resumed in {time.perf_counter() - start:.2f}s")
 
 
 async def update_weights(
@@ -343,6 +354,7 @@ async def update_weights(
     to invalidate any cached KV states computed with the old weights.
     """
     logger = get_logger()
+    total_start = time.perf_counter()
 
     weight_dir_posix = weight_dir.as_posix() if weight_dir is not None else None
 
@@ -351,8 +363,13 @@ async def update_weights(
     else:
 
         async def _update_weights(admin_client: AsyncClient, weight_dir: str | None) -> None:
+            start = time.perf_counter()
             response = await admin_client.post("/update_weights", json={"weight_dir": weight_dir})
             response.raise_for_status()
+            logger.info(
+                f"Updated weights on inference engine {_admin_client_label(admin_client)} "
+                f"in {time.perf_counter() - start:.2f}s"
+            )
 
         # Pause engines so all DP workers drain in-flight work and can join the NCCL broadcast
         await _pause_engines(admin_clients)
@@ -368,6 +385,7 @@ async def update_weights(
             await asyncio.gather(*[_update_weights(admin_client, weight_dir_posix) for admin_client in admin_clients])
         finally:
             await _resume_engines(admin_clients)
+            logger.info(f"Completed inference weight update fanout in {time.perf_counter() - total_start:.2f}s")
 
 
 def _is_retryable_lora_error(exception: BaseException) -> bool:

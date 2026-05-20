@@ -1,6 +1,8 @@
+import time
 from typing import TYPE_CHECKING
 
 from torch.nn import Module
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
 
 from prime_rl.inference.vllm.worker.weight_transfer import load_weights_checkpoint_layerwise
@@ -12,6 +14,8 @@ if TYPE_CHECKING:
     Worker = Worker
 else:
     Worker = object
+
+logger = init_logger("vllm.inference.vllm.worker_filesystem")
 
 
 class FileSystemWeightUpdateWorker(Worker):
@@ -27,6 +31,8 @@ class FileSystemWeightUpdateWorker(Worker):
 
     def update_weights_from_path(self, weight_path: str) -> None:
         """Update weights from a specified path in shared filesystem containing a HF-compatible checkpoint."""
+        start = time.perf_counter()
+        logger.info(f"Filesystem worker update_weights_from_path start (weight_path={weight_path})")
         # Get vLLM model runner and model
         # When enforce_eager=True, model isn't wrapped by torch.compile so no .runnable attr
         model_runner = self.model_runner
@@ -53,3 +59,4 @@ class FileSystemWeightUpdateWorker(Worker):
             self.model_runner.model_config,
             self.vllm_config,
         )
+        logger.info(f"Filesystem worker update_weights_from_path complete in {time.perf_counter() - start:.2f}s")

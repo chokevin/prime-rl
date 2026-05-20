@@ -612,11 +612,16 @@ def monkey_patch_dp_engine_core_pause_resume_deadlock():
     (https://github.com/vllm-project/vllm/pull/39366), which makes resume
     reject states that our weight-update flow can validly hit.
     """
+    import time
+
     from vllm.config import ParallelConfig
+    from vllm.logger import init_logger
     from vllm.v1.core.sched.interface import PauseState
     from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
     from vllm.v1.engine.core import DPEngineCoreProc, EngineCore, EngineCoreProc
     from vllm.v1.request import Request
+
+    logger = init_logger("prime_rl.inference.pause_resume_patch")
 
     _require_vllm_attrs_for_patch(
         {
@@ -651,11 +656,17 @@ def monkey_patch_dp_engine_core_pause_resume_deadlock():
             _base_handle_client_request(self, request_type, request)
 
     def _patched_pause_complete(self) -> bool:
+        start = time.perf_counter()
         self.pending_pause = False
         self.ignore_start_dp_wave = False
-        return _base_pause_complete(self)
+        complete = _base_pause_complete(self)
+        logger.info(
+            f"DP engine core {self.engine_index} pause_complete={complete} in {time.perf_counter() - start:.2f}s"
+        )
+        return complete
 
     def _patched_resume_scheduler(self):
+        start = time.perf_counter()
         was_paused = self.scheduler.pause_state != PauseState.UNPAUSED
         self.pending_pause = False
         self.ignore_start_dp_wave = False
@@ -663,6 +674,10 @@ def monkey_patch_dp_engine_core_pause_resume_deadlock():
         if was_paused:
             self.engines_running = True
             self._force_dp_running_state_sync = True
+        logger.info(
+            f"DP engine core {self.engine_index} resume_scheduler(was_paused={was_paused}) "
+            f"in {time.perf_counter() - start:.2f}s"
+        )
 
     def _patched_has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         self.step_counter += 1

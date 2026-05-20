@@ -1,4 +1,5 @@
 import asyncio
+import time
 from argparse import Namespace
 from typing import Any
 
@@ -168,20 +169,30 @@ WORKER_EXTENSION_CLS = {
 
 @router.post("/pause")
 async def pause(request: Request):
+    start = time.perf_counter()
+    logger.info("Prime-RL /pause start")
     await engine_client(request).pause_generation(mode="keep", clear_cache=False)
+    logger.info(f"Prime-RL /pause complete in {time.perf_counter() - start:.2f}s")
     return {"status": "paused"}
 
 
 @router.post("/resume")
 async def resume(request: Request):
+    start = time.perf_counter()
+    logger.info("Prime-RL /resume start")
     await engine_client(request).resume_generation()
+    logger.info(f"Prime-RL /resume complete in {time.perf_counter() - start:.2f}s")
     return {"status": "resumed"}
 
 
 @router.post("/update_weights")
 async def update_weights(request: Request):
+    start = time.perf_counter()
     data = await request.json()
-    await engine_client(request).collective_rpc("update_weights_from_path", args=(data.get("weight_dir"),))
+    weight_dir = data.get("weight_dir")
+    logger.info(f"Prime-RL /update_weights collective_rpc start (weight_dir={weight_dir})")
+    await engine_client(request).collective_rpc("update_weights_from_path", args=(weight_dir,))
+    logger.info(f"Prime-RL /update_weights collective_rpc complete in {time.perf_counter() - start:.2f}s")
     return {"status": "ok"}
 
 
