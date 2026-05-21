@@ -876,8 +876,68 @@ WeightBroadcastConfig: TypeAlias = Annotated[
 ]
 
 
+class DirectRequestPickerConfig(BaseConfig):
+    """Default direct Prime scheduler selection with no routing seam behavior change."""
+
+    type: Literal["direct"] = "direct"
+
+
+class LeastLoadedRequestPickerConfig(BaseConfig):
+    """No-op in-process picker that reproduces Prime's direct least-loaded selection."""
+
+    type: Literal["least_loaded"] = "least_loaded"
+
+
+class ExternalRequestPickerConfig(BaseConfig):
+    """HTTP adapter for Prime-aware request picking outside the generation data path."""
+
+    type: Literal["external"] = "external"
+
+    adapter_url: Annotated[
+        str,
+        Field(
+            description=(
+                "HTTP endpoint that accepts Prime's logical rollout-client candidates and returns one selected "
+                "candidate. This is an adapter boundary, not an llm-d/Envoy ext-proc endpoint."
+            )
+        ),
+    ]
+
+    timeout: Annotated[
+        float,
+        Field(gt=0, description="Timeout in seconds for request-picker adapter calls."),
+    ] = 1.0
+
+    max_attempts: Annotated[
+        int,
+        Field(ge=1, description="Maximum attempts for retryable request-picker adapter failures."),
+    ] = 3
+
+    retry_backoff: Annotated[
+        float,
+        Field(ge=0, description="Initial exponential backoff in seconds between retryable adapter failures."),
+    ] = 0.05
+
+
+RequestPickerConfig: TypeAlias = Annotated[
+    DirectRequestPickerConfig | LeastLoadedRequestPickerConfig | ExternalRequestPickerConfig,
+    Field(discriminator="type"),
+]
+
+
 class OrchestratorExperimentalConfig(BaseConfig):
     """Experimental features for the orchestrator."""
+
+    request_picker: Annotated[
+        RequestPickerConfig,
+        Field(
+            description=(
+                "Experimental rollout request picker. The default direct mode preserves Prime's existing "
+                "least-loaded scheduler path; least_loaded runs the same policy through the picker seam; "
+                "external calls an adapter while keeping generation/admin traffic direct."
+            )
+        ),
+    ] = DirectRequestPickerConfig()
 
 
 class TeacherModelConfig(BaseConfig):

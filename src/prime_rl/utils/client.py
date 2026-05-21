@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from itertools import cycle
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+from urllib.parse import urlparse
 
 import httpx
 import verifiers as vf
@@ -42,12 +44,22 @@ class InferencePool(Protocol):
         """Wait for inference pool to be ready."""
         ...
 
-    async def update_weights(self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0) -> None:
+    async def update_weights(
+        self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0
+    ) -> dict[str, float] | None:
         """Update weights on all inference servers."""
         ...
 
     def get_metrics(self) -> dict[str, float]:
         """Get pool metrics."""
+        ...
+
+    def update_client_metrics(self, metrics: dict[str, dict[str, float]]) -> None:
+        """Update latest per-endpoint inference metrics."""
+        ...
+
+    def get_client_metrics(self) -> dict[str, dict[str, float]]:
+        """Get latest per-endpoint inference metrics."""
         ...
 
     async def stop(self) -> None:
@@ -89,6 +101,7 @@ class StaticInferencePool:
         self._wait_for_ready_timeout = client_config.wait_for_ready_timeout
         self._eval_cycle = cycle(self._eval_clients)
         self.model_name = model_name
+        self._client_metrics: dict[str, dict[str, float]] = {}
 
     @property
     def train_clients(self) -> list[vf.ClientConfig]:
@@ -114,11 +127,19 @@ class StaticInferencePool:
         )
         await maybe_check_has_model(self._admin_clients, model_name, skip_model_check=self._skip_model_check)
 
-    async def update_weights(self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0) -> None:
-        await update_weights(self._admin_clients, weight_dir, lora_name=lora_name, step=step)
+    async def update_weights(
+        self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0
+    ) -> dict[str, float]:
+        return await update_weights(self._admin_clients, weight_dir, lora_name=lora_name, step=step)
 
     def get_metrics(self) -> dict[str, float]:
         return {}
+
+    def update_client_metrics(self, metrics: dict[str, dict[str, float]]) -> None:
+        self._client_metrics = metrics
+
+    def get_client_metrics(self) -> dict[str, dict[str, float]]:
+        return self._client_metrics
 
     async def stop(self) -> None:
         pass
@@ -302,29 +323,49 @@ async def check_health(
 NCCL_READY_MARKER = "NCCL_READY"
 
 
-async def _pause_engines(admin_clients: list[AsyncClient]) -> None:
+def _admin_client_metric_label(client: AsyncClient) -> str:
+    parsed = urlparse(str(client.base_url))
+    netloc = parsed.netloc or parsed.path
+    return netloc.replace(":", "_").replace(".", "_").replace("-", "_")
+
+
+async def _pause_engines(admin_clients: list[AsyncClient]) -> dict[str, float]:
     """Pause all inference engines, waiting for in-flight requests to drain."""
     logger = get_logger()
     logger.info("Pausing inference engines for weight update")
 
-    async def _pause(client: AsyncClient) -> None:
+    async def _pause(client: AsyncClient) -> tuple[str, float]:
+        start = time.perf_counter()
         response = await client.post("/pause", params={"mode": "keep", "clear_cache": "false"})
         response.raise_for_status()
+        return _admin_client_metric_label(client), time.perf_counter() - start
 
-    await asyncio.gather(*[_pause(client) for client in admin_clients])
+    start = time.perf_counter()
+    results = await asyncio.gather(*[_pause(client) for client in admin_clients])
     logger.info("All inference engines paused")
+    metrics = {"time/update_pause": time.perf_counter() - start}
+    for label, duration in results:
+        metrics[f"time/update_pause/{label}"] = duration
+    return metrics
 
 
-async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
+async def _resume_engines(admin_clients: list[AsyncClient]) -> dict[str, float]:
     """Resume all inference engines after weight update."""
     logger = get_logger()
 
-    async def _resume(client: AsyncClient) -> None:
+    async def _resume(client: AsyncClient) -> tuple[str, float]:
+        start = time.perf_counter()
         response = await client.post("/resume")
         response.raise_for_status()
+        return _admin_client_metric_label(client), time.perf_counter() - start
 
-    await asyncio.gather(*[_resume(client) for client in admin_clients])
+    start = time.perf_counter()
+    results = await asyncio.gather(*[_resume(client) for client in admin_clients])
     logger.info("All inference engines resumed")
+    metrics = {"time/update_resume": time.perf_counter() - start}
+    for label, duration in results:
+        metrics[f"time/update_resume/{label}"] = duration
+    return metrics
 
 
 async def update_weights(
@@ -332,7 +373,7 @@ async def update_weights(
     weight_dir: Path | None,
     lora_name: str | None = None,
     step: int = 0,
-) -> None:
+) -> dict[str, float]:
     """Update weights on static inference servers.
 
     Pauses all engines first to drain in-flight requests, then performs the
@@ -345,17 +386,23 @@ async def update_weights(
     logger = get_logger()
 
     weight_dir_posix = weight_dir.as_posix() if weight_dir is not None else None
+    total_start = time.perf_counter()
+    metrics: dict[str, float] = {}
 
     if lora_name is not None and weight_dir is not None:
+        start = time.perf_counter()
         await load_lora_adapter(admin_clients, lora_name, weight_dir)
+        metrics["time/update_fanout"] = time.perf_counter() - start
     else:
 
-        async def _update_weights(admin_client: AsyncClient, weight_dir: str | None) -> None:
+        async def _update_weights(admin_client: AsyncClient, weight_dir: str | None) -> tuple[str, float]:
+            start = time.perf_counter()
             response = await admin_client.post("/update_weights", json={"weight_dir": weight_dir})
             response.raise_for_status()
+            return _admin_client_metric_label(admin_client), time.perf_counter() - start
 
         # Pause engines so all DP workers drain in-flight work and can join the NCCL broadcast
-        await _pause_engines(admin_clients)
+        metrics.update(await _pause_engines(admin_clients))
 
         try:
             # Create ready marker before servers enter receive path (used by NCCL broadcast)
@@ -365,9 +412,17 @@ async def update_weights(
                 nccl_ready_file.touch()
                 logger.debug(f"Created NCCL_READY marker at {nccl_ready_file}")
 
-            await asyncio.gather(*[_update_weights(admin_client, weight_dir_posix) for admin_client in admin_clients])
+            start = time.perf_counter()
+            results = await asyncio.gather(
+                *[_update_weights(admin_client, weight_dir_posix) for admin_client in admin_clients]
+            )
+            metrics["time/update_fanout"] = time.perf_counter() - start
+            for label, duration in results:
+                metrics[f"time/update_fanout/{label}"] = duration
         finally:
-            await _resume_engines(admin_clients)
+            metrics.update(await _resume_engines(admin_clients))
+    metrics["time/update_total"] = time.perf_counter() - total_start
+    return metrics
 
 
 def _is_retryable_lora_error(exception: BaseException) -> bool:

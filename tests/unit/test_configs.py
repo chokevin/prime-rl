@@ -53,6 +53,29 @@ def test_load_configs(config_file: Path):
     assert any(could_parse), f"No config class could be parsed from {config_file}"
 
 
+def test_orchestrator_request_picker_config_defaults_to_direct():
+    config = OrchestratorConfig.model_validate({"use_renderer": False})
+    assert config.experimental.request_picker.type == "direct"
+
+
+def test_orchestrator_external_request_picker_config():
+    config = OrchestratorConfig.model_validate(
+        {
+            "use_renderer": False,
+            "experimental": {
+                "request_picker": {
+                    "type": "external",
+                    "adapter_url": "http://picker.local/pick",
+                    "timeout": 0.25,
+                }
+            },
+        }
+    )
+    assert config.experimental.request_picker.type == "external"
+    assert config.experimental.request_picker.adapter_url == "http://picker.local/pick"
+    assert config.experimental.request_picker.timeout == 0.25
+
+
 class NestedConfig(BaseConfig):
     lr: float = 1e-4
     weight_decay: float = 0.01

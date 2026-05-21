@@ -1,10 +1,12 @@
 import asyncio
+from collections import Counter, defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import verifiers as vf
 
+from prime_rl.orchestrator.request_picker import DirectRequestPicker
 from prime_rl.orchestrator.scheduler import InflightRequest, Scheduler
 from prime_rl.utils.async_utils import safe_cancel
 
@@ -31,6 +33,10 @@ def make_scheduler() -> Scheduler:
     scheduler.inflight_policy_update_task = None
     scheduler.update_policy_task = None
     scheduler.enable_policy_updates = True
+    scheduler.request_picker = DirectRequestPicker()
+    scheduler.metric_values = defaultdict(list)
+    scheduler.metric_counts = Counter()
+    scheduler.cancelled_rollouts_by_client = Counter()
     return scheduler
 
 
@@ -159,6 +165,33 @@ def test_stop_cancels_inflight_policy_update_task():
         assert cancelled.is_set()
         assert scheduler.update_policy_task is None
         assert scheduler.inflight_policy_update_task is None
+
+    asyncio.run(run())
+
+
+def test_cancel_inflight_rollouts_records_client_cancellations():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        client = vf.ClientConfig(
+            client_idx=3,
+            api_base_url="http://worker-a:8000/v1",
+            extra_headers={"X-data-parallel-rank": "1"},
+        )
+        task = asyncio.create_task(asyncio.sleep(60))
+        scheduler.inflight_requests[task] = InflightRequest(
+            off_policy_steps=0,
+            client_config=client,
+            env_name="test",
+            group_id=1,
+            rollout_count=2,
+        )
+
+        await scheduler.cancel_inflight_rollouts()
+
+        assert scheduler.cancelled_rollouts_count == 2
+        assert scheduler.cancelled_rollouts_by_client[Scheduler._client_identity(client)] == 2
+        assert scheduler.metric_counts["scheduler/cancelled_rollouts/client_3_worker_a_8000_dp_1"] == 2
+        assert scheduler.inflight_requests == {}
 
     asyncio.run(run())
 

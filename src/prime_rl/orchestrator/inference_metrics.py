@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
+from collections.abc import Callable
+from urllib.parse import urlparse
 
 import wandb
 from httpx import AsyncClient
@@ -43,6 +45,12 @@ _COUNTER_TOTAL_TO_NAME = {f"{name}_total": name for name in COUNTER_METRICS}
 
 # Gauges where we log both max and mean across engines (to show imbalance)
 _DUAL_AGG_GAUGES = {"vllm:gpu_cache_usage_perc", "vllm:gpu_prefix_cache_hit_rate"}
+
+
+def _endpoint_label(base_url: str) -> str:
+    parsed = urlparse(base_url)
+    netloc = parsed.netloc or parsed.path
+    return netloc.replace(":", "_").replace(".", "_").replace("-", "_")
 
 
 def parse_prometheus_text(text: str) -> tuple[dict[str, float], dict[str, float], dict[str, tuple[float, float]]]:
@@ -91,12 +99,18 @@ class InferenceMetricsCollector:
     Runs independently of training steps on a time-based axis.
     """
 
-    def __init__(self, admin_clients: list[AsyncClient]):
+    def __init__(
+        self,
+        admin_clients: list[AsyncClient],
+        metric_sink: Callable[[dict[str, dict[str, float]]], None] | None = None,
+    ):
         self.admin_clients = admin_clients
+        self.metric_sink = metric_sink
         self.logger = get_logger()
         self._gauge_history: dict[str, deque[float]] = {}
         self._rate_history: dict[str, deque[float]] = {}
         self._prev_counters: dict[str, tuple[float, float]] = {}
+        self._prev_server_counters: dict[tuple[str, str], tuple[float, float]] = {}
         self._prev_histograms: dict[str, tuple[float, float, float]] = {}
         self._task: asyncio.Task | None = None
 
@@ -116,11 +130,11 @@ class InferenceMetricsCollector:
     async def _collect_and_log(self):
         now = time.monotonic()
 
-        async def fetch(client: AsyncClient) -> str | None:
+        async def fetch(client: AsyncClient) -> tuple[str, str] | None:
             try:
                 response = await client.get("/metrics", timeout=5.0)
                 response.raise_for_status()
-                return response.text
+                return _endpoint_label(str(client.base_url)), response.text
             except Exception as e:
                 self.logger.debug(f"Failed to fetch metrics from {client.base_url}: {e!r}")
                 return None
@@ -132,15 +146,22 @@ class InferenceMetricsCollector:
         agg_sum_gauges: dict[str, float] = {}
         agg_counters: dict[str, float] = {}
         agg_histograms: dict[str, tuple[float, float]] = {}
+        endpoint_metrics: dict[str, dict[str, float]] = {}
+        skew_values: dict[str, list[float]] = {}
         n_servers = 0
 
-        for text in results:
-            if text is None:
+        for result in results:
+            if result is None:
                 continue
+            label, text = result
             n_servers += 1
             gauges, counters, histograms = parse_prometheus_text(text)
+            endpoint_metrics[label] = {}
 
             for name, value in gauges.items():
+                short = name.removeprefix("vllm:")
+                endpoint_metrics[label][short] = value
+                skew_values.setdefault(short, []).append(value)
                 if name in _DUAL_AGG_GAUGES:
                     dual_agg_values.setdefault(name, []).append(value)
                 else:
@@ -148,6 +169,19 @@ class InferenceMetricsCollector:
 
             for name, value in counters.items():
                 agg_counters[name] = agg_counters.get(name, 0.0) + value
+                prev = self._prev_server_counters.get((label, name))
+                self._prev_server_counters[(label, name)] = (now, value)
+                if prev is None:
+                    continue
+                prev_time, prev_value = prev
+                dt = now - prev_time
+                delta = value - prev_value
+                if dt <= 0 or delta < 0:
+                    continue
+                rate_name = COUNTER_RATE_NAMES[name]
+                rate = delta / dt
+                endpoint_metrics[label][rate_name] = rate
+                skew_values.setdefault(rate_name, []).append(rate)
 
             for name, (h_sum, h_count) in histograms.items():
                 prev = agg_histograms.get(name, (0.0, 0.0))
@@ -155,6 +189,8 @@ class InferenceMetricsCollector:
 
         if n_servers == 0:
             return
+        if self.metric_sink is not None:
+            self.metric_sink(endpoint_metrics)
 
         # Update gauge history — sum gauges
         for name, value in agg_sum_gauges.items():
@@ -221,6 +257,15 @@ class InferenceMetricsCollector:
         for rate_name, values in self._rate_history.items():
             if values:
                 metrics[f"inference/{rate_name}"] = sum(values) / len(values)
+        for label, values in endpoint_metrics.items():
+            for name, value in values.items():
+                metrics[f"inference/server/{label}/{name}"] = value
+        for name, values in skew_values.items():
+            if not values:
+                continue
+            metrics[f"inference/skew/{name}/min"] = min(values)
+            metrics[f"inference/skew/{name}/max"] = max(values)
+            metrics[f"inference/skew/{name}/mean"] = sum(values) / len(values)
 
         if metrics:
             metrics["_timestamp"] = time.time()

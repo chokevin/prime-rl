@@ -11,6 +11,17 @@ from aiolimiter import AsyncLimiter
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.buffer import Buffer
 from prime_rl.orchestrator.envs import TrainEnvs
+from prime_rl.orchestrator.request_picker import (
+    CandidateStats,
+    ClientIdentity,
+    DirectRequestPicker,
+    RequestPickContext,
+    client_identity,
+    client_metric_label,
+    endpoint_label_from_url,
+    select_with_metrics,
+    setup_request_picker,
+)
 from prime_rl.orchestrator.vf_utils import get_seq_len
 from prime_rl.utils.async_utils import safe_cancel, safe_cancel_all
 from prime_rl.utils.client import InferencePool
@@ -34,6 +45,10 @@ class InflightRequest:
     rollout_count: int = 1
     # Dispatch round the request belongs to (see GroupState.current_round).
     round_id: int = 0
+    request_id: int = 0
+    request_started_at: float = 0.0
+    dispatch_wait_seconds: float = 0.0
+    client_inflight_at_selection: int = 0
 
 
 @dataclass
@@ -57,6 +72,9 @@ class GroupState:
     # Highest round already counted as failed; used to dedupe failures from
     # multiple rollouts in the same round.
     last_failed_round: int = -1
+    created_at: float = field(default_factory=time.perf_counter)
+    first_dispatch_at: float | None = None
+    first_completion_at: float | None = None
 
 
 class Scheduler:
@@ -106,6 +124,7 @@ class Scheduler:
 
         # Inference pool - used for admin operations (adapter sync) and metrics
         self.inference_pool = inference_pool
+        self.request_picker = setup_request_picker(config.experimental.request_picker)
 
         group_scoring_envs = [env.name for env in train_envs if env.requires_group_scoring]
         if group_scoring_envs:
@@ -116,6 +135,7 @@ class Scheduler:
 
         # Track in-progress groups while rollouts are generated independently.
         self.next_group_id = 0
+        self.next_request_id = 0
         self.groups: dict[int, GroupState] = {}
 
         self.step, self.ckpt_step = 0, 0
@@ -131,6 +151,16 @@ class Scheduler:
         self.total_rollouts_by_env: dict[str, int] = defaultdict(int)
         self.dropped_groups_by_env: dict[str, int] = defaultdict(int)
         self.last_batch_generation_time = 0.0
+        self.last_update_metrics: dict[str, float] = {}
+        self.inflight_rollouts_at_pause = 0
+        self.oldest_off_policy_at_pause = 0
+        self.metric_values: dict[str, list[float]] = defaultdict(list)
+        self.metric_counts: Counter[str] = Counter()
+        self.completed_rollouts_by_client: Counter[ClientIdentity] = Counter()
+        self.cancelled_rollouts_by_client: Counter[ClientIdentity] = Counter()
+        self.request_wall_seconds_by_client: dict[ClientIdentity, list[float]] = defaultdict(list)
+        self.last_request_wall_seconds_by_client: dict[ClientIdentity, float] = {}
+        self._last_refill_end_time: float | None = None
 
     @property
     def uses_token_batching(self) -> bool:
@@ -157,6 +187,9 @@ class Scheduler:
     async def cancel_inflight_rollouts(self):
         """Cancel all in-flight rollout requests."""
         count = sum(info.rollout_count for info in self.inflight_requests.values())
+        for info in self.inflight_requests.values():
+            self.cancelled_rollouts_by_client[self._client_identity(info.client_config)] += info.rollout_count
+            self._record_client_count("scheduler/cancelled_rollouts", info.client_config, info.rollout_count)
         await safe_cancel_all(list(self.inflight_requests))
         self.inflight_requests.clear()
         self.groups.clear()
@@ -164,10 +197,19 @@ class Scheduler:
 
     @staticmethod
     def _client_identity(c: vf.ClientConfig) -> tuple[str, str | None]:
-        return (
-            c.api_base_url,
-            c.extra_headers.get("X-data-parallel-rank"),
-        )
+        return client_identity(c)
+
+    def _record_value(self, name: str, value: float) -> None:
+        self.metric_values[name].append(value)
+
+    def _record_count(self, name: str, value: int | float = 1) -> None:
+        self.metric_counts[name] += value
+
+    def _record_client_count(self, prefix: str, client: vf.ClientConfig, value: int | float = 1) -> None:
+        self._record_count(f"{prefix}/{client_metric_label(client)}", value)
+
+    def _record_client_value(self, prefix: str, client: vf.ClientConfig, value: float) -> None:
+        self._record_value(f"{prefix}/{client_metric_label(client)}", value)
 
     async def _select_least_loaded_client(self) -> vf.ClientConfig:
         """Select the client with the fewest in-flight tasks.
@@ -182,6 +224,86 @@ class Scheduler:
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
         return min(clients, key=lambda c: inflight[self._client_identity(c)])
 
+    async def _get_train_clients(self) -> list[vf.ClientConfig]:
+        clients = self.inference_pool.train_clients
+        while not clients:
+            await asyncio.sleep(1)
+            clients = self.inference_pool.train_clients
+        return clients
+
+    def _oldest_inflight_seconds(self) -> float:
+        now = time.perf_counter()
+        ages = [
+            now - info.request_started_at for info in self.inflight_requests.values() if info.request_started_at > 0
+        ]
+        return max(ages, default=0.0)
+
+    def _candidate_stats(self, clients: list[vf.ClientConfig]) -> dict[ClientIdentity, CandidateStats]:
+        endpoint_metrics = self.inference_pool.get_client_metrics()
+        stats: dict[ClientIdentity, CandidateStats] = {}
+        for client in clients:
+            identity = self._client_identity(client)
+            wall_times = self.request_wall_seconds_by_client.get(identity, [])
+            endpoint_label = endpoint_label_from_url(client.api_base_url)
+            stats[identity] = CandidateStats(
+                completed_rollouts=self.completed_rollouts_by_client[identity],
+                cancelled_rollouts=self.cancelled_rollouts_by_client[identity],
+                request_wall_seconds_mean=sum(wall_times) / len(wall_times) if wall_times else None,
+                request_wall_seconds_last=self.last_request_wall_seconds_by_client.get(identity),
+                endpoint_metrics=endpoint_metrics.get(endpoint_label, {}),
+            )
+        return stats
+
+    async def _select_request_client(self, group_id: int, group: GroupState, env_name: str, cache_salt: str):
+        clients = await self._get_train_clients()
+        inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
+        context = RequestPickContext(
+            env_name=env_name,
+            group_id=group_id,
+            model_name=self.model_name,
+            step=self.step,
+            ckpt_step=self.ckpt_step,
+            cache_salt=cache_salt,
+            group_age_seconds=time.perf_counter() - group.created_at,
+            rollouts_to_schedule=group.rollouts_to_schedule,
+            completed_rollouts=len(group.completed_rollouts),
+            max_off_policy_level=self.max_off_policy_level,
+            oldest_inflight_seconds=self._oldest_inflight_seconds(),
+        )
+
+        if isinstance(self.request_picker, DirectRequestPicker):
+            start = time.perf_counter()
+            client = min(clients, key=lambda c: inflight[self._client_identity(c)])
+            latency_seconds = time.perf_counter() - start
+            attempts = 1
+            selected_inflight = inflight[self._client_identity(client)]
+        else:
+            result = await select_with_metrics(
+                self.request_picker,
+                clients,
+                inflight,
+                context,
+                self._candidate_stats(clients),
+            )
+            client = result.client
+            latency_seconds = result.latency_seconds
+            attempts = result.attempts
+            selected_inflight = result.selected_inflight
+
+        self._record_value("request_picker_latency_seconds", latency_seconds)
+        self._record_value("request_picker_selected_inflight", float(selected_inflight))
+        self._record_value("request_picker_candidate_count", float(len(clients)))
+        self._record_value("request_picker_attempts", float(attempts))
+        self._record_client_count("scheduler/selected_client", client)
+        self._record_client_value("scheduler/inflight_at_selection", client, float(selected_inflight))
+        self.logger.debug(
+            "Selected rollout client "
+            f"group_id={group_id} env={env_name} client_idx={client.client_idx} "
+            f"base_url={client.api_base_url} dp_rank={client.extra_headers.get('X-data-parallel-rank')} "
+            f"inflight={selected_inflight} picker_latency={latency_seconds:.6f}s"
+        )
+        return client, selected_inflight
+
     async def drop_group(self, group_id: int) -> int:
         """Drop a group and cancel any remaining in-flight rollouts for it. Returns the number of cancelled rollouts."""
         tasks_to_cancel = []
@@ -192,30 +314,42 @@ class Scheduler:
             self.inflight_requests.pop(task, None)
             tasks_to_cancel.append(task)
             rollout_count += info.rollout_count
+            self.cancelled_rollouts_by_client[self._client_identity(info.client_config)] += info.rollout_count
+            self._record_client_count("scheduler/cancelled_rollouts", info.client_config, info.rollout_count)
         self.groups.pop(group_id, None)
         await safe_cancel_all(tasks_to_cancel)
         return rollout_count
 
     async def schedule_rollout(self, group_id: int):
         """Asynchronously schedules a rollout request (or a group request for group-scoring envs)."""
+        dispatch_start = time.perf_counter()
         if self.rate_limiter:
             await self.rate_limiter.acquire()
         group = self.groups.get(group_id)
         if group is None or group.rollouts_to_schedule <= 0:
             return
 
+        env_name = group.example["env_name"]
+        env = self.train_envs.get(env_name)
+        cache_salt = str(self.ckpt_step)
+        selected_inflight = 0
         if group.pinned_client is not None:
             client_config = group.pinned_client
         else:
-            client_config = await self._select_least_loaded_client()
+            client_config, selected_inflight = await self._select_request_client(group_id, group, env_name, cache_salt)
             if group_id not in self.groups:
                 return
             group.pinned_client = client_config
 
-        env_name = group.example["env_name"]
-        env = self.train_envs.get(env_name)
+        if group.first_dispatch_at is None:
+            group.first_dispatch_at = time.perf_counter()
 
-        cache_salt = str(self.ckpt_step)
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        request_started_at = time.perf_counter()
+        dispatch_wait_seconds = request_started_at - dispatch_start
+        self._record_value("rollout_dispatch_wait_seconds", dispatch_wait_seconds)
+        self._record_client_value("rollout_dispatch_wait_seconds", client_config, dispatch_wait_seconds)
         if env.requires_group_scoring:
             rollout_count = group.rollouts_to_schedule
             group.rollouts_to_schedule = 0
@@ -246,6 +380,10 @@ class Scheduler:
             group_id=group_id,
             rollout_count=rollout_count,
             round_id=group.current_round,
+            request_id=request_id,
+            request_started_at=request_started_at,
+            dispatch_wait_seconds=dispatch_wait_seconds,
+            client_inflight_at_selection=selected_inflight,
         )
 
     @property
@@ -318,9 +456,14 @@ class Scheduler:
             f"Got new policy with step {next_ckpt_step}. Updating weights and cancelling old rollout requests."
         )
 
+        self.inflight_rollouts_at_pause = self.inflight_rollout_count
+        self.oldest_off_policy_at_pause = self.max_off_policy_level
         update_weights_start_time = time.perf_counter()
         weights_path = get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step)
-        await self.inference_pool.update_weights(weights_path, lora_name=self.lora_name, step=next_ckpt_step)
+        update_metrics = await self.inference_pool.update_weights(
+            weights_path, lora_name=self.lora_name, step=next_ckpt_step
+        )
+        self.last_update_metrics = update_metrics or {}
         self.update_weights_time = time.perf_counter() - update_weights_start_time
         self.logger.debug(f"Updated weights to step {next_ckpt_step} in {self.update_weights_time:.2f}s")
 
@@ -408,6 +551,7 @@ class Scheduler:
             self.checkpoint_ready.set()
 
         batch_start_time = time.perf_counter()
+        self._last_refill_end_time = None
 
         self.logger.debug("Starting to generate batch rollouts")
 
@@ -418,7 +562,11 @@ class Scheduler:
         )
 
         while batch_progress < self.batch_target:
+            refill_start = time.perf_counter()
+            if self._last_refill_end_time is not None:
+                self._record_value("scheduler_refill_gap_seconds", refill_start - self._last_refill_end_time)
             await self._fill_inflight_requests()
+            self._last_refill_end_time = time.perf_counter()
             inflight_tasks = list(self.inflight_requests.keys())
 
             finished_tasks, _ = await asyncio.wait(
@@ -437,10 +585,22 @@ class Scheduler:
 
                 group_id = rollout_info.group_id
                 env_name = rollout_info.env_name
+                request_wall_seconds = time.perf_counter() - rollout_info.request_started_at
+                identity = self._client_identity(rollout_info.client_config)
+                self._record_value("rollout_request_wall_seconds", request_wall_seconds)
+                self._record_client_value(
+                    "rollout_request_wall_seconds", rollout_info.client_config, request_wall_seconds
+                )
+                self.request_wall_seconds_by_client[identity].append(request_wall_seconds)
+                self.last_request_wall_seconds_by_client[identity] = request_wall_seconds
+                aggregation_start = time.perf_counter()
 
                 try:
                     group = self.groups.get(group_id)
                     if group is None:
+                        self._record_value(
+                            "rollout_response_aggregation_seconds", time.perf_counter() - aggregation_start
+                        )
                         continue
 
                     env = self.train_envs.get(env_name)
@@ -473,6 +633,8 @@ class Scheduler:
                         else:
                             rollout["env_name"] = env_name
                             valid_rollouts.append(rollout)
+                    if valid_rollouts and group.first_completion_at is None:
+                        group.first_completion_at = time.perf_counter()
 
                     if has_failures:
                         # Dedupe failures within the same dispatch round: an
@@ -498,40 +660,80 @@ class Scheduler:
                                 f"to retry more aggressively."
                             )
                             await self.drop_group(group_id)
+                            self._record_value(
+                                "rollout_response_aggregation_seconds", time.perf_counter() - aggregation_start
+                            )
                             continue
 
                     if has_failures and env.requires_group_scoring:
                         # Group scoring requires all rollouts — discard partial results, reschedule full group
                         group.completed_rollouts.clear()
                         group.rollouts_to_schedule = self.rollouts_per_example
+                        self._record_value(
+                            "rollout_response_aggregation_seconds", time.perf_counter() - aggregation_start
+                        )
                         continue
 
                     # For individual scoring, reschedule only the failed ones
                     group.rollouts_to_schedule += len(rollouts) - len(valid_rollouts)
                     group.completed_rollouts.extend(valid_rollouts)
                     if len(group.completed_rollouts) < self.rollouts_per_example:
+                        self.completed_rollouts_by_client[identity] += len(valid_rollouts)
+                        self._record_client_count(
+                            "scheduler/completed_rollouts", rollout_info.client_config, len(valid_rollouts)
+                        )
+                        self._record_client_value(
+                            "scheduler/off_policy_level_at_completion",
+                            rollout_info.client_config,
+                            float(rollout_info.off_policy_steps),
+                        )
+                        self._record_value(
+                            "rollout_response_aggregation_seconds", time.perf_counter() - aggregation_start
+                        )
                         continue
+                    group_completed_at = time.perf_counter()
+                    self._record_value("rollout_group_wall_seconds", group_completed_at - group.created_at)
+                    if group.first_completion_at is not None:
+                        self._record_value("rollout_group_tail_seconds", group_completed_at - group.first_completion_at)
+                    else:
+                        self._record_value("rollout_group_tail_seconds", 0.0)
                     completed_rollouts = self.groups.pop(group_id).completed_rollouts
+                    self.completed_rollouts_by_client[identity] += len(valid_rollouts)
+                    self._record_client_count(
+                        "scheduler/completed_rollouts", rollout_info.client_config, len(valid_rollouts)
+                    )
+                    self._record_client_value(
+                        "scheduler/off_policy_level_at_completion",
+                        rollout_info.client_config,
+                        float(rollout_info.off_policy_steps),
+                    )
 
                 except asyncio.CancelledError:
                     if group_id is not None:
                         await self.drop_group(group_id)
+                    self._record_value("rollout_response_aggregation_seconds", time.perf_counter() - aggregation_start)
                     continue
                 except Exception as e:
                     self.logger.warning(f"Rollout failed: {e}")
                     if group_id is not None:
                         await self.drop_group(group_id)
+                    self._record_value("rollout_response_aggregation_seconds", time.perf_counter() - aggregation_start)
                     continue
 
                 self.buffer.update(completed_rollouts)
                 accepted_rollouts = self.buffer.sample_rollouts(n=self.rollouts_per_example)
+                self._record_value("rollout_response_aggregation_seconds", time.perf_counter() - aggregation_start)
 
                 batch_rollouts.extend(accepted_rollouts)
                 progress_increment = self.get_batch_progress_increment(accepted_rollouts)
                 batch_progress += progress_increment
                 pbar.update(progress_increment)
 
+        refill_start = time.perf_counter()
+        if self._last_refill_end_time is not None:
+            self._record_value("scheduler_refill_gap_seconds", refill_start - self._last_refill_end_time)
         await self._fill_inflight_requests()
+        self._last_refill_end_time = time.perf_counter()
 
         batch_rollouts = self.finalize_batch_rollouts(batch_rollouts)
         pbar.close()
@@ -546,6 +748,7 @@ class Scheduler:
         if self.inflight_policy_update_task is not None:
             await safe_cancel(self.inflight_policy_update_task)
             self.inflight_policy_update_task = None
+        await self.request_picker.aclose()
 
     @property
     def max_off_policy_level(self) -> int:
@@ -565,11 +768,28 @@ class Scheduler:
     def async_level(self) -> int:
         return self.step - self.ckpt_step
 
+    def _consume_recorded_metrics(self) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        for name, values in self.metric_values.items():
+            if not values:
+                continue
+            metrics[name] = sum(values) / len(values)
+            metrics[f"{name}/max"] = max(values)
+            metrics[f"{name}/min"] = min(values)
+            metrics[f"{name}/count"] = len(values)
+        for name, value in self.metric_counts.items():
+            metrics[name] = value
+        self.metric_values.clear()
+        self.metric_counts.clear()
+        return metrics
+
     def get_metrics(self) -> dict[str, float]:
         total_rollouts = sum(self.total_rollouts_by_env.values())
         metrics = {
             "time/wait_for_ckpt": self.wait_for_ckpt_time,
             "time/update_weights": self.update_weights_time,
+            "scheduler/inflight_rollouts_at_pause": self.inflight_rollouts_at_pause,
+            "scheduler/oldest_off_policy_at_pause": self.oldest_off_policy_at_pause,
             "scheduler/async_level": self.async_level,
             "scheduler/inflight_rollouts": self.inflight_rollout_count,
             "scheduler/inflight_samples": self.inflight_sample_count,
@@ -592,11 +812,18 @@ class Scheduler:
         for env_name, steps in by_env.items():
             metrics[f"off_policy_level/{env_name}/max"] = max(steps)
             metrics[f"off_policy_level/{env_name}/mean"] = sum(steps) / len(steps)
+        metrics.update(self.last_update_metrics)
+        metrics.update(self._consume_recorded_metrics())
         self.cancelled_rollouts_count = 0
         self.empty_rollouts_by_env.clear()
         self.errored_rollouts_by_env.clear()
         self.total_rollouts_by_env.clear()
         self.dropped_groups_by_env.clear()
+        self.last_update_metrics = {}
+        self.completed_rollouts_by_client.clear()
+        self.cancelled_rollouts_by_client.clear()
+        self.request_wall_seconds_by_client.clear()
+        self.last_request_wall_seconds_by_client.clear()
 
         # Add inference pool metrics (e.g. elastic pool server counts)
         metrics.update(self.inference_pool.get_metrics())
