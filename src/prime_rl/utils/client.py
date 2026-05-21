@@ -391,7 +391,21 @@ async def update_weights(
                     f"Created durable NCCL_READY marker at {nccl_ready_file} in {time.perf_counter() - marker_start:.2f}s"
                 )
 
-            await asyncio.gather(*[_update_weights(admin_client, weight_dir_posix) for admin_client in admin_clients])
+            update_fanout = asyncio.gather(
+                *[_update_weights(admin_client, weight_dir_posix) for admin_client in admin_clients]
+            )
+            cancelled: asyncio.CancelledError | None = None
+            try:
+                await asyncio.shield(update_fanout)
+            except asyncio.CancelledError as e:
+                cancelled = e
+                logger.warning(
+                    "Cancellation requested during inference weight update fanout; waiting for in-flight "
+                    "updates to finish before resuming engines."
+                )
+                await update_fanout
+            if cancelled is not None:
+                raise cancelled
         finally:
             await _resume_engines(admin_clients)
             logger.info(f"Completed inference weight update fanout in {time.perf_counter() - total_start:.2f}s")

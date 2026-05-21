@@ -1,13 +1,19 @@
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import verifiers as vf
 
 from prime_rl.configs.shared import ClientConfig
 from prime_rl.orchestrator.request_picker import ExternalRequestPicker, RequestPickContext, _match_decision
-from prime_rl.utils.client import _is_retryable_lora_error, _pause_engines, load_lora_adapter, setup_clients
+from prime_rl.utils.client import (
+    _is_retryable_lora_error,
+    _pause_engines,
+    load_lora_adapter,
+    setup_clients,
+    update_weights,
+)
 
 
 def test_is_retryable_lora_error_returns_true_for_404():
@@ -60,6 +66,56 @@ def test_pause_engines_aborts_inflight_requests_for_weight_update():
     asyncio.run(_pause_engines([mock_client]))
 
     mock_client.post.assert_called_once_with("/pause", params={"mode": "abort", "clear_cache": "true"})
+
+
+def test_update_weights_finishes_fanout_before_propagating_cancellation():
+    async def run() -> None:
+        update_started = asyncio.Event()
+        update_release = asyncio.Event()
+        update_completed = asyncio.Event()
+        mock_client = AsyncMock()
+        mock_client.base_url = "http://worker-a:8000"
+        mock_response = MagicMock()
+        mock_response.raise_for_status = MagicMock()
+
+        async def post(path, json=None):
+            assert path == "/update_weights"
+            assert json == {"weight_dir": "/tmp/weights"}
+            update_started.set()
+            await update_release.wait()
+            update_completed.set()
+            return mock_response
+
+        mock_client.post.side_effect = post
+
+        with (
+            patch("prime_rl.utils.client._pause_engines", new=AsyncMock()) as pause_engines,
+            patch("prime_rl.utils.client._resume_engines", new=AsyncMock()) as resume_engines,
+            patch("prime_rl.utils.client.durable_touch") as durable_touch,
+        ):
+            task = asyncio.create_task(update_weights([mock_client], Path("/tmp/weights")))
+            await update_started.wait()
+
+            task.cancel()
+            await asyncio.sleep(0)
+
+            assert not task.done()
+            assert not update_completed.is_set()
+
+            update_release.set()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            else:
+                raise AssertionError("Expected cancellation to propagate after update fanout completed")
+
+            assert update_completed.is_set()
+            pause_engines.assert_awaited_once_with([mock_client])
+            durable_touch.assert_called_once_with(Path("/tmp/weights") / "NCCL_READY")
+            resume_engines.assert_awaited_once_with([mock_client])
+
+    asyncio.run(run())
 
 
 def test_setup_clients_assigns_renderer_and_dp_rank_headers():
