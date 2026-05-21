@@ -1,7 +1,7 @@
 import pickle
 import time
 from pathlib import Path
-from typing import Callable, Generator, cast
+from typing import Callable, cast
 
 import torch
 import torch.nn as nn
@@ -115,26 +115,43 @@ def filter_state_dict_by_layers(
     num_layers: int,
     layer_prefix: str,
     log_fn: LogFn | None = None,
-) -> Generator[tuple[int, dict[str, torch.Tensor]], None, None]:
+) -> list[tuple[int, dict[str, torch.Tensor]]]:
     """Yield non-layer weights first, then each layer's weights.
 
-    Yields (layer_idx, layer_state_dict) where layer_idx is -1 for the non-layer
+    Returns (layer_idx, layer_state_dict) where layer_idx is -1 for the non-layer
     dict and the actual layer index (0, 1, ...) for layer dicts.
     """
     start = time.perf_counter()
-    non_layer_state_dict = {key: value for key, value in state_dict.items() if not key.startswith(layer_prefix)}
-    if log_fn is not None:
-        log_fn(f"NCCL sender layer=-1 filter tensors={len(non_layer_state_dict)} in {time.perf_counter() - start:.2f}s")
-    yield -1, non_layer_state_dict
+    layer_state_dicts = [dict[str, torch.Tensor]() for _ in range(num_layers)]
+    non_layer_state_dict: dict[str, torch.Tensor] = {}
+    misplaced_layer_tensors = 0
+    for key, value in state_dict.items():
+        if not key.startswith(layer_prefix):
+            non_layer_state_dict[key] = value
+            continue
 
-    for i in range(num_layers):
-        start = time.perf_counter()
-        layer_state_dict = {key: value for key, value in state_dict.items() if key.startswith(f"{layer_prefix}{i}.")}
-        if log_fn is not None:
-            log_fn(
-                f"NCCL sender layer={i} filter tensors={len(layer_state_dict)} in {time.perf_counter() - start:.2f}s"
-            )
-        yield i, layer_state_dict
+        layer_num_str = key[len(layer_prefix) :].split(".")[0]
+        if not layer_num_str.isdigit():
+            non_layer_state_dict[key] = value
+            misplaced_layer_tensors += 1
+            continue
+
+        layer_idx = int(layer_num_str)
+        if 0 <= layer_idx < num_layers:
+            layer_state_dicts[layer_idx][key] = value
+        else:
+            non_layer_state_dict[key] = value
+            misplaced_layer_tensors += 1
+
+    if log_fn is not None:
+        total_tensors = len(non_layer_state_dict) + sum(len(layer_state_dict) for layer_state_dict in layer_state_dicts)
+        log_fn(
+            f"NCCL sender grouped state_dict tensors={total_tensors} layers={num_layers} "
+            f"non_layer_tensors={len(non_layer_state_dict)} "
+            f"misplaced_layer_tensors={misplaced_layer_tensors} in {time.perf_counter() - start:.2f}s"
+        )
+
+    return [(-1, non_layer_state_dict), *list(enumerate(layer_state_dicts))]
 
 
 def preprocess_layer_checkpoint(
@@ -192,10 +209,20 @@ class NCCLWeightBroadcastSender:
     @torch.no_grad()
     def broadcast_weights(self, model: nn.Module, step: int) -> None:
         """Broadcast the state dict of a model into the inference pool using NCCL."""
+        start = time.perf_counter()
         state_dict = model.state_dict()
+        self.logger.info(
+            f"NCCL sender collected model.state_dict tensors={len(state_dict)} in {time.perf_counter() - start:.2f}s"
+        )
+
+        start = time.perf_counter()
         layer_prefix = get_layer_prefix(model.config)
         num_layers = get_max_layer_num(state_dict, layer_prefix)
         num_state_dict_to_send = num_layers + 1  # we send all layer plus the remaining weights
+        self.logger.info(
+            f"NCCL sender planned {num_state_dict_to_send} groups "
+            f"(layers={num_layers}, layer_prefix={layer_prefix}) in {time.perf_counter() - start:.2f}s"
+        )
 
         if self.world.is_master:
             broadcast_integer(num_state_dict_to_send, self.communicator)
@@ -207,22 +234,26 @@ class NCCLWeightBroadcastSender:
         else:
             preprocess_fn = preprocess_layer_checkpoint
 
-        for group_idx, (layer_id, layer_state_dict) in enumerate(
-            filter_state_dict_by_layers(state_dict, num_layers, layer_prefix, log_fn=self.logger.info), start=1
-        ):
+        groups = filter_state_dict_by_layers(state_dict, num_layers, layer_prefix, log_fn=self.logger.info)
+        previous_group_complete = time.perf_counter()
+        broadcast_start = time.perf_counter()
+        for group_idx, (layer_id, layer_state_dict) in enumerate(groups, start=1):
             layer_start = time.perf_counter()
             layer_label = f"layer={layer_id} group={group_idx}/{num_state_dict_to_send}"
-            self.logger.info(f"NCCL sender {layer_label} prep start tensors={len(layer_state_dict)}")
+            self.logger.info(
+                f"NCCL sender {layer_label} prep start tensors={len(layer_state_dict)} "
+                f"since_previous_group={layer_start - previous_group_complete:.2f}s"
+            )
 
             phase_start = time.perf_counter()
             layer_state_dict = self._resolve_dtensors(layer_state_dict)
             self.logger.info(f"NCCL sender {layer_label} resolved DTensors in {time.perf_counter() - phase_start:.2f}s")
 
-            phase_start = time.perf_counter()
-            layer_state_dict = preprocess_fn(model, layer_state_dict, layer_id)
-            self.logger.info(f"NCCL sender {layer_label} preprocessed in {time.perf_counter() - phase_start:.2f}s")
-
             if self.world.is_master:
+                phase_start = time.perf_counter()
+                layer_state_dict = preprocess_fn(model, layer_state_dict, layer_id)
+                self.logger.info(f"NCCL sender {layer_label} preprocessed in {time.perf_counter() - phase_start:.2f}s")
+
                 broadcast_state_dict(
                     layer_state_dict,
                     self.communicator,
@@ -230,11 +261,23 @@ class NCCLWeightBroadcastSender:
                     log_fn=self.logger.info,
                 )
             self.logger.info(f"NCCL sender {layer_label} complete in {time.perf_counter() - layer_start:.2f}s")
+            previous_group_complete = time.perf_counter()
+        self.logger.info(f"NCCL sender broadcast_weights complete in {time.perf_counter() - broadcast_start:.2f}s")
 
     def _resolve_dtensors(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        dtensor_count = 0
+        materialized_elements = 0
         for key, value in list(state_dict.items()):
             if isinstance(value, DTensor):
+                dtensor_count += 1
+                materialized_elements += value.numel()
                 state_dict[key] = cast(DTensor, value.to(self.dtype)).full_tensor()
+        if dtensor_count and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        if dtensor_count:
+            self.logger.info(
+                f"NCCL sender materialized DTensors tensors={dtensor_count} elements={materialized_elements}"
+            )
         return state_dict
 
 

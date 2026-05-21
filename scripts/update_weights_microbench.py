@@ -92,14 +92,26 @@ def iter_safetensor_keys(weight_dir: Path) -> Iterable[str]:
             yield from f.keys()
 
 
-def load_key_group(weight_dir: Path, keys: set[str], device: torch.device) -> dict[str, Tensor]:
+def load_key_group(weight_dir: Path, keys: set[str], device: torch.device) -> tuple[dict[str, Tensor], float, float]:
     state_dict: dict[str, Tensor] = {}
+    read_elapsed = 0.0
+    transfer_elapsed = 0.0
     for path in sorted(weight_dir.glob("*.safetensors")):
         with safe_open(path, framework="pt", device="cpu") as f:
             matching_keys = [key for key in f.keys() if key in keys]
             for key in matching_keys:
-                state_dict[key] = f.get_tensor(key).to(device=device, non_blocking=False)
-    return state_dict
+                read_start = time.perf_counter()
+                tensor = f.get_tensor(key)
+                read_elapsed += time.perf_counter() - read_start
+
+                transfer_start = time.perf_counter()
+                state_dict[key] = tensor.to(device=device, non_blocking=False)
+                transfer_elapsed += time.perf_counter() - transfer_start
+    if device.type == "cuda":
+        sync_start = time.perf_counter()
+        torch.cuda.synchronize(device)
+        transfer_elapsed += time.perf_counter() - sync_start
+    return state_dict, read_elapsed, transfer_elapsed
 
 
 def iter_layer_key_groups(weight_dir: Path, layer_prefix: str) -> Iterable[tuple[int, set[str]]]:
@@ -136,9 +148,16 @@ class CheckpointNCCLBroadcaster:
 
         groups = [(layer_id, keys) for layer_id, keys in iter_layer_key_groups(weight_dir, layer_prefix) if keys]
         broadcast_integer(len(groups), self.communicator)
+        self._previous_group_complete = time.perf_counter()
         for group_idx, (layer_id, keys) in enumerate(groups, start=1):
             start = time.perf_counter()
-            state_dict = load_key_group(weight_dir, keys, self.device)
+            previous_group_complete = getattr(self, "_previous_group_complete", start)
+            print(
+                f"broadcast group {group_idx}/{len(groups)} layer={layer_id} "
+                f"start keys={len(keys)} since_previous_group={start - previous_group_complete:.2f}s",
+                flush=True,
+            )
+            state_dict, read_elapsed, transfer_elapsed = load_key_group(weight_dir, keys, self.device)
             load_elapsed = time.perf_counter() - start
             broadcast_state_dict(
                 state_dict,
@@ -148,10 +167,13 @@ class CheckpointNCCLBroadcaster:
             )
             print(
                 f"broadcast group {group_idx}/{len(groups)} layer={layer_id} "
-                f"tensors={len(keys)} load={load_elapsed:.2f}s total={time.perf_counter() - start:.2f}s",
+                f"tensors={len(keys)} safetensors_read={read_elapsed:.2f}s "
+                f"device_transfer={transfer_elapsed:.2f}s load={load_elapsed:.2f}s "
+                f"total={time.perf_counter() - start:.2f}s",
                 flush=True,
             )
             del state_dict
+            self._previous_group_complete = time.perf_counter()
 
 
 async def init_broadcasters(args: argparse.Namespace, base_urls: list[str]) -> None:
