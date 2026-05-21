@@ -18,7 +18,7 @@ from prime_rl.trainer.utils import get_world
 from prime_rl.trainer.weights import get_max_layer_num
 from prime_rl.utils.logger import get_logger
 from prime_rl.utils.nccl import disable_nccl_p2p_if_unavailable
-from prime_rl.utils.pathing import sync_wait_for_path
+from prime_rl.utils.pathing import durable_touch, sync_wait_for_path
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 from prime_rl.utils.vlm import get_layer_prefix
 
@@ -244,9 +244,13 @@ class NCCLWeightBroadcast(WeightBroadcast):
         """
         for idx, save_dir in notified_runs:
             try:
-                save_dir.mkdir(parents=True, exist_ok=True)
                 stable_file = save_dir / "STABLE"
-                stable_file.touch()
+                marker_start = time.perf_counter()
+                durable_touch(stable_file)
+                self.logger.info(
+                    f"Created durable STABLE marker for run {idx} at {stable_file} "
+                    f"in {time.perf_counter() - marker_start:.2f}s"
+                )
             except FileNotFoundError:
                 self.logger.warning(f"Run {idx} is deleted, skipping")
             except Exception as e:
@@ -258,6 +262,9 @@ class NCCLWeightBroadcast(WeightBroadcast):
         """Wait for inference workers to signal they are ready to receive NCCL broadcast."""
         for idx, save_dir in notified_runs:
             nccl_ready_file = save_dir / NCCL_READY_MARKER
-            self.logger.debug(f"Waiting for NCCL_READY marker at {nccl_ready_file}")
+            start = time.perf_counter()
+            self.logger.info(f"Waiting for NCCL_READY marker at {nccl_ready_file}")
             sync_wait_for_path(nccl_ready_file, interval=0.1, log_interval=10)
-            self.logger.debug(f"Inference workers ready for NCCL broadcast (run {idx})")
+            self.logger.info(
+                f"Inference workers ready for NCCL broadcast (run {idx}) after {time.perf_counter() - start:.2f}s"
+            )

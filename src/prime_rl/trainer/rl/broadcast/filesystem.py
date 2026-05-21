@@ -17,6 +17,7 @@ from prime_rl.trainer.weights import (
     save_state_dict,
 )
 from prime_rl.trainer.world import get_world
+from prime_rl.utils.pathing import durable_touch
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 
 
@@ -107,7 +108,7 @@ class FileSystemWeightBroadcast(WeightBroadcast):
     def _notify_orchestrator(self, save_dir: Path):
         """Notify the orchestrator that the weights have been broadcast by writing a 'STABLE' file to a shared filesystem."""
         stable_file = save_dir / "STABLE"
-        stable_file.touch()
+        durable_touch(stable_file)
 
     def maybe_clean(self, max_async_level: int, interval_to_keep: int | None):
         for idx in self.multi_run_manager.used_idxs:

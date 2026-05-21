@@ -31,6 +31,7 @@ from prime_rl.trainer.weights import (
 )
 from prime_rl.trainer.world import get_world
 from prime_rl.utils.logger import get_logger
+from prime_rl.utils.pathing import durable_touch
 from prime_rl.utils.utils import get_all_ckpt_steps, get_ckpt_dir, get_step_path, get_weights_dir
 
 
@@ -150,7 +151,7 @@ class CheckpointManager:
         """Write STABLE file to indicate checkpoint is complete (for eval to safely read)."""
         if self.world.is_master:
             step_path = get_step_path(self.ckpt_dir, step)
-            (step_path / "STABLE").touch()
+            durable_touch(step_path / "STABLE")
 
     def save_to_path(
         self,
@@ -316,7 +317,7 @@ class WeightCheckpointManager:
         """Write STABLE file to indicate weight checkpoint is complete."""
         if self.world.is_master:
             step_path = self.get_step_path(step)
-            (step_path / "STABLE").touch()
+            durable_touch(step_path / "STABLE")
 
     def get_run_adapter_state_dict(self) -> dict[str, Tensor]:
         lora_state_dict = {
