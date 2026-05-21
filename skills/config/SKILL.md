@@ -248,6 +248,20 @@ type = "direct"
 [orchestrator.experimental.request_picker]
 type = "least_loaded"
 
+# In-process straggler-aware scorer: no HTTP boundary, generation/admin stay direct.
+[orchestrator.experimental.request_picker]
+type = "prime_aware"
+inflight_weight = 1.0
+waiting_weight = 1.0
+running_weight = 0.25
+request_wall_weight = 0.5
+group_tail_weight = 0.5
+off_policy_weight = 0.25
+cancelled_weight = 0.25
+decode_deficit_weight = 1.0
+completed_rps_deficit_weight = 1.0
+cache_usage_weight = 0.25
+
 # External adapter: generation/admin traffic still goes directly to Prime-vLLM.
 [orchestrator.experimental.request_picker]
 type = "external"
@@ -258,6 +272,7 @@ retry_backoff = 0.05
 ```
 
 Do not use this as an llm-d/Envoy data-path switch. The external picker receives Prime's logical rollout clients, in-flight counts, group/off-policy context, and recent per-endpoint metrics, then returns one candidate for Prime to use directly.
+The `prime_aware` picker uses the same Prime/vLLM signals in-process, so it is the preferred hill-climb variant when per-request external HTTP latency dominates.
 
 ### Model fields
 

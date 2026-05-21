@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from typing import Protocol
 from urllib.parse import urlparse
@@ -56,6 +56,10 @@ class CandidateStats:
     cancelled_rollouts: int = 0
     request_wall_seconds_mean: float | None = None
     request_wall_seconds_last: float | None = None
+    group_tail_seconds_mean: float | None = None
+    group_tail_seconds_last: float | None = None
+    off_policy_steps_mean: float | None = None
+    off_policy_steps_last: float | None = None
     endpoint_metrics: dict[str, float] | None = None
 
 
@@ -66,6 +70,7 @@ class RequestPickResult:
     attempts: int
     candidate_count: int
     selected_inflight: int
+    selected_score: float | None = None
 
 
 class RequestPicker(Protocol):
@@ -99,6 +104,9 @@ class DirectRequestPicker:
 class LeastLoadedRequestPicker:
     """No-op in-process picker that reproduces the direct least-loaded policy."""
 
+    def __init__(self):
+        self.last_score: float | None = None
+
     async def select_client(
         self,
         candidates: list[vf.ClientConfig],
@@ -106,7 +114,77 @@ class LeastLoadedRequestPicker:
         context: RequestPickContext,
         candidate_stats: Mapping[ClientIdentity, CandidateStats],
     ) -> vf.ClientConfig:
-        return min(candidates, key=lambda c: inflight.get(client_identity(c), 0))
+        client = min(candidates, key=lambda c: inflight.get(client_identity(c), 0))
+        self.last_score = float(inflight.get(client_identity(client), 0))
+        return client
+
+    async def aclose(self) -> None:
+        return None
+
+
+class PrimeAwareRequestPicker:
+    """In-process picker that keeps Prime's fast path but avoids observed stragglers."""
+
+    def __init__(
+        self,
+        inflight_weight: float = 1.0,
+        waiting_weight: float = 1.0,
+        running_weight: float = 0.25,
+        request_wall_weight: float = 0.5,
+        group_tail_weight: float = 0.5,
+        off_policy_weight: float = 0.25,
+        cancelled_weight: float = 0.25,
+        decode_deficit_weight: float = 1.0,
+        completed_rps_deficit_weight: float = 1.0,
+        cache_usage_weight: float = 0.25,
+    ):
+        self.inflight_weight = inflight_weight
+        self.waiting_weight = waiting_weight
+        self.running_weight = running_weight
+        self.request_wall_weight = request_wall_weight
+        self.group_tail_weight = group_tail_weight
+        self.off_policy_weight = off_policy_weight
+        self.cancelled_weight = cancelled_weight
+        self.decode_deficit_weight = decode_deficit_weight
+        self.completed_rps_deficit_weight = completed_rps_deficit_weight
+        self.cache_usage_weight = cache_usage_weight
+        self.last_score: float | None = None
+
+    async def select_client(
+        self,
+        candidates: list[vf.ClientConfig],
+        inflight: Mapping[ClientIdentity, int],
+        context: RequestPickContext,
+        candidate_stats: Mapping[ClientIdentity, CandidateStats],
+    ) -> vf.ClientConfig:
+        scores = {client_identity(client): self._score(client, inflight, candidate_stats) for client in candidates}
+        client = min(candidates, key=lambda c: scores[client_identity(c)])
+        self.last_score = scores[client_identity(client)]
+        return client
+
+    def _score(
+        self,
+        client: vf.ClientConfig,
+        inflight: Mapping[ClientIdentity, int],
+        candidate_stats: Mapping[ClientIdentity, CandidateStats],
+    ) -> float:
+        identity = client_identity(client)
+        stats = candidate_stats.get(identity, CandidateStats())
+        metrics = stats.endpoint_metrics or {}
+        return (
+            self.inflight_weight * inflight.get(identity, 0)
+            + self.waiting_weight * metrics.get("num_requests_waiting", 0.0)
+            + self.running_weight * metrics.get("num_requests_running", 0.0)
+            + self.request_wall_weight
+            * _latest_or_mean(stats.request_wall_seconds_last, stats.request_wall_seconds_mean)
+            + self.group_tail_weight * _latest_or_mean(stats.group_tail_seconds_last, stats.group_tail_seconds_mean)
+            + self.off_policy_weight * _latest_or_mean(stats.off_policy_steps_last, stats.off_policy_steps_mean)
+            + self.cancelled_weight * stats.cancelled_rollouts
+            + self.decode_deficit_weight * _rate_deficit("decode_throughput_tps", stats, candidate_stats.values())
+            + self.completed_rps_deficit_weight
+            * _rate_deficit("completed_requests_per_s", stats, candidate_stats.values())
+            + self.cache_usage_weight * metrics.get("gpu_cache_usage_perc", 0.0)
+        )
 
     async def aclose(self) -> None:
         return None
@@ -217,11 +295,46 @@ def _is_retryable_picker_error(exception: BaseException) -> bool:
     return isinstance(exception, (httpx.TimeoutException, httpx.TransportError))
 
 
+def _latest_or_mean(latest: float | None, mean: float | None) -> float:
+    if latest is not None:
+        return latest
+    if mean is not None:
+        return mean
+    return 0.0
+
+
+def _rate_deficit(metric_name: str, stats: CandidateStats, all_stats: Iterable[CandidateStats]) -> float:
+    rate = (stats.endpoint_metrics or {}).get(metric_name)
+    if rate is None:
+        return 0.0
+
+    max_rate = max(
+        ((candidate.endpoint_metrics or {}).get(metric_name, 0.0) for candidate in all_stats),
+        default=0.0,
+    )
+    if max_rate <= 0:
+        return 0.0
+    return max(max_rate - rate, 0.0) / max_rate
+
+
 def setup_request_picker(config) -> RequestPicker:
     if config.type == "direct":
         return DirectRequestPicker()
     if config.type == "least_loaded":
         return LeastLoadedRequestPicker()
+    if config.type == "prime_aware":
+        return PrimeAwareRequestPicker(
+            inflight_weight=config.inflight_weight,
+            waiting_weight=config.waiting_weight,
+            running_weight=config.running_weight,
+            request_wall_weight=config.request_wall_weight,
+            group_tail_weight=config.group_tail_weight,
+            off_policy_weight=config.off_policy_weight,
+            cancelled_weight=config.cancelled_weight,
+            decode_deficit_weight=config.decode_deficit_weight,
+            completed_rps_deficit_weight=config.completed_rps_deficit_weight,
+            cache_usage_weight=config.cache_usage_weight,
+        )
     if config.type == "external":
         return ExternalRequestPicker(
             adapter_url=config.adapter_url,
@@ -243,10 +356,12 @@ async def select_with_metrics(
     client = await picker.select_client(candidates, inflight, context, candidate_stats)
     latency = time.perf_counter() - start
     attempts = getattr(picker, "last_attempts", 1)
+    selected_score = getattr(picker, "last_score", None)
     return RequestPickResult(
         client=client,
         latency_seconds=latency,
         attempts=attempts,
         candidate_count=len(candidates),
         selected_inflight=inflight.get(client_identity(client), 0),
+        selected_score=float(selected_score) if isinstance(selected_score, (int, float)) else None,
     )

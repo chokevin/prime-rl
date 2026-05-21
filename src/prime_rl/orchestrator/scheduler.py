@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 
 import verifiers as vf
@@ -52,6 +52,8 @@ SCHEDULER_INSTRUMENTATION_KEYS = {
     "time/update_weights",
     "time/wait_for_ckpt",
 }
+
+PICKER_HISTORY_SIZE = 128
 
 
 @dataclass
@@ -178,8 +180,18 @@ class Scheduler:
         self.metric_counts: Counter[str] = Counter()
         self.completed_rollouts_by_client: Counter[ClientIdentity] = Counter()
         self.cancelled_rollouts_by_client: Counter[ClientIdentity] = Counter()
-        self.request_wall_seconds_by_client: dict[ClientIdentity, list[float]] = defaultdict(list)
+        self.request_wall_seconds_by_client: dict[ClientIdentity, deque[float]] = defaultdict(
+            lambda: deque(maxlen=PICKER_HISTORY_SIZE)
+        )
         self.last_request_wall_seconds_by_client: dict[ClientIdentity, float] = {}
+        self.group_tail_seconds_by_client: dict[ClientIdentity, deque[float]] = defaultdict(
+            lambda: deque(maxlen=PICKER_HISTORY_SIZE)
+        )
+        self.last_group_tail_seconds_by_client: dict[ClientIdentity, float] = {}
+        self.off_policy_steps_by_client: dict[ClientIdentity, deque[float]] = defaultdict(
+            lambda: deque(maxlen=PICKER_HISTORY_SIZE)
+        )
+        self.last_off_policy_steps_by_client: dict[ClientIdentity, float] = {}
         self._last_refill_end_time: float | None = None
 
     @property
@@ -264,12 +276,18 @@ class Scheduler:
         for client in clients:
             identity = self._client_identity(client)
             wall_times = self.request_wall_seconds_by_client.get(identity, [])
+            tail_times = self.group_tail_seconds_by_client.get(identity, [])
+            off_policy_steps = self.off_policy_steps_by_client.get(identity, [])
             endpoint_label = endpoint_label_from_url(client.api_base_url)
             stats[identity] = CandidateStats(
                 completed_rollouts=self.completed_rollouts_by_client[identity],
                 cancelled_rollouts=self.cancelled_rollouts_by_client[identity],
                 request_wall_seconds_mean=sum(wall_times) / len(wall_times) if wall_times else None,
                 request_wall_seconds_last=self.last_request_wall_seconds_by_client.get(identity),
+                group_tail_seconds_mean=sum(tail_times) / len(tail_times) if tail_times else None,
+                group_tail_seconds_last=self.last_group_tail_seconds_by_client.get(identity),
+                off_policy_steps_mean=(sum(off_policy_steps) / len(off_policy_steps) if off_policy_steps else None),
+                off_policy_steps_last=self.last_off_policy_steps_by_client.get(identity),
                 endpoint_metrics=endpoint_metrics.get(endpoint_label, {}),
             )
         return stats
@@ -297,6 +315,7 @@ class Scheduler:
             latency_seconds = time.perf_counter() - start
             attempts = 1
             selected_inflight = inflight[self._client_identity(client)]
+            selected_score = float(selected_inflight)
         else:
             result = await select_with_metrics(
                 self.request_picker,
@@ -309,11 +328,14 @@ class Scheduler:
             latency_seconds = result.latency_seconds
             attempts = result.attempts
             selected_inflight = result.selected_inflight
+            selected_score = result.selected_score
 
         self._record_value("request_picker_latency_seconds", latency_seconds)
         self._record_value("request_picker_selected_inflight", float(selected_inflight))
         self._record_value("request_picker_candidate_count", float(len(clients)))
         self._record_value("request_picker_attempts", float(attempts))
+        if selected_score is not None:
+            self._record_value("request_picker_selected_score", selected_score)
         self._record_client_count("scheduler/selected_client", client)
         self._record_client_value("scheduler/inflight_at_selection", client, float(selected_inflight))
         self.logger.debug(
@@ -707,16 +729,28 @@ class Scheduler:
                             rollout_info.client_config,
                             float(rollout_info.off_policy_steps),
                         )
+                        self.off_policy_steps_by_client[identity].append(float(rollout_info.off_policy_steps))
+                        self.last_off_policy_steps_by_client[identity] = float(rollout_info.off_policy_steps)
                         self._record_value(
                             "rollout_response_aggregation_seconds", time.perf_counter() - aggregation_start
                         )
                         continue
                     group_completed_at = time.perf_counter()
-                    self._record_value("rollout_group_wall_seconds", group_completed_at - group.created_at)
+                    group_wall_seconds = group_completed_at - group.created_at
+                    self._record_value("rollout_group_wall_seconds", group_wall_seconds)
+                    self._record_client_value(
+                        "rollout_group_wall_seconds", rollout_info.client_config, group_wall_seconds
+                    )
                     if group.first_completion_at is not None:
-                        self._record_value("rollout_group_tail_seconds", group_completed_at - group.first_completion_at)
+                        group_tail_seconds = group_completed_at - group.first_completion_at
                     else:
-                        self._record_value("rollout_group_tail_seconds", 0.0)
+                        group_tail_seconds = 0.0
+                    self._record_value("rollout_group_tail_seconds", group_tail_seconds)
+                    self._record_client_value(
+                        "rollout_group_tail_seconds", rollout_info.client_config, group_tail_seconds
+                    )
+                    self.group_tail_seconds_by_client[identity].append(group_tail_seconds)
+                    self.last_group_tail_seconds_by_client[identity] = group_tail_seconds
                     completed_rollouts = self.groups.pop(group_id).completed_rollouts
                     self.completed_rollouts_by_client[identity] += len(valid_rollouts)
                     self._record_client_count(
@@ -727,6 +761,8 @@ class Scheduler:
                         rollout_info.client_config,
                         float(rollout_info.off_policy_steps),
                     )
+                    self.off_policy_steps_by_client[identity].append(float(rollout_info.off_policy_steps))
+                    self.last_off_policy_steps_by_client[identity] = float(rollout_info.off_policy_steps)
 
                 except asyncio.CancelledError:
                     if group_id is not None:
@@ -842,8 +878,6 @@ class Scheduler:
         self.last_update_metrics = {}
         self.completed_rollouts_by_client.clear()
         self.cancelled_rollouts_by_client.clear()
-        self.request_wall_seconds_by_client.clear()
-        self.last_request_wall_seconds_by_client.clear()
 
         # Add inference pool metrics (e.g. elastic pool server counts)
         metrics.update(self.inference_pool.get_metrics())

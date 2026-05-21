@@ -8,6 +8,7 @@ from prime_rl.orchestrator.request_picker import (
     CandidateStats,
     ExternalRequestPicker,
     LeastLoadedRequestPicker,
+    PrimeAwareRequestPicker,
     RequestPickContext,
     client_identity,
 )
@@ -91,6 +92,10 @@ def test_external_request_picker_reuses_client_and_sends_prime_aware_fields():
                 cancelled_rollouts=1,
                 request_wall_seconds_mean=3.25,
                 request_wall_seconds_last=4.0,
+                group_tail_seconds_mean=1.5,
+                group_tail_seconds_last=2.0,
+                off_policy_steps_mean=1.0,
+                off_policy_steps_last=2.0,
                 endpoint_metrics={"decode_throughput_tps": 123.0, "num_requests_waiting": 2.0},
             )
         }
@@ -106,6 +111,73 @@ def test_external_request_picker_reuses_client_and_sends_prime_aware_fields():
         assert payload["request"]["group_id"] == 7
         assert payload["request"]["max_off_policy_level"] == 2
         assert payload["candidates"][1]["completed_rollouts"] == 5
+        assert payload["candidates"][1]["group_tail_seconds_last"] == 2.0
+        assert payload["candidates"][1]["off_policy_steps_last"] == 2.0
         assert payload["candidates"][1]["endpoint_metrics"]["decode_throughput_tps"] == 123.0
+
+    asyncio.run(run())
+
+
+def test_prime_aware_request_picker_matches_least_loaded_without_signals():
+    async def run() -> None:
+        clients = [
+            _client(0, "http://worker-a:8000/v1", "0"),
+            _client(1, "http://worker-b:8000/v1", "0"),
+            _client(2, "http://worker-c:8000/v1", "0"),
+        ]
+        inflight = {
+            client_identity(clients[0]): 2,
+            client_identity(clients[1]): 0,
+            client_identity(clients[2]): 1,
+        }
+
+        picked = await PrimeAwareRequestPicker().select_client(clients, inflight, _context(), {})
+
+        assert picked.client_idx == 1
+
+    asyncio.run(run())
+
+
+def test_prime_aware_request_picker_avoids_queued_straggler():
+    async def run() -> None:
+        clients = [
+            _client(0, "http://worker-a:8000/v1", "0"),
+            _client(1, "http://worker-b:8000/v1", "0"),
+        ]
+        stats = {
+            client_identity(clients[0]): CandidateStats(
+                request_wall_seconds_last=6.0,
+                group_tail_seconds_last=4.0,
+                off_policy_steps_last=3.0,
+                endpoint_metrics={
+                    "num_requests_waiting": 8.0,
+                    "num_requests_running": 2.0,
+                    "decode_throughput_tps": 250.0,
+                    "completed_requests_per_s": 0.05,
+                },
+            ),
+            client_identity(clients[1]): CandidateStats(
+                request_wall_seconds_last=1.0,
+                group_tail_seconds_last=0.25,
+                endpoint_metrics={
+                    "num_requests_waiting": 0.0,
+                    "num_requests_running": 1.0,
+                    "decode_throughput_tps": 500.0,
+                    "completed_requests_per_s": 0.10,
+                },
+            ),
+        }
+
+        picked = await PrimeAwareRequestPicker().select_client(
+            clients,
+            {
+                client_identity(clients[0]): 0,
+                client_identity(clients[1]): 1,
+            },
+            _context(),
+            stats,
+        )
+
+        assert picked.client_idx == 1
 
     asyncio.run(run())

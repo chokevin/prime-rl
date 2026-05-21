@@ -48,6 +48,10 @@ def make_scheduler() -> Scheduler:
     scheduler.cancelled_rollouts_by_client = Counter()
     scheduler.request_wall_seconds_by_client = defaultdict(list)
     scheduler.last_request_wall_seconds_by_client = {}
+    scheduler.group_tail_seconds_by_client = defaultdict(list)
+    scheduler.last_group_tail_seconds_by_client = {}
+    scheduler.off_policy_steps_by_client = defaultdict(list)
+    scheduler.last_off_policy_steps_by_client = {}
     scheduler.inference_pool = SimpleNamespace(get_metrics=lambda: {})
     return scheduler
 

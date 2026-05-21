@@ -888,6 +888,62 @@ class LeastLoadedRequestPickerConfig(BaseConfig):
     type: Literal["least_loaded"] = "least_loaded"
 
 
+class PrimeAwareRequestPickerConfig(BaseConfig):
+    """In-process picker that scores Prime/vLLM straggler signals without an HTTP adapter boundary."""
+
+    type: Literal["prime_aware"] = "prime_aware"
+
+    inflight_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for Prime-tracked in-flight rollout requests on the candidate client."),
+    ] = 1.0
+
+    waiting_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for vLLM num_requests_waiting on the candidate endpoint."),
+    ] = 1.0
+
+    running_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for vLLM num_requests_running on the candidate endpoint."),
+    ] = 0.25
+
+    request_wall_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for recent Prime rollout request wall time on the candidate client."),
+    ] = 0.5
+
+    group_tail_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for recent rollout group tail time on the candidate client."),
+    ] = 0.5
+
+    off_policy_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for recent off-policy completion level on the candidate client."),
+    ] = 0.25
+
+    cancelled_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for recent cancelled/off-policy rollouts on the candidate client."),
+    ] = 0.25
+
+    decode_deficit_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for normalized decode-throughput deficit versus the fastest candidate."),
+    ] = 1.0
+
+    completed_rps_deficit_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for normalized completed-request-rate deficit versus the fastest candidate."),
+    ] = 1.0
+
+    cache_usage_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for vLLM GPU cache usage percentage on the candidate endpoint."),
+    ] = 0.25
+
+
 class ExternalRequestPickerConfig(BaseConfig):
     """HTTP adapter for Prime-aware request picking outside the generation data path."""
 
@@ -920,7 +976,10 @@ class ExternalRequestPickerConfig(BaseConfig):
 
 
 RequestPickerConfig: TypeAlias = Annotated[
-    DirectRequestPickerConfig | LeastLoadedRequestPickerConfig | ExternalRequestPickerConfig,
+    DirectRequestPickerConfig
+    | LeastLoadedRequestPickerConfig
+    | PrimeAwareRequestPickerConfig
+    | ExternalRequestPickerConfig,
     Field(discriminator="type"),
 ]
 
@@ -934,7 +993,8 @@ class OrchestratorExperimentalConfig(BaseConfig):
             description=(
                 "Experimental rollout request picker. The default direct mode preserves Prime's existing "
                 "least-loaded scheduler path; least_loaded runs the same policy through the picker seam; "
-                "external calls an adapter while keeping generation/admin traffic direct."
+                "prime_aware is an in-process straggler-aware scorer; external calls an adapter while keeping "
+                "generation/admin traffic direct."
             )
         ),
     ] = DirectRequestPickerConfig()

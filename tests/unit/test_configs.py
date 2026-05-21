@@ -76,6 +76,24 @@ def test_orchestrator_external_request_picker_config():
     assert config.experimental.request_picker.timeout == 0.25
 
 
+def test_orchestrator_prime_aware_request_picker_config():
+    config = OrchestratorConfig.model_validate(
+        {
+            "use_renderer": False,
+            "experimental": {
+                "request_picker": {
+                    "type": "prime_aware",
+                    "waiting_weight": 2.0,
+                    "decode_deficit_weight": 0.5,
+                }
+            },
+        }
+    )
+    assert config.experimental.request_picker.type == "prime_aware"
+    assert config.experimental.request_picker.waiting_weight == 2.0
+    assert config.experimental.request_picker.decode_deficit_weight == 0.5
+
+
 class NestedConfig(BaseConfig):
     lr: float = 1e-4
     weight_decay: float = 0.01
