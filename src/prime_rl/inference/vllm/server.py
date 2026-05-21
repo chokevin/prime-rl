@@ -1,7 +1,7 @@
 import asyncio
 import time
 from argparse import Namespace
-from typing import Any
+from typing import Any, Literal
 
 import uvloop
 from fastapi import APIRouter, Request
@@ -168,10 +168,10 @@ WORKER_EXTENSION_CLS = {
 
 
 @router.post("/pause")
-async def pause(request: Request):
+async def pause(request: Request, mode: Literal["abort", "wait", "keep"] = "abort", clear_cache: bool = True):
     start = time.perf_counter()
-    logger.info("Prime-RL /pause start")
-    await engine_client(request).pause_generation(mode="keep", clear_cache=False)
+    logger.info(f"Prime-RL /pause start (mode={mode}, clear_cache={clear_cache})")
+    await engine_client(request).pause_generation(mode=mode, clear_cache=clear_cache)
     logger.info(f"Prime-RL /pause complete in {time.perf_counter() - start:.2f}s")
     return {"status": "paused"}
 

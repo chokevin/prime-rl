@@ -308,13 +308,18 @@ def _admin_client_label(client: AsyncClient) -> str:
 
 
 async def _pause_engines(admin_clients: list[AsyncClient]) -> None:
-    """Pause all inference engines, waiting for in-flight requests to drain."""
+    """Pause all inference engines before a weight update.
+
+    Weight updates make in-flight generations stale. Abort them instead of
+    freezing or draining them so the trainer can enter the NCCL broadcast as
+    soon as all DP workers are quiesced.
+    """
     logger = get_logger()
     logger.info("Pausing inference engines for weight update")
 
     async def _pause(client: AsyncClient) -> None:
         start = time.perf_counter()
-        response = await client.post("/pause", params={"mode": "keep", "clear_cache": "false"})
+        response = await client.post("/pause", params={"mode": "abort", "clear_cache": "true"})
         response.raise_for_status()
         logger.info(f"Paused inference engine {_admin_client_label(client)} in {time.perf_counter() - start:.2f}s")
 
