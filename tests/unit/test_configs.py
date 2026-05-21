@@ -713,12 +713,18 @@ def test_orchestrator_external_request_picker_config_parses():
             "http://localhost:9000/pick",
             "--experimental.request-picker.timeout",
             "0.25",
+            "--experimental.request-picker.max-attempts",
+            "4",
+            "--experimental.request-picker.retry-backoff",
+            "0.1",
         ],
     )
 
     assert config.experimental.request_picker.type == "external"
     assert config.experimental.request_picker.adapter_url == "http://localhost:9000/pick"
     assert config.experimental.request_picker.timeout == 0.25
+    assert config.experimental.request_picker.max_attempts == 4
+    assert config.experimental.request_picker.retry_backoff == 0.1
 
 
 def test_ray_native_rewrites_local_inference_client_urls():

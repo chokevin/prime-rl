@@ -902,6 +902,16 @@ class ExternalRequestPickerConfig(BaseConfig):
         Field(gt=0, description="Timeout in seconds for request-picker adapter calls."),
     ] = 1.0
 
+    max_attempts: Annotated[
+        int,
+        Field(ge=1, description="Maximum attempts for retryable request-picker adapter failures."),
+    ] = 3
+
+    retry_backoff: Annotated[
+        float,
+        Field(ge=0, description="Initial exponential backoff in seconds between retryable adapter failures."),
+    ] = 0.05
+
 
 RequestPickerConfig: TypeAlias = Annotated[
     LeastLoadedRequestPickerConfig | ExternalRequestPickerConfig,

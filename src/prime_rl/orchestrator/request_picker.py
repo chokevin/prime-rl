@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Protocol
 
 import httpx
 import verifiers as vf
+
+from prime_rl.utils.utils import get_logger
 
 ClientIdentity = tuple[str, str | None]
 
@@ -53,9 +56,11 @@ class ExternalRequestPicker:
     them. It deliberately does not proxy generation traffic or admin endpoints.
     """
 
-    def __init__(self, adapter_url: str, timeout: float):
+    def __init__(self, adapter_url: str, timeout: float, max_attempts: int = 3, retry_backoff: float = 0.05):
         self.adapter_url = adapter_url
         self.timeout = timeout
+        self.max_attempts = max_attempts
+        self.retry_backoff = retry_backoff
 
     async def select_client(
         self,
@@ -75,11 +80,43 @@ class ExternalRequestPicker:
                 for client in candidates
             ],
         }
+        decision = await self._post_with_retries(payload, context)
+        return _match_decision(candidates, decision)
+
+    async def _post_with_retries(self, payload: dict, context: RequestPickContext) -> dict:
+        logger = get_logger()
+        last_error: BaseException | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                return await self._post_decision(payload)
+            except Exception as e:
+                if not _is_retryable_picker_error(e):
+                    logger.error(
+                        f"External request picker call failed for group_id={context.group_id} "
+                        f"with non-retryable error: {e!r}"
+                    )
+                    raise
+                if attempt >= self.max_attempts:
+                    logger.error(
+                        f"External request picker call exhausted retry budget for group_id={context.group_id} "
+                        f"after {self.max_attempts} attempt(s): {e!r}"
+                    )
+                    raise
+                last_error = e
+                delay = self.retry_backoff * (2 ** (attempt - 1))
+                logger.warning(
+                    f"External request picker call failed for group_id={context.group_id} "
+                    f"(attempt {attempt}/{self.max_attempts}, retrying in {delay:.2f}s): {e!r}"
+                )
+                await asyncio.sleep(delay)
+        assert last_error is not None
+        raise last_error
+
+    async def _post_decision(self, payload: dict) -> dict:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(self.adapter_url, json=payload)
             response.raise_for_status()
-        decision = response.json()
-        return _match_decision(candidates, decision)
+            return response.json()
 
 
 def _match_decision(candidates: list[vf.ClientConfig], decision: dict) -> vf.ClientConfig:
@@ -99,9 +136,20 @@ def _match_decision(candidates: list[vf.ClientConfig], decision: dict) -> vf.Cli
     raise ValueError(f"External request picker returned unknown client identity={decision_identity!r}")
 
 
+def _is_retryable_picker_error(exception: BaseException) -> bool:
+    if isinstance(exception, httpx.HTTPStatusError):
+        return exception.response.status_code >= 500
+    return isinstance(exception, (httpx.TimeoutException, httpx.TransportError))
+
+
 def setup_request_picker(config) -> RequestPicker:
     if config.type == "least_loaded":
         return LeastLoadedRequestPicker()
     if config.type == "external":
-        return ExternalRequestPicker(adapter_url=config.adapter_url, timeout=config.timeout)
+        return ExternalRequestPicker(
+            adapter_url=config.adapter_url,
+            timeout=config.timeout,
+            max_attempts=config.max_attempts,
+            retry_backoff=config.retry_backoff,
+        )
     raise ValueError(f"Unsupported request picker type: {config.type}")

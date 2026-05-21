@@ -6,7 +6,7 @@ import httpx
 import verifiers as vf
 
 from prime_rl.configs.shared import ClientConfig
-from prime_rl.orchestrator.request_picker import _match_decision
+from prime_rl.orchestrator.request_picker import ExternalRequestPicker, RequestPickContext, _match_decision
 from prime_rl.utils.client import _is_retryable_lora_error, _pause_engines, load_lora_adapter, setup_clients
 
 
@@ -145,3 +145,82 @@ def test_external_request_picker_matches_logical_dp_rank_decision():
 
     assert selected.client_idx == 1
     assert selected.extra_headers["X-data-parallel-rank"] == "1"
+
+
+def test_external_request_picker_retries_connect_timeout_then_selects_client():
+    async def run() -> None:
+        clients = setup_clients(
+            ClientConfig(
+                base_url=["http://worker-a:8000/v1"],
+                api_key_var="PRIME_API_KEY",
+                dp_rank_count=2,
+            )
+        )
+        picker = ExternalRequestPicker("http://adapter/pick", timeout=1.0, max_attempts=2, retry_backoff=0)
+        attempts = 0
+
+        async def post_decision(payload):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.ConnectTimeout("transient connect timeout")
+            return {"client_idx": 1}
+
+        picker._post_decision = post_decision
+
+        selected = await picker.select_client(
+            clients,
+            inflight={},
+            context=RequestPickContext(
+                env_name="test-env",
+                group_id=696,
+                model_name="test-model",
+                ckpt_step=2,
+                cache_salt="2",
+            ),
+        )
+
+        assert selected.client_idx == 1
+        assert attempts == 2
+
+    asyncio.run(run())
+
+
+def test_external_request_picker_raises_after_retry_budget_exhausted():
+    async def run() -> None:
+        clients = setup_clients(
+            ClientConfig(
+                base_url=["http://worker-a:8000/v1"],
+                api_key_var="PRIME_API_KEY",
+            )
+        )
+        picker = ExternalRequestPicker("http://adapter/pick", timeout=1.0, max_attempts=2, retry_backoff=0)
+        attempts = 0
+
+        async def post_decision(payload):
+            nonlocal attempts
+            attempts += 1
+            raise httpx.ConnectTimeout("persistent connect timeout")
+
+        picker._post_decision = post_decision
+
+        try:
+            await picker.select_client(
+                clients,
+                inflight={},
+                context=RequestPickContext(
+                    env_name="test-env",
+                    group_id=697,
+                    model_name="test-model",
+                    ckpt_step=2,
+                    cache_salt="2",
+                ),
+            )
+        except httpx.ConnectTimeout:
+            pass
+        else:
+            raise AssertionError("Expected persistent picker timeout to propagate")
+
+        assert attempts == 2
+
+    asyncio.run(run())
