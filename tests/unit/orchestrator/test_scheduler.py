@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections import Counter, defaultdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,8 @@ def make_scheduler() -> Scheduler:
     scheduler.model_name = "test-model"
     scheduler.update_weights_time = 0
     scheduler.wait_for_ckpt_time = 0
+    scheduler.inflight_rollouts_at_pause = 0
+    scheduler.oldest_off_policy_at_pause = 0
     scheduler.inflight_requests = {}
     scheduler.groups = {}
     scheduler.max_off_policy_steps = 1
@@ -36,7 +39,16 @@ def make_scheduler() -> Scheduler:
     scheduler.request_picker = DirectRequestPicker()
     scheduler.metric_values = defaultdict(list)
     scheduler.metric_counts = Counter()
+    scheduler.last_update_metrics = {}
+    scheduler.total_rollouts_by_env = defaultdict(int)
+    scheduler.empty_rollouts_by_env = defaultdict(int)
+    scheduler.errored_rollouts_by_env = defaultdict(int)
+    scheduler.dropped_groups_by_env = defaultdict(int)
+    scheduler.completed_rollouts_by_client = Counter()
     scheduler.cancelled_rollouts_by_client = Counter()
+    scheduler.request_wall_seconds_by_client = defaultdict(list)
+    scheduler.last_request_wall_seconds_by_client = {}
+    scheduler.inference_pool = SimpleNamespace(get_metrics=lambda: {})
     return scheduler
 
 
@@ -207,3 +219,27 @@ def test_client_identity_distinguishes_base_url_and_dp_rank():
     )
 
     assert Scheduler._client_identity(client_a) != Scheduler._client_identity(client_b)
+
+
+def test_get_metrics_logs_instrumentation_payload():
+    scheduler = make_scheduler()
+    scheduler.inflight_rollouts_at_pause = 4
+    scheduler.oldest_off_policy_at_pause = 2
+    scheduler.last_update_metrics = {"time/update_ready_marker": 0.25}
+    scheduler.metric_values["rollout_request_wall_seconds"].append(1.5)
+    scheduler.metric_counts["scheduler/cancelled_rollouts/client_1_worker_a_8000_dp_0"] = 3
+
+    metrics = scheduler.get_metrics()
+
+    assert metrics["rollout_request_wall_seconds"] == 1.5
+    assert metrics["time/update_ready_marker"] == 0.25
+
+    message = scheduler.logger.info.call_args.args[0]
+    prefix = "Scheduler instrumentation metrics: "
+    assert message.startswith(prefix)
+    payload = json.loads(message.removeprefix(prefix))
+    assert payload["rollout_request_wall_seconds"] == 1.5
+    assert payload["scheduler/cancelled_rollouts/client_1_worker_a_8000_dp_0"] == 3
+    assert payload["scheduler/inflight_rollouts_at_pause"] == 4
+    assert payload["scheduler/oldest_off_policy_at_pause"] == 2
+    assert payload["time/update_ready_marker"] == 0.25

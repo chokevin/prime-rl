@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -32,6 +33,25 @@ from prime_rl.utils.utils import (
     get_step_path,
     wait_for_path,
 )
+
+SCHEDULER_INSTRUMENTATION_PREFIXES = (
+    "rollout_",
+    "request_picker_",
+    "scheduler_refill_gap_seconds",
+    "scheduler/completed_rollouts/",
+    "scheduler/cancelled_rollouts/",
+    "scheduler/inflight_at_selection/",
+    "scheduler/off_policy_level_at_completion/",
+    "scheduler/selected_client/",
+    "time/update_",
+)
+
+SCHEDULER_INSTRUMENTATION_KEYS = {
+    "scheduler/inflight_rollouts_at_pause",
+    "scheduler/oldest_off_policy_at_pause",
+    "time/update_weights",
+    "time/wait_for_ckpt",
+}
 
 
 @dataclass
@@ -828,4 +848,19 @@ class Scheduler:
         # Add inference pool metrics (e.g. elastic pool server counts)
         metrics.update(self.inference_pool.get_metrics())
 
+        self._log_instrumentation_metrics(metrics)
+
         return metrics
+
+    def _log_instrumentation_metrics(self, metrics: dict[str, float]) -> None:
+        instrumentation_metrics = {
+            name: value
+            for name, value in metrics.items()
+            if name in SCHEDULER_INSTRUMENTATION_KEYS
+            or any(name.startswith(prefix) for prefix in SCHEDULER_INSTRUMENTATION_PREFIXES)
+        }
+        if instrumentation_metrics:
+            self.logger.info(
+                "Scheduler instrumentation metrics: "
+                + json.dumps(instrumentation_metrics, sort_keys=True, separators=(",", ":"))
+            )
