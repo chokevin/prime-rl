@@ -1,6 +1,8 @@
+import asyncio
+
 import pytest
 
-from prime_rl.utils.pathing import validate_output_dir
+from prime_rl.utils.pathing import durable_touch, sync_wait_for_path, validate_output_dir, wait_for_path
 
 
 def test_nonexistent_dir_passes(tmp_path):
@@ -55,3 +57,26 @@ def test_clean_on_nonexistent_dir_is_noop(tmp_path):
     output_dir = tmp_path / "does_not_exist"
     validate_output_dir(output_dir, resuming=False, clean=True)
     assert not output_dir.exists()
+
+
+def test_durable_touch_creates_marker_and_parent(tmp_path):
+    marker = tmp_path / "missing_parent" / "NCCL_READY"
+
+    durable_touch(marker)
+
+    assert marker.exists()
+    assert marker.read_text()
+
+
+def test_sync_wait_for_path_finds_marker_via_parent_listing(tmp_path):
+    marker = tmp_path / "NCCL_READY"
+    marker.write_text("ready")
+
+    sync_wait_for_path(marker, interval=0.01, log_interval=1)
+
+
+def test_wait_for_path_finds_marker_via_parent_listing(tmp_path):
+    marker = tmp_path / "NCCL_READY"
+    marker.write_text("ready")
+
+    asyncio.run(wait_for_path(marker, interval=0.01, log_interval=1))
