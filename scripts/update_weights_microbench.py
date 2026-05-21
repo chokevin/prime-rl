@@ -140,7 +140,12 @@ class CheckpointNCCLBroadcaster:
             start = time.perf_counter()
             state_dict = load_key_group(weight_dir, keys, self.device)
             load_elapsed = time.perf_counter() - start
-            broadcast_state_dict(state_dict, self.communicator)
+            broadcast_state_dict(
+                state_dict,
+                self.communicator,
+                label=f"microbench group={group_idx}/{len(groups)} layer={layer_id}",
+                log_fn=lambda message: print(message, flush=True),
+            )
             print(
                 f"broadcast group {group_idx}/{len(groups)} layer={layer_id} "
                 f"tensors={len(keys)} load={load_elapsed:.2f}s total={time.perf_counter() - start:.2f}s",

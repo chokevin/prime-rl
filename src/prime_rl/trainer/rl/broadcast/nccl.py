@@ -25,15 +25,27 @@ from prime_rl.utils.vlm import get_layer_prefix
 NCCL_READY_MARKER = "NCCL_READY"
 
 
+LogFn = Callable[[str], None]
+
+
 def broadcast_integer(integer: int, communicator: PyNcclCommunicator) -> None:
     """Broadcast an integer to a process group using NCCL communicator."""
     integer_tensor = torch.tensor([integer], dtype=torch.long).cuda()
     communicator.broadcast(integer_tensor, src=0)
 
 
-def broadcast_state_dict(state_dict: dict[str, Tensor], communicator: PyNcclCommunicator) -> None:
+def broadcast_state_dict(
+    state_dict: dict[str, Tensor],
+    communicator: PyNcclCommunicator,
+    label: str | None = None,
+    log_fn: LogFn | None = None,
+) -> None:
     """Broadcast a state dict to NCCL process group using the PyNcclCommunicator."""
+    start = time.perf_counter()
+    prefix = f"{label} " if label else ""
+
     # Group tensors by dtype
+    group_start = time.perf_counter()
     dtype_groups: dict[torch.dtype, list[tuple[str, Tensor]]] = {}
     for key, value in state_dict.items():
         assert not isinstance(value, DTensor), (
@@ -43,46 +55,86 @@ def broadcast_state_dict(state_dict: dict[str, Tensor], communicator: PyNcclComm
         if dtype not in dtype_groups:
             dtype_groups[dtype] = []
         dtype_groups[dtype].append((key, value))
+    grouping_elapsed = time.perf_counter() - group_start
 
     # Build metadata: for each dtype group, store keys and shapes
+    metadata_start = time.perf_counter()
     metadata = {}
     for dtype, items in dtype_groups.items():
         metadata[dtype] = [(key, value.shape, value.numel()) for key, value in items]
 
     # Send metadata
     state = pickle.dumps(metadata)
+    metadata_prep_elapsed = time.perf_counter() - metadata_start
+
+    metadata_broadcast_start = time.perf_counter()
     size_tensor = torch.tensor([len(state)], dtype=torch.long).cuda()
     communicator.broadcast(size_tensor, src=0)
     state_tensor = torch.ByteTensor(list(state)).cuda()
     communicator.broadcast(state_tensor, src=0)
+    metadata_broadcast_elapsed = time.perf_counter() - metadata_broadcast_start
+
+    if log_fn is not None:
+        num_tensors = sum(len(items) for items in dtype_groups.values())
+        log_fn(
+            f"{prefix}NCCL sender state_dict metadata tensors={num_tensors} "
+            f"dtype_groups={len(dtype_groups)} bytes={len(state)} "
+            f"group={grouping_elapsed:.2f}s prep={metadata_prep_elapsed:.2f}s "
+            f"broadcast={metadata_broadcast_elapsed:.2f}s"
+        )
 
     # Concatenate and broadcast tensors grouped by dtype
     for dtype, items in dtype_groups.items():
+        dtype_start = time.perf_counter()
+        elements = sum(value.numel() for _, value in items)
         # Flatten all tensors and concatenate
+        concat_start = time.perf_counter()
         flat_tensors = [value.flatten() for _, value in items]
         concatenated = torch.cat(flat_tensors)
+        concat_elapsed = time.perf_counter() - concat_start
+
+        broadcast_start = time.perf_counter()
         communicator.broadcast(concatenated, src=0)
+        broadcast_elapsed = time.perf_counter() - broadcast_start
+        if log_fn is not None:
+            log_fn(
+                f"{prefix}NCCL sender dtype={dtype} tensors={len(items)} elements={elements} "
+                f"concat={concat_elapsed:.2f}s broadcast={broadcast_elapsed:.2f}s "
+                f"total={time.perf_counter() - dtype_start:.2f}s"
+            )
         del concatenated
         # Clean up individual tensors
         for _, value in items:
             del value
+    if log_fn is not None:
+        log_fn(f"{prefix}NCCL sender state_dict complete in {time.perf_counter() - start:.2f}s")
 
 
 def filter_state_dict_by_layers(
-    state_dict: dict[str, torch.Tensor], num_layers: int, layer_prefix: str
+    state_dict: dict[str, torch.Tensor],
+    num_layers: int,
+    layer_prefix: str,
+    log_fn: LogFn | None = None,
 ) -> Generator[tuple[int, dict[str, torch.Tensor]], None, None]:
     """Yield non-layer weights first, then each layer's weights.
 
     Yields (layer_idx, layer_state_dict) where layer_idx is -1 for the non-layer
     dict and the actual layer index (0, 1, ...) for layer dicts.
     """
-    yield -1, {key: value for key, value in state_dict.items() if not key.startswith(layer_prefix)}
+    start = time.perf_counter()
+    non_layer_state_dict = {key: value for key, value in state_dict.items() if not key.startswith(layer_prefix)}
+    if log_fn is not None:
+        log_fn(f"NCCL sender layer=-1 filter tensors={len(non_layer_state_dict)} in {time.perf_counter() - start:.2f}s")
+    yield -1, non_layer_state_dict
 
     for i in range(num_layers):
-        yield (
-            i,
-            {key: value for key, value in state_dict.items() if key.startswith(f"{layer_prefix}{i}.")},
-        )
+        start = time.perf_counter()
+        layer_state_dict = {key: value for key, value in state_dict.items() if key.startswith(f"{layer_prefix}{i}.")}
+        if log_fn is not None:
+            log_fn(
+                f"NCCL sender layer={i} filter tensors={len(layer_state_dict)} in {time.perf_counter() - start:.2f}s"
+            )
+        yield i, layer_state_dict
 
 
 def preprocess_layer_checkpoint(
@@ -155,11 +207,29 @@ class NCCLWeightBroadcastSender:
         else:
             preprocess_fn = preprocess_layer_checkpoint
 
-        for layer_id, layer_state_dict in filter_state_dict_by_layers(state_dict, num_layers, layer_prefix):
+        for group_idx, (layer_id, layer_state_dict) in enumerate(
+            filter_state_dict_by_layers(state_dict, num_layers, layer_prefix, log_fn=self.logger.info), start=1
+        ):
+            layer_start = time.perf_counter()
+            layer_label = f"layer={layer_id} group={group_idx}/{num_state_dict_to_send}"
+            self.logger.info(f"NCCL sender {layer_label} prep start tensors={len(layer_state_dict)}")
+
+            phase_start = time.perf_counter()
             layer_state_dict = self._resolve_dtensors(layer_state_dict)
+            self.logger.info(f"NCCL sender {layer_label} resolved DTensors in {time.perf_counter() - phase_start:.2f}s")
+
+            phase_start = time.perf_counter()
             layer_state_dict = preprocess_fn(model, layer_state_dict, layer_id)
+            self.logger.info(f"NCCL sender {layer_label} preprocessed in {time.perf_counter() - phase_start:.2f}s")
+
             if self.world.is_master:
-                broadcast_state_dict(layer_state_dict, self.communicator)
+                broadcast_state_dict(
+                    layer_state_dict,
+                    self.communicator,
+                    label=f"NCCL sender {layer_label}",
+                    log_fn=self.logger.info,
+                )
+            self.logger.info(f"NCCL sender {layer_label} complete in {time.perf_counter() - layer_start:.2f}s")
 
     def _resolve_dtensors(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
         for key, value in list(state_dict.items()):
