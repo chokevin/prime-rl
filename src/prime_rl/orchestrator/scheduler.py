@@ -480,6 +480,56 @@ class Scheduler:
         max_completion_tokens = self._max_completion_tokens_for_env(group.example["env_name"])
         return float(max_completion_tokens or 1)
 
+    def _wave_minimax_throughput_penalty(
+        self,
+        stats: CandidateStats,
+        all_stats: list[CandidateStats],
+        request_load: float,
+    ) -> float:
+        metrics = stats.endpoint_metrics or {}
+        if not metrics:
+            return 0.0
+
+        def rate_deficit(metric_name: str) -> float:
+            rate = metrics.get(metric_name)
+            if rate is None:
+                return 0.0
+            max_rate = max(
+                ((candidate.endpoint_metrics or {}).get(metric_name, 0.0) for candidate in all_stats), default=0.0
+            )
+            if max_rate <= 0:
+                return 0.0
+            return max(max_rate - rate, 0.0) / max_rate
+
+        def decode_guardrail_deficit() -> float:
+            ratio = getattr(self.request_picker, "decode_guardrail_ratio", 0.0)
+            if not isinstance(ratio, (int, float)):
+                return 0.0
+            rate = metrics.get("decode_throughput_tps")
+            if rate is None:
+                return 0.0
+            max_rate = max(
+                ((candidate.endpoint_metrics or {}).get("decode_throughput_tps", 0.0) for candidate in all_stats),
+                default=0.0,
+            )
+            if max_rate <= 0:
+                return 0.0
+            tolerated_rate = max_rate * max(1.0 - float(ratio), 0.0)
+            if rate >= tolerated_rate:
+                return 0.0
+            return (tolerated_rate - rate) / max_rate
+
+        decode_penalty = getattr(self.request_picker, "decode_guardrail_penalty", 0.0)
+        completed_rps_weight = getattr(self.request_picker, "completed_rps_deficit_weight", 0.0)
+        if not isinstance(decode_penalty, (int, float)):
+            decode_penalty = 0.0
+        if not isinstance(completed_rps_weight, (int, float)):
+            completed_rps_weight = 0.0
+
+        penalty = float(decode_penalty) * decode_guardrail_deficit()
+        penalty += float(completed_rps_weight) * rate_deficit("completed_requests_per_s")
+        return request_load * penalty
+
     def _new_group_from_example(self, example: dict) -> tuple[int, GroupState]:
         example_fingerprint = _example_fingerprint(example)
         predicted_completion_tokens, completion_prediction_source = self._predict_completion_tokens(
@@ -529,6 +579,8 @@ class Scheduler:
         }
         assigned_counts: Counter[ClientIdentity] = Counter()
         assignments: dict[int, vf.ClientConfig] = {}
+        assignment_penalties: dict[int, float] = {}
+        stats_list = list(candidate_stats.values())
 
         sorted_group_ids = sorted(
             group_ids,
@@ -541,12 +593,23 @@ class Scheduler:
             client = min(
                 clients,
                 key=lambda candidate: (
-                    projected_load[self._client_identity(candidate)] + load,
+                    projected_load[self._client_identity(candidate)]
+                    + load
+                    + self._wave_minimax_throughput_penalty(
+                        candidate_stats[self._client_identity(candidate)],
+                        stats_list,
+                        load,
+                    ),
                     inflight[self._client_identity(candidate)] + assigned_counts[self._client_identity(candidate)],
                     candidate.client_idx,
                 ),
             )
             identity = self._client_identity(client)
+            assignment_penalties[group_id] = self._wave_minimax_throughput_penalty(
+                candidate_stats[identity],
+                stats_list,
+                load,
+            )
             projected_load[identity] += load
             assigned_counts[identity] += 1
             assignments[group_id] = client
@@ -572,6 +635,7 @@ class Scheduler:
                         "dp_rank": assignments[group_id].extra_headers.get("X-data-parallel-rank"),
                         "predicted_completion_tokens": self.groups[group_id].predicted_completion_tokens,
                         "completion_prediction_source": self.groups[group_id].completion_prediction_source,
+                        "throughput_penalty": assignment_penalties[group_id],
                     }
                     for group_id in sorted_group_ids
                 ],
