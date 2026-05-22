@@ -34,6 +34,10 @@ def make_scheduler() -> Scheduler:
     scheduler.oldest_off_policy_at_pause = 0
     scheduler.inflight_requests = {}
     scheduler.groups = {}
+    scheduler.next_request_id = 0
+    scheduler.next_dispatch_wave_id = 0
+    scheduler.next_refill_wave_id = 0
+    scheduler.current_refill_wave_id = 0
     scheduler.max_off_policy_steps = 1
     scheduler.cancelled_rollouts_count = 0
     scheduler.policy_update_lock = asyncio.Lock()
@@ -554,13 +558,100 @@ def test_long_output_cold_start_activates_candidate_score_metrics():
         )
         scheduler.groups[2] = GroupState(example={"env_name": "math"}, rollouts_to_schedule=1)
 
-        client, _ = await scheduler._select_request_client(2, scheduler.groups[2], "math", cache_salt="7")
+        client, _ = await scheduler._select_request_client(
+            2,
+            scheduler.groups[2],
+            "math",
+            cache_salt="7",
+            request_id=11,
+            dispatch_wave_id=12,
+            refill_wave_id=13,
+        )
 
         assert client == clients[1]
         assert scheduler.groups[2].predicted_completion_tokens == 4096.0
         assert scheduler.groups[2].completion_prediction_source == "cold_start"
         assert scheduler.metric_values["request_picker_score_component/long_output/max"][0] > 0.0
+        replay_events = [
+            call.args[0]
+            for call in scheduler.logger.info.call_args_list
+            if call.args and call.args[0].startswith("Scheduler replay event: ")
+        ]
+        assert len(replay_events) == 1
+        dispatch = json.loads(replay_events[0].removeprefix("Scheduler replay event: "))
+        assert dispatch["event"] == "dispatch"
+        assert dispatch["request_id"] == 11
+        assert dispatch["dispatch_wave_id"] == 12
+        assert dispatch["refill_wave_id"] == 13
+        assert dispatch["selected_client_idx"] == 2
+        assert dispatch["completion_prediction_source"] == "cold_start"
+        assert dispatch["predicted_completion_tokens"] == 4096.0
+        selected_candidate = next(candidate for candidate in dispatch["candidates"] if candidate["selected"])
+        assert selected_candidate["score_components"]["long_output"] == 0.0
+        assert (
+            max(
+                candidate["score_components"]["long_output"]
+                for candidate in dispatch["candidates"]
+                if candidate["score_components"] is not None
+            )
+            > 0.0
+        )
 
         await safe_cancel_all([task])
 
     asyncio.run(run())
+
+
+def test_replay_completion_event_joins_dispatch_to_actual_tokens_and_group_close():
+    scheduler = make_scheduler()
+    client = vf.ClientConfig(
+        client_idx=1,
+        api_base_url="http://worker-a:8000/v1",
+        extra_headers={"X-data-parallel-rank": "0"},
+    )
+    group = GroupState(
+        example={"env_name": "math"},
+        rollouts_to_schedule=0,
+        completed_request_count=1,
+        completion_tokens=4096,
+        slowest_request_id=22,
+        slowest_request_wall_seconds=44.0,
+        slowest_request_client=client,
+    )
+    info = InflightRequest(
+        off_policy_steps=0,
+        client_config=client,
+        env_name="math",
+        group_id=7,
+        request_id=22,
+        dispatch_wave_id=3,
+        refill_wave_id=2,
+        predicted_completion_tokens=4096.0,
+        completion_prediction_source="cold_start",
+    )
+
+    scheduler._log_completion_replay_event(
+        rollout_info=info,
+        group=group,
+        valid_rollouts=[rollout(prompt_tokens=5, completion_tokens=4096)],
+        request_wall_seconds=44.0,
+        group_closed=True,
+        group_wall_seconds=45.0,
+        group_tail_seconds=1.0,
+    )
+
+    replay_events = [
+        call.args[0]
+        for call in scheduler.logger.info.call_args_list
+        if call.args and call.args[0].startswith("Scheduler replay event: ")
+    ]
+    assert len(replay_events) == 1
+    completion = json.loads(replay_events[0].removeprefix("Scheduler replay event: "))
+    assert completion["event"] == "completion"
+    assert completion["request_id"] == 22
+    assert completion["dispatch_wave_id"] == 3
+    assert completion["actual_completion_tokens"] == 4096.0
+    assert completion["request_wall_seconds"] == 44.0
+    assert completion["group_closed"] is True
+    assert completion["group_wall_seconds"] == 45.0
+    assert completion["group_slowest_request_client"].startswith("client_1_")

@@ -101,8 +101,11 @@ class InflightRequest:
     request_started_at: float = 0.0
     dispatch_wait_seconds: float = 0.0
     client_inflight_at_selection: int = 0
+    dispatch_wave_id: int = 0
+    refill_wave_id: int = 0
     example_fingerprint: str | None = None
     predicted_completion_tokens: float | None = None
+    completion_prediction_source: str = "none"
 
 
 @dataclass
@@ -201,6 +204,9 @@ class Scheduler:
         # Track in-progress groups while rollouts are generated independently.
         self.next_group_id = 0
         self.next_request_id = 0
+        self.next_dispatch_wave_id = 0
+        self.next_refill_wave_id = 0
+        self.current_refill_wave_id = 0
         self.groups: dict[int, GroupState] = {}
 
         self.step, self.ckpt_step = 0, 0
@@ -318,6 +324,154 @@ class Scheduler:
         self._record_value(name, value)
         if group.pinned_client is not None:
             self._record_client_value(name, group.pinned_client, value)
+
+    def _log_replay_event(self, event: str, payload: dict) -> None:
+        payload = {"event": event, "schema_version": 1, **payload}
+        self.logger.info("Scheduler replay event: " + json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+    def _client_replay_entry(
+        self,
+        client: vf.ClientConfig,
+        inflight: Counter[ClientIdentity],
+        candidate_stats: dict[ClientIdentity, CandidateStats],
+        candidate_scores: dict[ClientIdentity, float] | None,
+        candidate_score_components: dict[ClientIdentity, dict[str, float]] | None,
+        selected_client: vf.ClientConfig,
+        predicted_completion_tokens: float | None,
+        completion_prediction_source: str,
+    ) -> dict:
+        identity = self._client_identity(client)
+        stats = candidate_stats.get(identity, CandidateStats())
+        metrics = stats.endpoint_metrics or {}
+        return {
+            "client_idx": client.client_idx,
+            "client_label": client_metric_label(client),
+            "dp_rank": client.extra_headers.get("X-data-parallel-rank"),
+            "endpoint_label": endpoint_label_from_url(client.api_base_url),
+            "selected": self._client_identity(client) == self._client_identity(selected_client),
+            "running_count": inflight[identity],
+            "score": (candidate_scores or {}).get(identity),
+            "score_components": (candidate_score_components or {}).get(identity),
+            "predicted_completion_tokens": predicted_completion_tokens,
+            "completion_prediction_source": completion_prediction_source,
+            "inflight_predicted_completion_tokens": stats.inflight_predicted_completion_tokens,
+            "completion_tokens_mean": stats.completion_tokens_mean,
+            "completion_tokens_last": stats.completion_tokens_last,
+            "request_wall_seconds_mean": stats.request_wall_seconds_mean,
+            "request_wall_seconds_last": stats.request_wall_seconds_last,
+            "group_wall_seconds_mean": stats.group_wall_seconds_mean,
+            "group_wall_seconds_last": stats.group_wall_seconds_last,
+            "decode_throughput_tps": metrics.get("decode_throughput_tps"),
+            "completed_requests_per_s": metrics.get("completed_requests_per_s"),
+            "num_requests_running": metrics.get("num_requests_running"),
+            "num_requests_waiting": metrics.get("num_requests_waiting"),
+            "gpu_cache_usage_perc": metrics.get("gpu_cache_usage_perc"),
+            "metrics_available": metrics.get("metrics_available", 0.0),
+            "metrics_scope_dp_rank_precise": metrics.get("metrics_scope_dp_rank_precise", 0.0),
+            "metrics_scope_base_url_client_count": metrics.get("metrics_scope_base_url_client_count", 0.0),
+        }
+
+    def _log_dispatch_replay_event(
+        self,
+        *,
+        request_id: int,
+        dispatch_wave_id: int,
+        refill_wave_id: int,
+        group_id: int,
+        group: GroupState,
+        env_name: str,
+        client: vf.ClientConfig,
+        clients: list[vf.ClientConfig],
+        inflight: Counter[ClientIdentity],
+        candidate_stats: dict[ClientIdentity, CandidateStats],
+        selected_inflight: int,
+        selected_score: float | None,
+        selected_score_components: dict[str, float] | None,
+        candidate_scores: dict[ClientIdentity, float] | None,
+        candidate_score_components: dict[ClientIdentity, dict[str, float]] | None,
+    ) -> None:
+        self._log_replay_event(
+            "dispatch",
+            {
+                "step": self.step,
+                "ckpt_step": self.ckpt_step,
+                "request_id": request_id,
+                "group_id": group_id,
+                "dispatch_wave_id": dispatch_wave_id,
+                "refill_wave_id": refill_wave_id,
+                "env_name": env_name,
+                "example_fingerprint": group.example_fingerprint,
+                "rollouts_to_schedule": group.rollouts_to_schedule,
+                "completed_rollouts": len(group.completed_rollouts),
+                "selected_client": client_metric_label(client),
+                "selected_client_idx": client.client_idx,
+                "selected_dp_rank": client.extra_headers.get("X-data-parallel-rank"),
+                "selected_inflight": selected_inflight,
+                "selected_score": selected_score,
+                "selected_score_components": selected_score_components,
+                "predicted_completion_tokens": group.predicted_completion_tokens,
+                "completion_prediction_source": group.completion_prediction_source,
+                "max_completion_tokens": self._max_completion_tokens_for_env(env_name),
+                "candidates": [
+                    self._client_replay_entry(
+                        candidate,
+                        inflight,
+                        candidate_stats,
+                        candidate_scores,
+                        candidate_score_components,
+                        client,
+                        group.predicted_completion_tokens,
+                        group.completion_prediction_source,
+                    )
+                    for candidate in clients
+                ],
+            },
+        )
+
+    def _log_completion_replay_event(
+        self,
+        *,
+        rollout_info: InflightRequest,
+        group: GroupState,
+        valid_rollouts: list[vf.RolloutOutput],
+        request_wall_seconds: float,
+        group_closed: bool,
+        group_wall_seconds: float | None = None,
+        group_tail_seconds: float | None = None,
+    ) -> None:
+        self._log_replay_event(
+            "completion",
+            {
+                "step": self.step,
+                "ckpt_step": self.ckpt_step,
+                "request_id": rollout_info.request_id,
+                "group_id": rollout_info.group_id,
+                "dispatch_wave_id": rollout_info.dispatch_wave_id,
+                "refill_wave_id": rollout_info.refill_wave_id,
+                "env_name": rollout_info.env_name,
+                "selected_client": client_metric_label(rollout_info.client_config),
+                "selected_client_idx": rollout_info.client_config.client_idx,
+                "selected_dp_rank": rollout_info.client_config.extra_headers.get("X-data-parallel-rank"),
+                "request_wall_seconds": request_wall_seconds,
+                "actual_prompt_tokens": float(sum(get_prompt_len(rollout) for rollout in valid_rollouts)),
+                "actual_completion_tokens": float(sum(get_completion_len(rollout) for rollout in valid_rollouts)),
+                "actual_seq_tokens": float(sum(get_seq_len(rollout) for rollout in valid_rollouts)),
+                "predicted_completion_tokens": rollout_info.predicted_completion_tokens,
+                "completion_prediction_source": rollout_info.completion_prediction_source,
+                "group_closed": group_closed,
+                "group_wall_seconds": group_wall_seconds,
+                "group_tail_seconds": group_tail_seconds,
+                "group_completed_request_count": group.completed_request_count,
+                "group_completion_tokens": group.completion_tokens,
+                "group_slowest_request_id": group.slowest_request_id,
+                "group_slowest_request_wall_seconds": group.slowest_request_wall_seconds,
+                "group_slowest_request_client": (
+                    client_metric_label(group.slowest_request_client)
+                    if group.slowest_request_client is not None
+                    else None
+                ),
+            },
+        )
 
     def _record_contributing_rollouts(
         self,
@@ -496,7 +650,14 @@ class Scheduler:
         return self.max_completion_tokens_by_env.get(env_name, self.default_max_completion_tokens)
 
     async def _select_request_client(
-        self, group_id: int, group: GroupState, env_name: str, cache_salt: str
+        self,
+        group_id: int,
+        group: GroupState,
+        env_name: str,
+        cache_salt: str,
+        request_id: int,
+        dispatch_wave_id: int,
+        refill_wave_id: int,
     ) -> tuple[vf.ClientConfig | None, int]:
         clients = await self._get_train_clients()
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
@@ -528,6 +689,8 @@ class Scheduler:
             selected_score = float(selected_inflight)
             selected_score_components = None
             score_component_stats = None
+            candidate_scores = None
+            candidate_score_components = None
         else:
             result = await select_with_metrics(
                 self.request_picker,
@@ -543,6 +706,8 @@ class Scheduler:
             selected_score = result.selected_score
             selected_score_components = result.selected_score_components
             score_component_stats = result.score_component_stats
+            candidate_scores = result.candidate_scores
+            candidate_score_components = result.candidate_score_components
 
         self._record_value("request_picker_latency_seconds", latency_seconds)
         self._record_value("request_picker_selected_inflight", float(selected_inflight))
@@ -574,6 +739,23 @@ class Scheduler:
         )
         self._record_client_count("scheduler/selected_client", client)
         self._record_client_value("scheduler/inflight_at_selection", client, float(selected_inflight))
+        self._log_dispatch_replay_event(
+            request_id=request_id,
+            dispatch_wave_id=dispatch_wave_id,
+            refill_wave_id=refill_wave_id,
+            group_id=group_id,
+            group=group,
+            env_name=env_name,
+            client=client,
+            clients=clients,
+            inflight=inflight,
+            candidate_stats=candidate_stats,
+            selected_inflight=selected_inflight,
+            selected_score=selected_score,
+            selected_score_components=selected_score_components,
+            candidate_scores=candidate_scores,
+            candidate_score_components=candidate_score_components,
+        )
         self.logger.debug(
             "Selected rollout client "
             f"group_id={group_id} env={env_name} client_idx={client.client_idx} "
@@ -610,22 +792,54 @@ class Scheduler:
         env_name = group.example["env_name"]
         env = self.train_envs.get(env_name)
         cache_salt = str(self.ckpt_step)
+        request_id = self.next_request_id
+        dispatch_wave_id = self.next_dispatch_wave_id
+        refill_wave_id = self.current_refill_wave_id
         selected_inflight = 0
         if group.pinned_client is not None:
             client_config = group.pinned_client
+            clients = await self._get_train_clients()
+            inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
+            selected_inflight = inflight[self._client_identity(client_config)]
+            self._ensure_group_prediction(group, env_name)
+            self._log_dispatch_replay_event(
+                request_id=request_id,
+                dispatch_wave_id=dispatch_wave_id,
+                refill_wave_id=refill_wave_id,
+                group_id=group_id,
+                group=group,
+                env_name=env_name,
+                client=client_config,
+                clients=clients,
+                inflight=inflight,
+                candidate_stats=self._candidate_stats(clients),
+                selected_inflight=selected_inflight,
+                selected_score=float(selected_inflight),
+                selected_score_components=None,
+                candidate_scores=None,
+                candidate_score_components=None,
+            )
         else:
-            client_config, selected_inflight = await self._select_request_client(group_id, group, env_name, cache_salt)
+            client_config, selected_inflight = await self._select_request_client(
+                group_id,
+                group,
+                env_name,
+                cache_salt,
+                request_id,
+                dispatch_wave_id,
+                refill_wave_id,
+            )
             if client_config is None:
                 return False
             if group_id not in self.groups:
                 return False
             group.pinned_client = client_config
+        self.next_request_id += 1
+        self.next_dispatch_wave_id += 1
 
         if group.first_dispatch_at is None:
             group.first_dispatch_at = time.perf_counter()
 
-        request_id = self.next_request_id
-        self.next_request_id += 1
         request_started_at = time.perf_counter()
         dispatch_wait_seconds = request_started_at - dispatch_start
         group_age_at_dispatch_seconds = request_started_at - group.created_at
@@ -683,8 +897,11 @@ class Scheduler:
             request_started_at=request_started_at,
             dispatch_wait_seconds=dispatch_wait_seconds,
             client_inflight_at_selection=selected_inflight,
+            dispatch_wave_id=dispatch_wave_id,
+            refill_wave_id=refill_wave_id,
             example_fingerprint=group.example_fingerprint,
             predicted_completion_tokens=group.predicted_completion_tokens,
+            completion_prediction_source=group.completion_prediction_source,
         )
         return True
 
@@ -735,6 +952,8 @@ class Scheduler:
         return False
 
     async def _fill_inflight_requests(self) -> None:
+        self.current_refill_wave_id = self.next_refill_wave_id
+        self.next_refill_wave_id += 1
         while await self._schedule_next_request():
             pass
 
@@ -1000,6 +1219,13 @@ class Scheduler:
                     group.rollouts_to_schedule += len(rollouts) - len(valid_rollouts)
                     group.completed_rollouts.extend(valid_rollouts)
                     if len(group.completed_rollouts) < self.rollouts_per_example:
+                        self._log_completion_replay_event(
+                            rollout_info=rollout_info,
+                            group=group,
+                            valid_rollouts=valid_rollouts,
+                            request_wall_seconds=request_wall_seconds,
+                            group_closed=False,
+                        )
                         self.completed_rollouts_by_client[identity] += len(valid_rollouts)
                         self._record_client_count(
                             "scheduler/completed_rollouts", rollout_info.client_config, len(valid_rollouts)
@@ -1030,6 +1256,15 @@ class Scheduler:
                         completed_group,
                         group_wall_seconds,
                         group_tail_seconds,
+                    )
+                    self._log_completion_replay_event(
+                        rollout_info=rollout_info,
+                        group=completed_group,
+                        valid_rollouts=valid_rollouts,
+                        request_wall_seconds=request_wall_seconds,
+                        group_closed=True,
+                        group_wall_seconds=group_wall_seconds,
+                        group_tail_seconds=group_tail_seconds,
                     )
                     completed_rollouts = completed_group.completed_rollouts
                     self.completed_rollouts_by_client[identity] += len(valid_rollouts)

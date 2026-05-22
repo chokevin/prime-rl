@@ -82,6 +82,8 @@ class RequestPickResult:
     selected_score: float | None = None
     selected_score_components: dict[str, float] | None = None
     score_component_stats: dict[str, float] | None = None
+    candidate_scores: dict[ClientIdentity, float] | None = None
+    candidate_score_components: dict[ClientIdentity, dict[str, float]] | None = None
 
 
 class RequestPicker(Protocol):
@@ -186,6 +188,8 @@ class PrimeAwareRequestPicker:
         self.last_score: float | None = None
         self.last_score_components: dict[str, float] | None = None
         self.last_score_component_stats: dict[str, float] | None = None
+        self.last_candidate_scores: dict[ClientIdentity, float] | None = None
+        self.last_candidate_score_components: dict[ClientIdentity, dict[str, float]] | None = None
 
     async def select_client(
         self,
@@ -211,6 +215,8 @@ class PrimeAwareRequestPicker:
         }
         self.last_score_component_stats = _score_component_stats(score_components.values())
         scores = {identity: sum(components.values()) for identity, components in score_components.items()}
+        self.last_candidate_scores = scores
+        self.last_candidate_score_components = score_components
         client = min(
             balanced_candidates,
             key=lambda c: (scores[client_identity(c)], candidate_inflight[client_identity(c)], c.client_idx),
@@ -605,6 +611,8 @@ async def select_with_metrics(
     selected_score = getattr(picker, "last_score", None)
     selected_score_components = getattr(picker, "last_score_components", None)
     score_component_stats = getattr(picker, "last_score_component_stats", None)
+    candidate_scores = getattr(picker, "last_candidate_scores", None)
+    candidate_score_components = getattr(picker, "last_candidate_score_components", None)
     return RequestPickResult(
         client=client,
         latency_seconds=latency,
@@ -614,6 +622,10 @@ async def select_with_metrics(
         selected_score=float(selected_score) if isinstance(selected_score, (int, float)) else None,
         selected_score_components=selected_score_components if isinstance(selected_score_components, dict) else None,
         score_component_stats=score_component_stats if isinstance(score_component_stats, dict) else None,
+        candidate_scores=candidate_scores if isinstance(candidate_scores, dict) else None,
+        candidate_score_components=(
+            candidate_score_components if isinstance(candidate_score_components, dict) else None
+        ),
     )
 
 
