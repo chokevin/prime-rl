@@ -74,6 +74,7 @@ class RequestPickResult:
     candidate_count: int
     selected_inflight: int
     selected_score: float | None = None
+    selected_score_components: dict[str, float] | None = None
 
 
 class RequestPicker(Protocol):
@@ -143,6 +144,12 @@ class PrimeAwareRequestPicker:
         completed_rps_deficit_weight: float = 0.0,
         cache_usage_weight: float = 0.25,
         history_penalty_cap: float = 4.0,
+        group_tail_pressure_weight: float = 0.0,
+        group_tail_pressure_threshold_seconds: float = 60.0,
+        waiting_backpressure_threshold: float | None = None,
+        waiting_backpressure_penalty: float = 0.0,
+        decode_guardrail_ratio: float = 0.0,
+        decode_guardrail_penalty: float = 0.0,
     ):
         self.inflight_slack = inflight_slack
         self.inflight_weight = inflight_weight
@@ -157,7 +164,14 @@ class PrimeAwareRequestPicker:
         self.completed_rps_deficit_weight = completed_rps_deficit_weight
         self.cache_usage_weight = cache_usage_weight
         self.history_penalty_cap = history_penalty_cap
+        self.group_tail_pressure_weight = group_tail_pressure_weight
+        self.group_tail_pressure_threshold_seconds = group_tail_pressure_threshold_seconds
+        self.waiting_backpressure_threshold = waiting_backpressure_threshold
+        self.waiting_backpressure_penalty = waiting_backpressure_penalty
+        self.decode_guardrail_ratio = decode_guardrail_ratio
+        self.decode_guardrail_penalty = decode_guardrail_penalty
         self.last_score: float | None = None
+        self.last_score_components: dict[str, float] | None = None
 
     async def select_client(
         self,
@@ -175,24 +189,30 @@ class PrimeAwareRequestPicker:
             for client in candidates
             if candidate_inflight[client_identity(client)] <= min_inflight + self.inflight_slack
         ]
-        scores = {
-            client_identity(client): self._score(client, inflight, candidate_stats, balanced_candidates)
+        score_components = {
+            client_identity(client): self._score_components(
+                client, inflight, context, candidate_stats, balanced_candidates
+            )
             for client in balanced_candidates
         }
+        scores = {identity: sum(components.values()) for identity, components in score_components.items()}
         client = min(
             balanced_candidates,
             key=lambda c: (scores[client_identity(c)], candidate_inflight[client_identity(c)], c.client_idx),
         )
-        self.last_score = scores[client_identity(client)]
+        selected_identity = client_identity(client)
+        self.last_score = scores[selected_identity]
+        self.last_score_components = score_components[selected_identity]
         return client
 
-    def _score(
+    def _score_components(
         self,
         client: vf.ClientConfig,
         inflight: Mapping[ClientIdentity, int],
+        context: RequestPickContext,
         candidate_stats: Mapping[ClientIdentity, CandidateStats],
         candidates: Iterable[vf.ClientConfig],
-    ) -> float:
+    ) -> dict[str, float]:
         identity = client_identity(client)
         stats = candidate_stats.get(identity, CandidateStats())
         metrics = stats.endpoint_metrics or {}
@@ -225,18 +245,33 @@ class PrimeAwareRequestPicker:
                 ),
             )
         )
-        return (
-            self.inflight_weight * inflight.get(identity, 0)
-            + self.waiting_weight * metrics.get("num_requests_waiting", 0.0)
-            + self.running_weight * metrics.get("num_requests_running", 0.0)
-            + min(history_penalty, self.history_penalty_cap)
-            + self.off_policy_weight * _latest_or_mean(stats.off_policy_steps_last, stats.off_policy_steps_mean)
-            + self.cancelled_weight * stats.cancelled_rollouts
-            + self.decode_deficit_weight * _rate_deficit("decode_throughput_tps", stats, candidate_stats.values())
-            + self.completed_rps_deficit_weight
-            * _rate_deficit("completed_requests_per_s", stats, candidate_stats.values())
-            + self.cache_usage_weight * metrics.get("gpu_cache_usage_perc", 0.0)
-        )
+        return {
+            "inflight": self.inflight_weight * inflight.get(identity, 0),
+            "waiting": self.waiting_weight * metrics.get("num_requests_waiting", 0.0),
+            "running": self.running_weight * metrics.get("num_requests_running", 0.0),
+            "history": min(history_penalty, self.history_penalty_cap),
+            "group_tail_pressure": self.group_tail_pressure_weight
+            * _group_tail_pressure(
+                context,
+                stats,
+                candidate_stats_subset,
+                self.group_tail_pressure_threshold_seconds,
+            ),
+            "off_policy": self.off_policy_weight
+            * _latest_or_mean(stats.off_policy_steps_last, stats.off_policy_steps_mean),
+            "cancelled": self.cancelled_weight * stats.cancelled_rollouts,
+            "decode_deficit": self.decode_deficit_weight
+            * _rate_deficit("decode_throughput_tps", stats, candidate_stats.values()),
+            "completed_rps_deficit": self.completed_rps_deficit_weight
+            * _rate_deficit("completed_requests_per_s", stats, candidate_stats.values()),
+            "cache_usage": self.cache_usage_weight * metrics.get("gpu_cache_usage_perc", 0.0),
+            "waiting_backpressure": self.waiting_backpressure_penalty
+            * _threshold_excess(metrics.get("num_requests_waiting", 0.0), self.waiting_backpressure_threshold),
+            "decode_guardrail": self.decode_guardrail_penalty
+            * _decode_guardrail_deficit(
+                "decode_throughput_tps", stats, candidate_stats.values(), self.decode_guardrail_ratio
+            ),
+        }
 
     async def aclose(self) -> None:
         return None
@@ -374,6 +409,30 @@ def _latency_excess(value: float | None, all_values: Iterable[float | None]) -> 
     return max(value - reference, 0.0) / reference
 
 
+def _group_tail_pressure(
+    context: RequestPickContext,
+    stats: CandidateStats,
+    all_stats: Iterable[CandidateStats],
+    threshold_seconds: float,
+) -> float:
+    tail_excess = _latency_excess(
+        _mean_or_latest(stats.group_tail_seconds_mean, stats.group_tail_seconds_last),
+        (
+            _mean_or_latest(candidate.group_tail_seconds_mean, candidate.group_tail_seconds_last)
+            for candidate in all_stats
+        ),
+    )
+    if tail_excess <= 0:
+        return 0.0
+
+    group_progress = context.completed_rollouts / max(context.completed_rollouts + context.rollouts_to_schedule, 1)
+    if threshold_seconds <= 0:
+        age_pressure = 1.0
+    else:
+        age_pressure = max(context.oldest_inflight_seconds - threshold_seconds, 0.0) / threshold_seconds
+    return tail_excess * (1.0 + group_progress + age_pressure)
+
+
 def _rate_deficit(metric_name: str, stats: CandidateStats, all_stats: Iterable[CandidateStats]) -> float:
     rate = (stats.endpoint_metrics or {}).get(metric_name)
     if rate is None:
@@ -386,6 +445,35 @@ def _rate_deficit(metric_name: str, stats: CandidateStats, all_stats: Iterable[C
     if max_rate <= 0:
         return 0.0
     return max(max_rate - rate, 0.0) / max_rate
+
+
+def _threshold_excess(value: float, threshold: float | None) -> float:
+    if threshold is None or value <= threshold:
+        return 0.0
+    return (value - threshold) / max(threshold, 1.0)
+
+
+def _decode_guardrail_deficit(
+    metric_name: str,
+    stats: CandidateStats,
+    all_stats: Iterable[CandidateStats],
+    tolerance_ratio: float,
+) -> float:
+    rate = (stats.endpoint_metrics or {}).get(metric_name)
+    if rate is None:
+        return 0.0
+
+    max_rate = max(
+        ((candidate.endpoint_metrics or {}).get(metric_name, 0.0) for candidate in all_stats),
+        default=0.0,
+    )
+    if max_rate <= 0:
+        return 0.0
+
+    tolerated_rate = max_rate * max(1.0 - tolerance_ratio, 0.0)
+    if rate >= tolerated_rate:
+        return 0.0
+    return (tolerated_rate - rate) / max_rate
 
 
 def setup_request_picker(config) -> RequestPicker:
@@ -408,6 +496,12 @@ def setup_request_picker(config) -> RequestPicker:
             completed_rps_deficit_weight=config.completed_rps_deficit_weight,
             cache_usage_weight=config.cache_usage_weight,
             history_penalty_cap=config.history_penalty_cap,
+            group_tail_pressure_weight=config.group_tail_pressure_weight,
+            group_tail_pressure_threshold_seconds=config.group_tail_pressure_threshold_seconds,
+            waiting_backpressure_threshold=config.waiting_backpressure_threshold,
+            waiting_backpressure_penalty=config.waiting_backpressure_penalty,
+            decode_guardrail_ratio=config.decode_guardrail_ratio,
+            decode_guardrail_penalty=config.decode_guardrail_penalty,
         )
     if config.type == "external":
         return ExternalRequestPicker(
@@ -431,6 +525,7 @@ async def select_with_metrics(
     latency = time.perf_counter() - start
     attempts = getattr(picker, "last_attempts", 1)
     selected_score = getattr(picker, "last_score", None)
+    selected_score_components = getattr(picker, "last_score_components", None)
     return RequestPickResult(
         client=client,
         latency_seconds=latency,
@@ -438,4 +533,5 @@ async def select_with_metrics(
         candidate_count=len(candidates),
         selected_inflight=inflight.get(client_identity(client), 0),
         selected_score=float(selected_score) if isinstance(selected_score, (int, float)) else None,
+        selected_score_components=selected_score_components if isinstance(selected_score_components, dict) else None,
     )

@@ -989,6 +989,59 @@ class PrimeAwareRequestPickerConfig(BaseConfig):
         ),
     ] = 4.0
 
+    group_tail_pressure_weight: Annotated[
+        float,
+        Field(
+            ge=0,
+            description=(
+                "Additional weight for avoiding clients with rollout-group tail history when older in-flight groups "
+                "make barrier closure more important."
+            ),
+        ),
+    ] = 0.0
+
+    group_tail_pressure_threshold_seconds: Annotated[
+        float,
+        Field(
+            ge=0,
+            description=(
+                "Oldest in-flight group age where group-tail pressure starts amplifying tail-history penalties."
+            ),
+        ),
+    ] = 60.0
+
+    waiting_backpressure_threshold: Annotated[
+        float | None,
+        Field(
+            ge=0,
+            description=(
+                "Optional vLLM waiting-request threshold above which the picker adds an explicit backpressure penalty."
+            ),
+        ),
+    ] = None
+
+    waiting_backpressure_penalty: Annotated[
+        float,
+        Field(ge=0, description="Penalty weight for candidates above waiting_backpressure_threshold."),
+    ] = 0.0
+
+    decode_guardrail_ratio: Annotated[
+        float,
+        Field(
+            ge=0,
+            le=1,
+            description=(
+                "Allowed decode-throughput regression versus the fastest candidate before applying the decode "
+                "guardrail penalty."
+            ),
+        ),
+    ] = 0.0
+
+    decode_guardrail_penalty: Annotated[
+        float,
+        Field(ge=0, description="Penalty weight for candidates that violate decode_guardrail_ratio."),
+    ] = 0.0
+
 
 class ExternalRequestPickerConfig(BaseConfig):
     """HTTP adapter for Prime-aware request picking outside the generation data path."""

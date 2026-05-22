@@ -291,6 +291,12 @@ decode_deficit_weight = 2.0
 completed_rps_deficit_weight = 0.0
 cache_usage_weight = 0.25
 history_penalty_cap = 4.0
+group_tail_pressure_weight = 0.0
+group_tail_pressure_threshold_seconds = 60.0
+waiting_backpressure_threshold = "None"
+waiting_backpressure_penalty = 0.0
+decode_guardrail_ratio = 0.0
+decode_guardrail_penalty = 0.0
 
 # External adapter: generation/admin traffic still goes directly to Prime-vLLM.
 [orchestrator.experimental.request_picker]
@@ -302,7 +308,7 @@ retry_backoff = 0.05
 ```
 
 Do not use this as an llm-d/Envoy data-path switch. The external picker receives Prime's logical rollout clients, in-flight counts, group/off-policy context, and recent per-endpoint metrics, then returns one candidate for Prime to use directly.
-The `prime_aware` picker uses the same Prime/vLLM signals in-process, so it is the preferred hill-climb variant when per-request external HTTP latency dominates. It first filters to candidates near the least-loaded in-flight count, then applies capped normalized request/group history penalties. This keeps DP-rank selection balanced when vLLM metrics are endpoint-level and identical across ranks.
+The `prime_aware` picker uses the same Prime/vLLM signals in-process, so it is the preferred hill-climb variant when per-request external HTTP latency dominates. It first filters to candidates near the least-loaded in-flight count, then applies capped normalized request/group history penalties. This keeps DP-rank selection balanced when vLLM metrics are endpoint-level and identical across ranks. The optional tail/backpressure/guardrail knobs default off where they add new behavior; use them for H200 rollout-tail experiments that need to avoid clients with prior group-tail history, penalize high vLLM waiting queues, or preserve decode throughput when raw completed-rps improves.
 
 ### Model fields
 

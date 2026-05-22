@@ -430,6 +430,7 @@ class Scheduler:
             attempts = 1
             selected_inflight = inflight[self._client_identity(client)]
             selected_score = float(selected_inflight)
+            selected_score_components = None
         else:
             result = await select_with_metrics(
                 self.request_picker,
@@ -443,6 +444,7 @@ class Scheduler:
             attempts = result.attempts
             selected_inflight = result.selected_inflight
             selected_score = result.selected_score
+            selected_score_components = result.selected_score_components
 
         self._record_value("request_picker_latency_seconds", latency_seconds)
         self._record_value("request_picker_selected_inflight", float(selected_inflight))
@@ -450,6 +452,9 @@ class Scheduler:
         self._record_value("request_picker_attempts", float(attempts))
         if selected_score is not None:
             self._record_value("request_picker_selected_score", selected_score)
+        if selected_score_components is not None:
+            for component, value in selected_score_components.items():
+                self._record_value(f"request_picker_selected_score_component/{component}", value)
         selected_metrics = candidate_stats.get(self._client_identity(client), CandidateStats()).endpoint_metrics or {}
         self._record_client_value(
             "scheduler/client_metrics_available",

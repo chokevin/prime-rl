@@ -11,6 +11,7 @@ from prime_rl.orchestrator.request_picker import (
     PrimeAwareRequestPicker,
     RequestPickContext,
     client_identity,
+    select_with_metrics,
 )
 
 
@@ -21,7 +22,12 @@ def _client(idx: int, base_url: str, dp_rank: str | None = None) -> vf.ClientCon
     return vf.ClientConfig(client_idx=idx, api_base_url=base_url, extra_headers=headers)
 
 
-def _context() -> RequestPickContext:
+def _context(
+    *,
+    rollouts_to_schedule: int = 1,
+    completed_rollouts: int = 0,
+    oldest_inflight_seconds: float = 4.5,
+) -> RequestPickContext:
     return RequestPickContext(
         env_name="math",
         group_id=7,
@@ -30,10 +36,10 @@ def _context() -> RequestPickContext:
         ckpt_step=2,
         cache_salt="2",
         group_age_seconds=1.25,
-        rollouts_to_schedule=1,
-        completed_rollouts=0,
+        rollouts_to_schedule=rollouts_to_schedule,
+        completed_rollouts=completed_rollouts,
         max_off_policy_level=2,
-        oldest_inflight_seconds=4.5,
+        oldest_inflight_seconds=oldest_inflight_seconds,
     )
 
 
@@ -240,5 +246,117 @@ def test_prime_aware_request_picker_avoids_queued_straggler():
         )
 
         assert picked.client_idx == 1
+
+    asyncio.run(run())
+
+
+def test_prime_aware_request_picker_amplifies_group_tail_under_oldest_group_pressure():
+    async def run() -> None:
+        clients = [
+            _client(0, "http://worker-a:8000/v1", "0"),
+            _client(1, "http://worker-b:8000/v1", "0"),
+        ]
+        stats = {
+            client_identity(clients[0]): CandidateStats(group_tail_seconds_mean=120.0),
+            client_identity(clients[1]): CandidateStats(group_tail_seconds_mean=30.0),
+        }
+
+        result = await select_with_metrics(
+            PrimeAwareRequestPicker(
+                request_wall_weight=0.0,
+                group_wall_weight=0.0,
+                group_tail_weight=0.0,
+                decode_deficit_weight=0.0,
+                cache_usage_weight=0.0,
+                group_tail_pressure_weight=4.0,
+                group_tail_pressure_threshold_seconds=30.0,
+            ),
+            clients,
+            {
+                client_identity(clients[0]): 0,
+                client_identity(clients[1]): 0,
+            },
+            _context(oldest_inflight_seconds=120.0),
+            stats,
+        )
+
+        assert result.client.client_idx == 1
+        assert result.selected_score_components is not None
+        assert result.selected_score_components["group_tail_pressure"] == 0.0
+
+    asyncio.run(run())
+
+
+def test_prime_aware_request_picker_applies_waiting_backpressure_threshold():
+    async def run() -> None:
+        clients = [
+            _client(0, "http://worker-a:8000/v1", "0"),
+            _client(1, "http://worker-b:8000/v1", "0"),
+        ]
+        stats = {
+            client_identity(clients[0]): CandidateStats(endpoint_metrics={"num_requests_waiting": 8.0}),
+            client_identity(clients[1]): CandidateStats(endpoint_metrics={"num_requests_waiting": 0.0}),
+        }
+
+        result = await select_with_metrics(
+            PrimeAwareRequestPicker(
+                waiting_weight=0.0,
+                request_wall_weight=0.0,
+                group_wall_weight=0.0,
+                group_tail_weight=0.0,
+                decode_deficit_weight=0.0,
+                cache_usage_weight=0.0,
+                waiting_backpressure_threshold=2.0,
+                waiting_backpressure_penalty=10.0,
+            ),
+            clients,
+            {
+                client_identity(clients[0]): 0,
+                client_identity(clients[1]): 0,
+            },
+            _context(),
+            stats,
+        )
+
+        assert result.client.client_idx == 1
+        assert result.selected_score_components is not None
+        assert result.selected_score_components["waiting_backpressure"] == 0.0
+
+    asyncio.run(run())
+
+
+def test_prime_aware_request_picker_applies_decode_guardrail():
+    async def run() -> None:
+        clients = [
+            _client(0, "http://worker-a:8000/v1", "0"),
+            _client(1, "http://worker-b:8000/v1", "0"),
+        ]
+        stats = {
+            client_identity(clients[0]): CandidateStats(endpoint_metrics={"decode_throughput_tps": 80.0}),
+            client_identity(clients[1]): CandidateStats(endpoint_metrics={"decode_throughput_tps": 100.0}),
+        }
+
+        result = await select_with_metrics(
+            PrimeAwareRequestPicker(
+                request_wall_weight=0.0,
+                group_wall_weight=0.0,
+                group_tail_weight=0.0,
+                decode_deficit_weight=0.0,
+                cache_usage_weight=0.0,
+                decode_guardrail_ratio=0.1,
+                decode_guardrail_penalty=10.0,
+            ),
+            clients,
+            {
+                client_identity(clients[0]): 0,
+                client_identity(clients[1]): 0,
+            },
+            _context(),
+            stats,
+        )
+
+        assert result.client.client_idx == 1
+        assert result.selected_score_components is not None
+        assert result.selected_score_components["decode_guardrail"] == 0.0
 
     asyncio.run(run())
