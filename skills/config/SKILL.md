@@ -297,6 +297,7 @@ waiting_backpressure_threshold = "None"
 waiting_backpressure_penalty = 0.0
 decode_guardrail_ratio = 0.0
 decode_guardrail_penalty = 0.0
+max_inflight_per_client = "None"
 
 # External adapter: generation/admin traffic still goes directly to Prime-vLLM.
 [orchestrator.experimental.request_picker]
@@ -308,7 +309,7 @@ retry_backoff = 0.05
 ```
 
 Do not use this as an llm-d/Envoy data-path switch. The external picker receives Prime's logical rollout clients, in-flight counts, group/off-policy context, and recent per-endpoint metrics, then returns one candidate for Prime to use directly.
-The `prime_aware` picker uses the same Prime/vLLM signals in-process, so it is the preferred hill-climb variant when per-request external HTTP latency dominates. It first filters to candidates near the least-loaded in-flight count, then applies capped normalized request/group history penalties. This keeps DP-rank selection balanced when vLLM metrics are endpoint-level and identical across ranks. The optional tail/backpressure/guardrail knobs default off where they add new behavior; use them for H200 rollout-tail experiments that need to avoid clients with prior group-tail history, penalize high vLLM waiting queues, or preserve decode throughput when raw completed-rps improves.
+The `prime_aware` picker uses the same Prime/vLLM signals in-process, so it is the preferred hill-climb variant when per-request external HTTP latency dominates. It first filters to candidates near the least-loaded in-flight count, then applies capped normalized request/group history penalties. This keeps DP-rank selection balanced when vLLM metrics are endpoint-level and identical across ranks. The optional tail/backpressure/guardrail knobs default off where they add new behavior; use them for H200 rollout-tail experiments that need to avoid clients with prior group-tail history, penalize high vLLM waiting queues, or preserve decode throughput when raw completed-rps improves. `max_inflight_per_client` is a Prime-side admission cap: when every logical rollout client is at the cap, the scheduler waits for a completion instead of queueing more long generations behind vLLM.
 
 ### Model fields
 

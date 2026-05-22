@@ -360,3 +360,29 @@ def test_prime_aware_request_picker_applies_decode_guardrail():
         assert result.selected_score_components["decode_guardrail"] == 0.0
 
     asyncio.run(run())
+
+
+def test_prime_aware_request_picker_filters_candidates_at_inflight_cap():
+    async def run() -> None:
+        clients = [
+            _client(0, "http://worker-a:8000/v1", "0"),
+            _client(1, "http://worker-b:8000/v1", "0"),
+        ]
+        stats = {
+            client_identity(clients[0]): CandidateStats(group_wall_seconds_mean=1.0),
+            client_identity(clients[1]): CandidateStats(group_wall_seconds_mean=100.0),
+        }
+
+        picked = await PrimeAwareRequestPicker(max_inflight_per_client=2).select_client(
+            clients,
+            {
+                client_identity(clients[0]): 2,
+                client_identity(clients[1]): 1,
+            },
+            _context(),
+            stats,
+        )
+
+        assert picked.client_idx == 1
+
+    asyncio.run(run())

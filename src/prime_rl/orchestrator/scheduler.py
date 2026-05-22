@@ -20,6 +20,8 @@ from prime_rl.orchestrator.request_picker import (
     client_identity,
     client_metric_label,
     endpoint_label_from_url,
+    has_request_picker_capacity,
+    request_picker_inflight_cap,
     select_with_metrics,
     setup_request_picker,
 )
@@ -405,9 +407,23 @@ class Scheduler:
             )
         return stats
 
-    async def _select_request_client(self, group_id: int, group: GroupState, env_name: str, cache_salt: str):
+    async def _select_request_client(
+        self, group_id: int, group: GroupState, env_name: str, cache_salt: str
+    ) -> tuple[vf.ClientConfig | None, int]:
         clients = await self._get_train_clients()
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
+        inflight_cap = request_picker_inflight_cap(self.request_picker)
+        if inflight_cap is not None:
+            self._record_value("request_picker_max_inflight_per_client", float(inflight_cap))
+            capped_count = sum(inflight[self._client_identity(client)] >= inflight_cap for client in clients)
+            self._record_value("request_picker_inflight_capped_client_count", float(capped_count))
+            self._record_value(
+                "request_picker_inflight_available_client_count",
+                float(len(clients) - capped_count),
+            )
+            if not has_request_picker_capacity(self.request_picker, clients, inflight):
+                self._record_value("request_picker_backpressure_all_clients_capped", 1.0)
+                return None, 0
         context = RequestPickContext(
             env_name=env_name,
             group_id=group_id,
@@ -497,14 +513,14 @@ class Scheduler:
         await safe_cancel_all(tasks_to_cancel)
         return rollout_count
 
-    async def schedule_rollout(self, group_id: int):
+    async def schedule_rollout(self, group_id: int) -> bool:
         """Asynchronously schedules a rollout request (or a group request for group-scoring envs)."""
         dispatch_start = time.perf_counter()
         if self.rate_limiter:
             await self.rate_limiter.acquire()
         group = self.groups.get(group_id)
         if group is None or group.rollouts_to_schedule <= 0:
-            return
+            return False
 
         env_name = group.example["env_name"]
         env = self.train_envs.get(env_name)
@@ -512,10 +528,21 @@ class Scheduler:
         selected_inflight = 0
         if group.pinned_client is not None:
             client_config = group.pinned_client
+            inflight_cap = request_picker_inflight_cap(self.request_picker)
+            if inflight_cap is not None:
+                inflight = Counter(
+                    self._client_identity(info.client_config) for info in self.inflight_requests.values()
+                )
+                if inflight[self._client_identity(client_config)] >= inflight_cap:
+                    self._record_value("request_picker_max_inflight_per_client", float(inflight_cap))
+                    self._record_value("request_picker_backpressure_pinned_client_capped", 1.0)
+                    return False
         else:
             client_config, selected_inflight = await self._select_request_client(group_id, group, env_name, cache_salt)
+            if client_config is None:
+                return False
             if group_id not in self.groups:
-                return
+                return False
             group.pinned_client = client_config
 
         if group.first_dispatch_at is None:
@@ -571,6 +598,7 @@ class Scheduler:
             dispatch_wait_seconds=dispatch_wait_seconds,
             client_inflight_at_selection=selected_inflight,
         )
+        return True
 
     @property
     def inflight_rollout_count(self) -> int:
@@ -593,8 +621,8 @@ class Scheduler:
             env = self.train_envs.get(group.example["env_name"])
             cost = group.rollouts_to_schedule if env.requires_group_scoring else 1
             if cost <= remaining_capacity:
-                await self.schedule_rollout(group_id=group_id)
-                return True
+                if await self.schedule_rollout(group_id=group_id):
+                    return True
 
         if remaining_capacity < self.rollouts_per_example:
             return False
@@ -603,8 +631,10 @@ class Scheduler:
         group_id = self.next_group_id
         self.next_group_id += 1
         self.groups[group_id] = GroupState(example=example, rollouts_to_schedule=self.rollouts_per_example)
-        await self.schedule_rollout(group_id=group_id)
-        return True
+        if await self.schedule_rollout(group_id=group_id):
+            return True
+        self.groups.pop(group_id, None)
+        return False
 
     async def _fill_inflight_requests(self) -> None:
         while await self._schedule_next_request():

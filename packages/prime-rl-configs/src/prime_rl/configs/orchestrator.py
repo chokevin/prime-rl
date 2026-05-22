@@ -1042,6 +1042,18 @@ class PrimeAwareRequestPickerConfig(BaseConfig):
         Field(ge=0, description="Penalty weight for candidates that violate decode_guardrail_ratio."),
     ] = 0.0
 
+    max_inflight_per_client: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Optional Prime-side admission cap per logical rollout client. When every client is at the cap, "
+                "the scheduler stops dispatching new rollout requests until one completes instead of queueing "
+                "more work behind long generations."
+            ),
+        ),
+    ] = None
+
 
 class ExternalRequestPickerConfig(BaseConfig):
     """HTTP adapter for Prime-aware request picking outside the generation data path."""
