@@ -49,6 +49,9 @@ class RequestPickContext:
     completed_rollouts: int
     max_off_policy_level: int
     oldest_inflight_seconds: float
+    example_fingerprint: str | None = None
+    predicted_completion_tokens: float | None = None
+    max_completion_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -57,12 +60,15 @@ class CandidateStats:
     cancelled_rollouts: int = 0
     request_wall_seconds_mean: float | None = None
     request_wall_seconds_last: float | None = None
+    completion_tokens_mean: float | None = None
+    completion_tokens_last: float | None = None
     group_wall_seconds_mean: float | None = None
     group_wall_seconds_last: float | None = None
     group_tail_seconds_mean: float | None = None
     group_tail_seconds_last: float | None = None
     off_policy_steps_mean: float | None = None
     off_policy_steps_last: float | None = None
+    inflight_predicted_completion_tokens: float = 0.0
     endpoint_metrics: dict[str, float] | None = None
 
 
@@ -151,6 +157,8 @@ class PrimeAwareRequestPicker:
         decode_guardrail_ratio: float = 0.0,
         decode_guardrail_penalty: float = 0.0,
         max_inflight_per_client: int | None = None,
+        long_output_weight: float = 0.0,
+        long_output_threshold_tokens: int | None = None,
     ):
         self.inflight_slack = inflight_slack
         self.inflight_weight = inflight_weight
@@ -172,6 +180,8 @@ class PrimeAwareRequestPicker:
         self.decode_guardrail_ratio = decode_guardrail_ratio
         self.decode_guardrail_penalty = decode_guardrail_penalty
         self.max_inflight_per_client = max_inflight_per_client
+        self.long_output_weight = long_output_weight
+        self.long_output_threshold_tokens = long_output_threshold_tokens
         self.last_score: float | None = None
         self.last_score_components: dict[str, float] | None = None
 
@@ -275,6 +285,13 @@ class PrimeAwareRequestPicker:
             "decode_guardrail": self.decode_guardrail_penalty
             * _decode_guardrail_deficit(
                 "decode_throughput_tps", stats, candidate_stats.values(), self.decode_guardrail_ratio
+            ),
+            "long_output": self.long_output_weight
+            * _long_output_pressure(
+                context,
+                stats,
+                candidate_stats_subset,
+                self.long_output_threshold_tokens,
             ),
         }
 
@@ -458,6 +475,59 @@ def _threshold_excess(value: float, threshold: float | None) -> float:
     return (value - threshold) / max(threshold, 1.0)
 
 
+def _load_excess(value: float, all_values: Iterable[float]) -> float:
+    observed_values = [candidate for candidate in all_values if candidate >= 0]
+    if len(observed_values) < 2:
+        return 0.0
+
+    reference = min(observed_values)
+    if value <= reference:
+        return 0.0
+    return (value - reference) / max(statistics.median(observed_values), 1.0)
+
+
+def _long_output_threshold(context: RequestPickContext, threshold_tokens: int | None) -> float | None:
+    if threshold_tokens is not None:
+        return float(threshold_tokens)
+    if context.max_completion_tokens is None:
+        return None
+    return 0.8 * context.max_completion_tokens
+
+
+def _long_output_pressure(
+    context: RequestPickContext,
+    stats: CandidateStats,
+    all_stats: Iterable[CandidateStats],
+    threshold_tokens: int | None,
+) -> float:
+    predicted_tokens = context.predicted_completion_tokens
+    if predicted_tokens is None or predicted_tokens <= 0:
+        return 0.0
+
+    threshold = _long_output_threshold(context, threshold_tokens)
+    if threshold is not None and predicted_tokens < threshold:
+        return 0.0
+
+    stats_list = list(all_stats)
+    if not stats_list:
+        return 0.0
+
+    normalization = threshold if threshold is not None else predicted_tokens
+    prediction_pressure = predicted_tokens / max(normalization, 1.0)
+    inflight_pressure = _load_excess(
+        stats.inflight_predicted_completion_tokens,
+        (candidate.inflight_predicted_completion_tokens for candidate in stats_list),
+    )
+    recent_completion_pressure = _latency_excess(
+        _mean_or_latest(stats.completion_tokens_mean, stats.completion_tokens_last),
+        (
+            _mean_or_latest(candidate.completion_tokens_mean, candidate.completion_tokens_last)
+            for candidate in stats_list
+        ),
+    )
+    return prediction_pressure * (inflight_pressure + recent_completion_pressure)
+
+
 def _decode_guardrail_deficit(
     metric_name: str,
     stats: CandidateStats,
@@ -508,6 +578,8 @@ def setup_request_picker(config) -> RequestPicker:
             decode_guardrail_ratio=config.decode_guardrail_ratio,
             decode_guardrail_penalty=config.decode_guardrail_penalty,
             max_inflight_per_client=config.max_inflight_per_client,
+            long_output_weight=config.long_output_weight,
+            long_output_threshold_tokens=config.long_output_threshold_tokens,
         )
     if config.type == "external":
         return ExternalRequestPicker(

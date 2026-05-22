@@ -52,12 +52,17 @@ def make_scheduler() -> Scheduler:
     scheduler.cancelled_rollouts_by_client = Counter()
     scheduler.request_wall_seconds_by_client = defaultdict(list)
     scheduler.last_request_wall_seconds_by_client = {}
+    scheduler.completion_tokens_by_client = defaultdict(list)
+    scheduler.last_completion_tokens_by_client = {}
+    scheduler.completion_tokens_by_fingerprint = defaultdict(list)
     scheduler.group_wall_seconds_by_client = defaultdict(list)
     scheduler.last_group_wall_seconds_by_client = {}
     scheduler.group_tail_seconds_by_client = defaultdict(list)
     scheduler.last_group_tail_seconds_by_client = {}
     scheduler.off_policy_steps_by_client = defaultdict(list)
     scheduler.last_off_policy_steps_by_client = {}
+    scheduler.default_max_completion_tokens = 4096
+    scheduler.max_completion_tokens_by_env = {"math": 4096}
     scheduler.inference_pool = SimpleNamespace(get_metrics=lambda: {}, get_client_metrics=lambda: {})
     return scheduler
 
@@ -332,6 +337,8 @@ def test_record_contributing_rollouts_tracks_tokens_and_slowest_request():
     assert group.slowest_request_client == client_b
     assert scheduler.metric_values["rollout_request_completion_tokens"] == [5.0, 13.0]
     assert scheduler.metric_values["rollout_request_seq_tokens/client_2_worker_b_8000_dp_1"] == [15.0]
+    assert scheduler.completion_tokens_by_client[Scheduler._client_identity(client_a)] == [5.0]
+    assert scheduler.completion_tokens_by_client[Scheduler._client_identity(client_b)] == [13.0]
 
 
 def test_record_completed_group_attribution_emits_tail_diagnostics():
@@ -400,6 +407,76 @@ def test_candidate_stats_marks_endpoint_metrics_scope_for_dp_rank_clients():
         assert metrics["metrics_scope_dp_rank_precise"] == 0.0
         assert metrics["metrics_scope_base_url_client_count"] == 2.0
         assert metrics["num_requests_waiting"] == 2.0
+
+
+def test_group_completion_history_predicts_future_completion_tokens():
+    scheduler = make_scheduler()
+    group = GroupState(
+        example={"env_name": "math", "prompt": "hard problem"},
+        rollouts_to_schedule=0,
+    )
+    scheduler._ensure_group_prediction(group)
+
+    assert group.example_fingerprint is not None
+    assert group.predicted_completion_tokens is None
+
+    client = vf.ClientConfig(
+        client_idx=1,
+        api_base_url="http://worker-a:8000/v1",
+        extra_headers={"X-data-parallel-rank": "0"},
+    )
+    scheduler._record_contributing_rollouts(
+        group,
+        InflightRequest(
+            off_policy_steps=0,
+            client_config=client,
+            env_name="math",
+            request_id=10,
+        ),
+        [rollout(prompt_tokens=3, completion_tokens=4096)],
+        request_wall_seconds=90.0,
+    )
+
+    next_group = GroupState(
+        example={"env_name": "math", "prompt": "hard problem"},
+        rollouts_to_schedule=1,
+    )
+    scheduler._ensure_group_prediction(next_group)
+
+    assert next_group.example_fingerprint == group.example_fingerprint
+    assert next_group.predicted_completion_tokens == 4096.0
+
+
+def test_candidate_stats_include_completion_history_and_predicted_inflight_load():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        client = vf.ClientConfig(
+            client_idx=1,
+            api_base_url="http://worker-a:8000/v1",
+            extra_headers={"X-data-parallel-rank": "0"},
+        )
+        identity = Scheduler._client_identity(client)
+        scheduler.completion_tokens_by_client[identity].extend([1024.0, 4096.0])
+        scheduler.last_completion_tokens_by_client[identity] = 4096.0
+        task = asyncio.create_task(asyncio.sleep(60))
+        scheduler.inflight_requests[task] = InflightRequest(
+            off_policy_steps=0,
+            client_config=client,
+            env_name="math",
+            group_id=1,
+            rollout_count=2,
+            predicted_completion_tokens=2048.0,
+        )
+
+        stats = scheduler._candidate_stats([client])
+
+        assert stats[identity].completion_tokens_mean == 2560.0
+        assert stats[identity].completion_tokens_last == 4096.0
+        assert stats[identity].inflight_predicted_completion_tokens == 2048.0
+
+        await safe_cancel_all([task])
+
+    asyncio.run(run())
 
 
 def test_select_request_client_backpressures_when_all_clients_hit_cap():

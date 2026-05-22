@@ -386,3 +386,119 @@ def test_prime_aware_request_picker_filters_candidates_at_inflight_cap():
         assert picked.client_idx == 1
 
     asyncio.run(run())
+
+
+def test_prime_aware_request_picker_spreads_predicted_long_outputs():
+    async def run() -> None:
+        clients = [
+            _client(0, "http://worker-a:8000/v1", "0"),
+            _client(1, "http://worker-b:8000/v1", "0"),
+        ]
+        stats = {
+            client_identity(clients[0]): CandidateStats(inflight_predicted_completion_tokens=4096.0),
+            client_identity(clients[1]): CandidateStats(inflight_predicted_completion_tokens=0.0),
+        }
+
+        result = await select_with_metrics(
+            PrimeAwareRequestPicker(
+                inflight_weight=0.0,
+                waiting_weight=0.0,
+                running_weight=0.0,
+                request_wall_weight=0.0,
+                group_wall_weight=0.0,
+                group_tail_weight=0.0,
+                off_policy_weight=0.0,
+                cancelled_weight=0.0,
+                decode_deficit_weight=0.0,
+                cache_usage_weight=0.0,
+                long_output_weight=10.0,
+            ),
+            clients,
+            {
+                client_identity(clients[0]): 0,
+                client_identity(clients[1]): 0,
+            },
+            RequestPickContext(
+                env_name="math",
+                group_id=7,
+                model_name="test-model",
+                step=3,
+                ckpt_step=2,
+                cache_salt="2",
+                group_age_seconds=1.25,
+                rollouts_to_schedule=1,
+                completed_rollouts=0,
+                max_off_policy_level=2,
+                oldest_inflight_seconds=4.5,
+                predicted_completion_tokens=4096.0,
+                max_completion_tokens=4096,
+            ),
+            stats,
+        )
+
+        assert result.client.client_idx == 1
+        assert result.selected_score_components is not None
+        assert result.selected_score_components["long_output"] == 0.0
+
+    asyncio.run(run())
+
+
+def test_prime_aware_request_picker_ignores_short_output_predictions():
+    async def run() -> None:
+        clients = [
+            _client(0, "http://worker-a:8000/v1", "0"),
+            _client(1, "http://worker-b:8000/v1", "0"),
+        ]
+        stats = {
+            client_identity(clients[0]): CandidateStats(
+                completion_tokens_mean=4096.0,
+                inflight_predicted_completion_tokens=4096.0,
+            ),
+            client_identity(clients[1]): CandidateStats(
+                completion_tokens_mean=128.0,
+                inflight_predicted_completion_tokens=0.0,
+            ),
+        }
+
+        result = await select_with_metrics(
+            PrimeAwareRequestPicker(
+                inflight_weight=0.0,
+                waiting_weight=0.0,
+                running_weight=0.0,
+                request_wall_weight=0.0,
+                group_wall_weight=0.0,
+                group_tail_weight=0.0,
+                off_policy_weight=0.0,
+                cancelled_weight=0.0,
+                decode_deficit_weight=0.0,
+                cache_usage_weight=0.0,
+                long_output_weight=10.0,
+            ),
+            clients,
+            {
+                client_identity(clients[0]): 0,
+                client_identity(clients[1]): 0,
+            },
+            RequestPickContext(
+                env_name="math",
+                group_id=7,
+                model_name="test-model",
+                step=3,
+                ckpt_step=2,
+                cache_salt="2",
+                group_age_seconds=1.25,
+                rollouts_to_schedule=1,
+                completed_rollouts=0,
+                max_off_policy_level=2,
+                oldest_inflight_seconds=4.5,
+                predicted_completion_tokens=256.0,
+                max_completion_tokens=4096,
+            ),
+            stats,
+        )
+
+        assert result.client.client_idx == 0
+        assert result.selected_score_components is not None
+        assert result.selected_score_components["long_output"] == 0.0
+
+    asyncio.run(run())

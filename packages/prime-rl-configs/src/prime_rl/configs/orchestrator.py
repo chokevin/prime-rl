@@ -1054,6 +1054,28 @@ class PrimeAwareRequestPickerConfig(BaseConfig):
         ),
     ] = None
 
+    long_output_weight: Annotated[
+        float,
+        Field(
+            ge=0,
+            description=(
+                "Penalty weight for placing a predicted-long rollout group on clients that already have "
+                "predicted-long in-flight work or recent long completions."
+            ),
+        ),
+    ] = 0.0
+
+    long_output_threshold_tokens: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Completion-token prediction threshold for long-output placement. If unset, the picker uses "
+                "80% of the env's max_completion_tokens when that limit is known."
+            ),
+        ),
+    ] = None
+
 
 class ExternalRequestPickerConfig(BaseConfig):
     """HTTP adapter for Prime-aware request picking outside the generation data path."""
