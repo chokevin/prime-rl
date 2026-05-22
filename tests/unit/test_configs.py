@@ -98,6 +98,117 @@ def test_orchestrator_prime_aware_request_picker_config():
     assert config.experimental.request_picker.history_penalty_cap == 2.0
 
 
+def test_nccl_async_level_above_one_requires_explicit_opt_in():
+    with pytest.raises(ValidationError, match="allow_async_level_gt_1"):
+        TrainerConfig.model_validate(
+            {
+                "max_async_level": 2,
+                "weight_broadcast": {"type": "nccl"},
+            }
+        )
+
+    with pytest.raises(ValidationError, match="allow_async_level_gt_1"):
+        OrchestratorConfig.model_validate(
+            {
+                "use_renderer": False,
+                "max_async_level": 2,
+                "weight_broadcast": {"type": "nccl"},
+            }
+        )
+
+
+def test_nccl_async_level_above_one_opt_in_requires_non_strict_and_off_policy_capacity():
+    trainer = TrainerConfig.model_validate(
+        {
+            "max_async_level": 2,
+            "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
+        }
+    )
+    assert trainer.weight_broadcast.type == "nccl"
+    assert trainer.weight_broadcast.allow_async_level_gt_1
+
+    orchestrator = OrchestratorConfig.model_validate(
+        {
+            "use_renderer": False,
+            "max_async_level": 2,
+            "max_off_policy_steps": 2,
+            "strict_async_level": False,
+            "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
+        }
+    )
+    assert orchestrator.weight_broadcast.type == "nccl"
+    assert orchestrator.weight_broadcast.allow_async_level_gt_1
+
+    with pytest.raises(ValidationError, match="strict_async_level=false"):
+        OrchestratorConfig.model_validate(
+            {
+                "use_renderer": False,
+                "max_async_level": 2,
+                "strict_async_level": True,
+                "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
+            }
+        )
+
+    with pytest.raises(ValidationError, match="max_async_level must be <= max_off_policy_steps"):
+        OrchestratorConfig.model_validate(
+            {
+                "use_renderer": False,
+                "max_async_level": 5,
+                "max_off_policy_steps": 4,
+                "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
+            }
+        )
+
+
+def test_shared_nccl_async_level_above_one_propagates_opt_in_and_guards_orchestrator():
+    config = RLConfig.model_validate(
+        {
+            "max_async_level": 2,
+            "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
+            "trainer": {},
+            "orchestrator": {
+                "use_renderer": False,
+                "max_off_policy_steps": 2,
+                "strict_async_level": False,
+            },
+        }
+    )
+    assert config.trainer.max_async_level == 2
+    assert config.trainer.weight_broadcast.type == "nccl"
+    assert config.trainer.weight_broadcast.allow_async_level_gt_1
+    assert config.orchestrator.max_async_level == 2
+    assert config.orchestrator.weight_broadcast.type == "nccl"
+    assert config.orchestrator.weight_broadcast.allow_async_level_gt_1
+
+    with pytest.raises(ValidationError, match="allow_async_level_gt_1"):
+        RLConfig.model_validate(
+            {
+                "max_async_level": 2,
+                "weight_broadcast": {"type": "nccl"},
+                "trainer": {},
+                "orchestrator": {
+                    "use_renderer": False,
+                    "max_off_policy_steps": 2,
+                    "strict_async_level": False,
+                },
+            }
+        )
+
+    with pytest.raises(ValidationError, match="strict_async_level=false"):
+        RLConfig.model_validate(
+            {
+                "max_async_level": 2,
+                "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
+                "trainer": {},
+                "orchestrator": {
+                    "use_renderer": False,
+                    "max_off_policy_steps": 2,
+                    "strict_async_level": True,
+                },
+            }
+        )
+
+
 class NestedConfig(BaseConfig):
     lr: float = 1e-4
     weight_decay: float = 0.01

@@ -290,6 +290,15 @@ class SharedWeightBroadcastConfig(BaseConfig):
 
     port: Annotated[int, Field(description="The port to use for NCCL weight broadcast.")] = 29501
     timeout: Annotated[int, Field(description="The timeout in seconds for NCCL weight broadcast.")] = 1200
+    allow_async_level_gt_1: Annotated[
+        bool,
+        Field(
+            description=(
+                "Allow NCCL broadcast with max_async_level > 1. Experimental; use only for finite runs where "
+                "skipping the final async-level broadcasts is acceptable."
+            )
+        ),
+    ] = False
     quantize_in_weight_transfer: Annotated[
         bool,
         Field(
@@ -877,6 +886,7 @@ class RLConfig(BaseConfig):
                     inference_world_size=inference_world_size,
                     port=self.weight_broadcast.port,
                     timeout=self.weight_broadcast.timeout,
+                    allow_async_level_gt_1=self.weight_broadcast.allow_async_level_gt_1,
                     quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
                 )
                 self.orchestrator.weight_broadcast = OrchestratorNCCLWeightBroadcastConfig(
@@ -884,6 +894,7 @@ class RLConfig(BaseConfig):
                     port=self.weight_broadcast.port,
                     timeout=self.weight_broadcast.timeout,
                     inference_world_size=inference_world_size,
+                    allow_async_level_gt_1=self.weight_broadcast.allow_async_level_gt_1,
                     quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
                 )
             elif self.weight_broadcast.type == "filesystem":
@@ -893,6 +904,31 @@ class RLConfig(BaseConfig):
                 self.inference.weight_broadcast = InferenceWeightBroadcastConfig(type=self.weight_broadcast.type)
 
         validate_shared_weight_broadcast(self.trainer, self.orchestrator, self.inference)
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_nccl_async_slack(self):
+        if self.trainer.weight_broadcast.type != "nccl":
+            return self
+
+        if self.trainer.max_async_level == 1:
+            return self
+
+        trainer_opt_in = self.trainer.weight_broadcast.allow_async_level_gt_1
+        orchestrator_opt_in = self.orchestrator.weight_broadcast.allow_async_level_gt_1
+        if not trainer_opt_in or not orchestrator_opt_in:
+            raise ValueError(
+                "NCCL weight broadcast only works with async level 1 unless "
+                "weight_broadcast.allow_async_level_gt_1 is enabled"
+            )
+        if self.orchestrator.strict_async_level:
+            raise ValueError("NCCL broadcast async levels above 1 require strict_async_level=false")
+        if (
+            self.orchestrator.max_async_level > 1
+            and self.orchestrator.max_async_level > self.orchestrator.max_off_policy_steps
+        ):
+            raise ValueError("max_async_level must be <= max_off_policy_steps")
 
         return self
 

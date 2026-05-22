@@ -227,6 +227,20 @@ Do not use `deployment.type = "multi_node"` for Ray. That remains the SLURM temp
 
 The accepted Ray-native weight update path reuses Prime-RL's HF-compatible filesystem broadcast by default; do not add `weight_broadcast.type = "ray"` unless a separate design proves a better full-model live update path.
 
+### NCCL async slack
+
+NCCL broadcast defaults to `max_async_level = 1`. Raising it requires an explicit opt-in because the trainer skips the final `max_async_level` NCCL broadcasts in finite runs; this can reduce final-step checkpoint/update exposure, but it makes the last rollouts more off-policy.
+
+```toml
+max_async_level = 2
+
+[weight_broadcast]
+type = "nccl"
+allow_async_level_gt_1 = true
+```
+
+The orchestrator requires `strict_async_level = false` and `max_async_level <= max_off_policy_steps` for this mode.
+
 ### SFT hard distill override
 
 For hosted multi-tenant runs where the trainer image's `trainer.loss.type` is fixed, the orchestrator exposes a per-run override that forces SFT loss on every micro-batch without rebuilding the trainer. Set `orchestrator.use_sft_loss = true` alongside `orchestrator.teacher_rollout_model`; both must be configured together (the orchestrator validator enforces this). The orchestrator stamps each `TrainingSample.sft_loss = True`, which the trainer's `compute_loss` honors by dispatching to `sft_loss_fn` per batch — independent of the trainer's configured default loss.

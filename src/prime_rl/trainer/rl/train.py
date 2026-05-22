@@ -9,6 +9,7 @@ from datetime import timedelta
 
 from prime_rl.trainer.models.layers.attn import substitute_ring_attn
 from prime_rl.trainer.rl.broadcast import setup_weight_broadcast
+from prime_rl.trainer.rl.broadcast_schedule import should_broadcast_weights
 from prime_rl.utils.act_offloading import maybe_activation_offloading
 import torch
 import torch.distributed as dist
@@ -255,13 +256,19 @@ def train(config: TrainerConfig):
             gc_handler.run(progress.step)
         is_last_step = config.max_steps is not None and progress.step == config.max_steps
 
-        # Broadcast weights at every step, (except step 0, because no need to broadcast the base model)
-        # Also, with NCCL broadcast, we do not broadcast weights the last async level step as the orchestrator is already finished and will not initialize the receive on the inference; for filesystem broadcast, we do "broadcast" until the final step to allow to resume from the broadcast directory
+        # Broadcast weights at every step, except step 0 because the inference
+        # engine already has the base model. NCCL skips the last async-level
+        # broadcasts because the orchestrator will not initialize receivers for
+        # steps it never needs to generate.
         if weight_broadcast is None:
             broadcast_weights_time = 0
         else:
-            last_async_level_steps = config.max_steps and progress.step >= config.max_steps - config.max_async_level
-            if progress.step > 0 and (not last_async_level_steps or config.weight_broadcast.type == "filesystem"):
+            if should_broadcast_weights(
+                progress_step=progress.step,
+                max_steps=config.max_steps,
+                max_async_level=config.max_async_level,
+                weight_broadcast_type=config.weight_broadcast.type,
+            ):
                 broadcast_weights_start_time = time.perf_counter()
                 weight_broadcast.broadcast_weights(model, step=progress.step)
                 broadcast_weights_time = time.perf_counter() - broadcast_weights_start_time
