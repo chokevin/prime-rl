@@ -23,7 +23,7 @@ from prime_rl.orchestrator.request_picker import (
     select_with_metrics,
     setup_request_picker,
 )
-from prime_rl.orchestrator.vf_utils import get_seq_len
+from prime_rl.orchestrator.vf_utils import get_completion_len, get_prompt_len, get_seq_len
 from prime_rl.utils.async_utils import safe_cancel, safe_cancel_all
 from prime_rl.utils.client import InferencePool
 from prime_rl.utils.logger import ProgressTracker, get_logger
@@ -40,6 +40,7 @@ SCHEDULER_INSTRUMENTATION_PREFIXES = (
     "scheduler_refill_gap_seconds",
     "scheduler/completed_rollouts/",
     "scheduler/cancelled_rollouts/",
+    "scheduler/client_metrics_",
     "scheduler/inflight_at_selection/",
     "scheduler/off_policy_level_at_completion/",
     "scheduler/selected_client/",
@@ -97,6 +98,14 @@ class GroupState:
     created_at: float = field(default_factory=time.perf_counter)
     first_dispatch_at: float | None = None
     first_completion_at: float | None = None
+    completed_request_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    seq_tokens: int = 0
+    request_wall_seconds: list[float] = field(default_factory=list)
+    slowest_request_id: int | None = None
+    slowest_request_wall_seconds: float = 0.0
+    slowest_request_client: vf.ClientConfig | None = None
 
 
 class Scheduler:
@@ -261,6 +270,79 @@ class Scheduler:
     def _record_client_value(self, prefix: str, client: vf.ClientConfig, value: float) -> None:
         self._record_value(f"{prefix}/{client_metric_label(client)}", value)
 
+    def _record_group_value(self, name: str, group: GroupState, value: float) -> None:
+        self._record_value(name, value)
+        if group.pinned_client is not None:
+            self._record_client_value(name, group.pinned_client, value)
+
+    def _record_contributing_rollouts(
+        self,
+        group: GroupState,
+        rollout_info: InflightRequest,
+        valid_rollouts: list[vf.RolloutOutput],
+        request_wall_seconds: float,
+    ) -> None:
+        if not valid_rollouts:
+            return
+
+        prompt_tokens = sum(get_prompt_len(rollout) for rollout in valid_rollouts)
+        completion_tokens = sum(get_completion_len(rollout) for rollout in valid_rollouts)
+        seq_tokens = sum(get_seq_len(rollout) for rollout in valid_rollouts)
+
+        group.completed_request_count += 1
+        group.prompt_tokens += prompt_tokens
+        group.completion_tokens += completion_tokens
+        group.seq_tokens += seq_tokens
+        group.request_wall_seconds.append(request_wall_seconds)
+        if request_wall_seconds >= group.slowest_request_wall_seconds:
+            group.slowest_request_wall_seconds = request_wall_seconds
+            group.slowest_request_id = rollout_info.request_id
+            group.slowest_request_client = rollout_info.client_config
+
+        self._record_value("rollout_request_prompt_tokens", float(prompt_tokens))
+        self._record_value("rollout_request_completion_tokens", float(completion_tokens))
+        self._record_value("rollout_request_seq_tokens", float(seq_tokens))
+        self._record_client_value("rollout_request_prompt_tokens", rollout_info.client_config, float(prompt_tokens))
+        self._record_client_value(
+            "rollout_request_completion_tokens", rollout_info.client_config, float(completion_tokens)
+        )
+        self._record_client_value("rollout_request_seq_tokens", rollout_info.client_config, float(seq_tokens))
+
+    def _record_completed_group_attribution(
+        self,
+        group: GroupState,
+        group_wall_seconds: float,
+        group_tail_seconds: float,
+    ) -> None:
+        self._record_group_value("rollout_group_wall_seconds", group, group_wall_seconds)
+        self._record_group_value("rollout_group_tail_seconds", group, group_tail_seconds)
+        self._record_group_value("rollout_group_prompt_tokens", group, float(group.prompt_tokens))
+        self._record_group_value("rollout_group_completion_tokens", group, float(group.completion_tokens))
+        self._record_group_value("rollout_group_seq_tokens", group, float(group.seq_tokens))
+        self._record_group_value("rollout_group_completed_request_count", group, float(group.completed_request_count))
+        self._record_group_value(
+            "rollout_group_slowest_request_wall_seconds",
+            group,
+            group.slowest_request_wall_seconds,
+        )
+        if group.request_wall_seconds:
+            request_wall_spread = max(group.request_wall_seconds) - min(group.request_wall_seconds)
+            self._record_group_value("rollout_group_request_wall_spread_seconds", group, request_wall_spread)
+        if group.first_dispatch_at is not None:
+            self._record_group_value(
+                "rollout_group_time_to_first_dispatch_seconds",
+                group,
+                group.first_dispatch_at - group.created_at,
+            )
+        if group.first_completion_at is not None:
+            self._record_group_value(
+                "rollout_group_time_to_first_completion_seconds",
+                group,
+                group.first_completion_at - group.created_at,
+            )
+        if group.slowest_request_client is not None:
+            self._record_client_count("rollout_group_slowest_request_client", group.slowest_request_client)
+
     async def _select_least_loaded_client(self) -> vf.ClientConfig:
         """Select the client with the fewest in-flight tasks.
 
@@ -290,6 +372,7 @@ class Scheduler:
 
     def _candidate_stats(self, clients: list[vf.ClientConfig]) -> dict[ClientIdentity, CandidateStats]:
         endpoint_metrics = self.inference_pool.get_client_metrics()
+        endpoint_client_counts = Counter(endpoint_label_from_url(client.api_base_url) for client in clients)
         stats: dict[ClientIdentity, CandidateStats] = {}
         for client in clients:
             identity = self._client_identity(client)
@@ -298,6 +381,15 @@ class Scheduler:
             tail_times = self.group_tail_seconds_by_client.get(identity, [])
             off_policy_steps = self.off_policy_steps_by_client.get(identity, [])
             endpoint_label = endpoint_label_from_url(client.api_base_url)
+            endpoint_metric_snapshot = dict(endpoint_metrics.get(endpoint_label, {}))
+            metrics_available = float(bool(endpoint_metric_snapshot))
+            endpoint_metric_snapshot["metrics_available"] = metrics_available
+            endpoint_metric_snapshot["metrics_scope_dp_rank_precise"] = float(
+                metrics_available > 0.0 and endpoint_client_counts[endpoint_label] == 1
+            )
+            endpoint_metric_snapshot["metrics_scope_base_url_client_count"] = float(
+                endpoint_client_counts[endpoint_label]
+            )
             stats[identity] = CandidateStats(
                 completed_rollouts=self.completed_rollouts_by_client[identity],
                 cancelled_rollouts=self.cancelled_rollouts_by_client[identity],
@@ -309,7 +401,7 @@ class Scheduler:
                 group_tail_seconds_last=self.last_group_tail_seconds_by_client.get(identity),
                 off_policy_steps_mean=(sum(off_policy_steps) / len(off_policy_steps) if off_policy_steps else None),
                 off_policy_steps_last=self.last_off_policy_steps_by_client.get(identity),
-                endpoint_metrics=endpoint_metrics.get(endpoint_label, {}),
+                endpoint_metrics=endpoint_metric_snapshot,
             )
         return stats
 
@@ -329,6 +421,7 @@ class Scheduler:
             max_off_policy_level=self.max_off_policy_level,
             oldest_inflight_seconds=self._oldest_inflight_seconds(),
         )
+        candidate_stats = self._candidate_stats(clients)
 
         if isinstance(self.request_picker, DirectRequestPicker):
             start = time.perf_counter()
@@ -343,7 +436,7 @@ class Scheduler:
                 clients,
                 inflight,
                 context,
-                self._candidate_stats(clients),
+                candidate_stats,
             )
             client = result.client
             latency_seconds = result.latency_seconds
@@ -357,6 +450,22 @@ class Scheduler:
         self._record_value("request_picker_attempts", float(attempts))
         if selected_score is not None:
             self._record_value("request_picker_selected_score", selected_score)
+        selected_metrics = candidate_stats.get(self._client_identity(client), CandidateStats()).endpoint_metrics or {}
+        self._record_client_value(
+            "scheduler/client_metrics_available",
+            client,
+            selected_metrics.get("metrics_available", 0.0),
+        )
+        self._record_client_value(
+            "scheduler/client_metrics_dp_rank_precise",
+            client,
+            selected_metrics.get("metrics_scope_dp_rank_precise", 0.0),
+        )
+        self._record_client_value(
+            "scheduler/client_metrics_base_url_client_count",
+            client,
+            selected_metrics.get("metrics_scope_base_url_client_count", 0.0),
+        )
         self._record_client_count("scheduler/selected_client", client)
         self._record_client_value("scheduler/inflight_at_selection", client, float(selected_inflight))
         self.logger.debug(
@@ -411,8 +520,17 @@ class Scheduler:
         self.next_request_id += 1
         request_started_at = time.perf_counter()
         dispatch_wait_seconds = request_started_at - dispatch_start
+        group_age_at_dispatch_seconds = request_started_at - group.created_at
         self._record_value("rollout_dispatch_wait_seconds", dispatch_wait_seconds)
         self._record_client_value("rollout_dispatch_wait_seconds", client_config, dispatch_wait_seconds)
+        self._record_value("rollout_request_group_age_at_dispatch_seconds", group_age_at_dispatch_seconds)
+        self._record_client_value(
+            "rollout_request_group_age_at_dispatch_seconds", client_config, group_age_at_dispatch_seconds
+        )
+        self._record_value("rollout_request_completed_rollouts_at_dispatch", float(len(group.completed_rollouts)))
+        self._record_client_value(
+            "rollout_request_completed_rollouts_at_dispatch", client_config, float(len(group.completed_rollouts))
+        )
         if env.requires_group_scoring:
             rollout_count = group.rollouts_to_schedule
             group.rollouts_to_schedule = 0
@@ -740,6 +858,12 @@ class Scheduler:
                         continue
 
                     # For individual scoring, reschedule only the failed ones
+                    self._record_contributing_rollouts(
+                        group,
+                        rollout_info,
+                        valid_rollouts,
+                        request_wall_seconds,
+                    )
                     group.rollouts_to_schedule += len(rollouts) - len(valid_rollouts)
                     group.completed_rollouts.extend(valid_rollouts)
                     if len(group.completed_rollouts) < self.rollouts_per_example:
@@ -760,23 +884,21 @@ class Scheduler:
                         continue
                     group_completed_at = time.perf_counter()
                     group_wall_seconds = group_completed_at - group.created_at
-                    self._record_value("rollout_group_wall_seconds", group_wall_seconds)
-                    self._record_client_value(
-                        "rollout_group_wall_seconds", rollout_info.client_config, group_wall_seconds
-                    )
                     self.group_wall_seconds_by_client[identity].append(group_wall_seconds)
                     self.last_group_wall_seconds_by_client[identity] = group_wall_seconds
                     if group.first_completion_at is not None:
                         group_tail_seconds = group_completed_at - group.first_completion_at
                     else:
                         group_tail_seconds = 0.0
-                    self._record_value("rollout_group_tail_seconds", group_tail_seconds)
-                    self._record_client_value(
-                        "rollout_group_tail_seconds", rollout_info.client_config, group_tail_seconds
-                    )
                     self.group_tail_seconds_by_client[identity].append(group_tail_seconds)
                     self.last_group_tail_seconds_by_client[identity] = group_tail_seconds
-                    completed_rollouts = self.groups.pop(group_id).completed_rollouts
+                    completed_group = self.groups.pop(group_id)
+                    self._record_completed_group_attribution(
+                        completed_group,
+                        group_wall_seconds,
+                        group_tail_seconds,
+                    )
+                    completed_rollouts = completed_group.completed_rollouts
                     self.completed_rollouts_by_client[identity] += len(valid_rollouts)
                     self._record_client_count(
                         "scheduler/completed_rollouts", rollout_info.client_config, len(valid_rollouts)
