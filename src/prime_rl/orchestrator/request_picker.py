@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import statistics
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
@@ -56,6 +57,8 @@ class CandidateStats:
     cancelled_rollouts: int = 0
     request_wall_seconds_mean: float | None = None
     request_wall_seconds_last: float | None = None
+    group_wall_seconds_mean: float | None = None
+    group_wall_seconds_last: float | None = None
     group_tail_seconds_mean: float | None = None
     group_tail_seconds_last: float | None = None
     off_policy_steps_mean: float | None = None
@@ -127,27 +130,33 @@ class PrimeAwareRequestPicker:
 
     def __init__(
         self,
+        inflight_slack: int = 2,
         inflight_weight: float = 1.0,
         waiting_weight: float = 1.0,
         running_weight: float = 0.25,
-        request_wall_weight: float = 0.5,
-        group_tail_weight: float = 0.5,
+        request_wall_weight: float = 1.0,
+        group_wall_weight: float = 3.0,
+        group_tail_weight: float = 1.0,
         off_policy_weight: float = 0.25,
         cancelled_weight: float = 0.25,
-        decode_deficit_weight: float = 1.0,
-        completed_rps_deficit_weight: float = 1.0,
+        decode_deficit_weight: float = 2.0,
+        completed_rps_deficit_weight: float = 0.0,
         cache_usage_weight: float = 0.25,
+        history_penalty_cap: float = 4.0,
     ):
+        self.inflight_slack = inflight_slack
         self.inflight_weight = inflight_weight
         self.waiting_weight = waiting_weight
         self.running_weight = running_weight
         self.request_wall_weight = request_wall_weight
+        self.group_wall_weight = group_wall_weight
         self.group_tail_weight = group_tail_weight
         self.off_policy_weight = off_policy_weight
         self.cancelled_weight = cancelled_weight
         self.decode_deficit_weight = decode_deficit_weight
         self.completed_rps_deficit_weight = completed_rps_deficit_weight
         self.cache_usage_weight = cache_usage_weight
+        self.history_penalty_cap = history_penalty_cap
         self.last_score: float | None = None
 
     async def select_client(
@@ -157,8 +166,23 @@ class PrimeAwareRequestPicker:
         context: RequestPickContext,
         candidate_stats: Mapping[ClientIdentity, CandidateStats],
     ) -> vf.ClientConfig:
-        scores = {client_identity(client): self._score(client, inflight, candidate_stats) for client in candidates}
-        client = min(candidates, key=lambda c: scores[client_identity(c)])
+        candidate_inflight = {
+            client_identity(client): inflight.get(client_identity(client), 0) for client in candidates
+        }
+        min_inflight = min(candidate_inflight.values(), default=0)
+        balanced_candidates = [
+            client
+            for client in candidates
+            if candidate_inflight[client_identity(client)] <= min_inflight + self.inflight_slack
+        ]
+        scores = {
+            client_identity(client): self._score(client, inflight, candidate_stats, balanced_candidates)
+            for client in balanced_candidates
+        }
+        client = min(
+            balanced_candidates,
+            key=lambda c: (scores[client_identity(c)], candidate_inflight[client_identity(c)], c.client_idx),
+        )
         self.last_score = scores[client_identity(client)]
         return client
 
@@ -167,17 +191,45 @@ class PrimeAwareRequestPicker:
         client: vf.ClientConfig,
         inflight: Mapping[ClientIdentity, int],
         candidate_stats: Mapping[ClientIdentity, CandidateStats],
+        candidates: Iterable[vf.ClientConfig],
     ) -> float:
         identity = client_identity(client)
         stats = candidate_stats.get(identity, CandidateStats())
         metrics = stats.endpoint_metrics or {}
+        candidate_stats_subset = [
+            candidate_stats.get(client_identity(candidate), CandidateStats()) for candidate in candidates
+        ]
+        history_penalty = (
+            self.request_wall_weight
+            * _latency_excess(
+                _mean_or_latest(stats.request_wall_seconds_mean, stats.request_wall_seconds_last),
+                (
+                    _mean_or_latest(candidate.request_wall_seconds_mean, candidate.request_wall_seconds_last)
+                    for candidate in candidate_stats_subset
+                ),
+            )
+            + self.group_wall_weight
+            * _latency_excess(
+                _mean_or_latest(stats.group_wall_seconds_mean, stats.group_wall_seconds_last),
+                (
+                    _mean_or_latest(candidate.group_wall_seconds_mean, candidate.group_wall_seconds_last)
+                    for candidate in candidate_stats_subset
+                ),
+            )
+            + self.group_tail_weight
+            * _latency_excess(
+                _mean_or_latest(stats.group_tail_seconds_mean, stats.group_tail_seconds_last),
+                (
+                    _mean_or_latest(candidate.group_tail_seconds_mean, candidate.group_tail_seconds_last)
+                    for candidate in candidate_stats_subset
+                ),
+            )
+        )
         return (
             self.inflight_weight * inflight.get(identity, 0)
             + self.waiting_weight * metrics.get("num_requests_waiting", 0.0)
             + self.running_weight * metrics.get("num_requests_running", 0.0)
-            + self.request_wall_weight
-            * _latest_or_mean(stats.request_wall_seconds_last, stats.request_wall_seconds_mean)
-            + self.group_tail_weight * _latest_or_mean(stats.group_tail_seconds_last, stats.group_tail_seconds_mean)
+            + min(history_penalty, self.history_penalty_cap)
             + self.off_policy_weight * _latest_or_mean(stats.off_policy_steps_last, stats.off_policy_steps_mean)
             + self.cancelled_weight * stats.cancelled_rollouts
             + self.decode_deficit_weight * _rate_deficit("decode_throughput_tps", stats, candidate_stats.values())
@@ -303,6 +355,25 @@ def _latest_or_mean(latest: float | None, mean: float | None) -> float:
     return 0.0
 
 
+def _mean_or_latest(mean: float | None, latest: float | None) -> float | None:
+    if mean is not None:
+        return mean
+    return latest
+
+
+def _latency_excess(value: float | None, all_values: Iterable[float | None]) -> float:
+    if value is None:
+        return 0.0
+    observed_values = [candidate for candidate in all_values if candidate is not None and candidate > 0]
+    if len(observed_values) < 2:
+        return 0.0
+
+    reference = statistics.median(observed_values)
+    if reference <= 0:
+        return 0.0
+    return max(value - reference, 0.0) / reference
+
+
 def _rate_deficit(metric_name: str, stats: CandidateStats, all_stats: Iterable[CandidateStats]) -> float:
     rate = (stats.endpoint_metrics or {}).get(metric_name)
     if rate is None:
@@ -324,16 +395,19 @@ def setup_request_picker(config) -> RequestPicker:
         return LeastLoadedRequestPicker()
     if config.type == "prime_aware":
         return PrimeAwareRequestPicker(
+            inflight_slack=config.inflight_slack,
             inflight_weight=config.inflight_weight,
             waiting_weight=config.waiting_weight,
             running_weight=config.running_weight,
             request_wall_weight=config.request_wall_weight,
+            group_wall_weight=config.group_wall_weight,
             group_tail_weight=config.group_tail_weight,
             off_policy_weight=config.off_policy_weight,
             cancelled_weight=config.cancelled_weight,
             decode_deficit_weight=config.decode_deficit_weight,
             completed_rps_deficit_weight=config.completed_rps_deficit_weight,
             cache_usage_weight=config.cache_usage_weight,
+            history_penalty_cap=config.history_penalty_cap,
         )
     if config.type == "external":
         return ExternalRequestPicker(

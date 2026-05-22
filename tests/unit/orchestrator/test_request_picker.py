@@ -92,6 +92,8 @@ def test_external_request_picker_reuses_client_and_sends_prime_aware_fields():
                 cancelled_rollouts=1,
                 request_wall_seconds_mean=3.25,
                 request_wall_seconds_last=4.0,
+                group_wall_seconds_mean=5.0,
+                group_wall_seconds_last=6.0,
                 group_tail_seconds_mean=1.5,
                 group_tail_seconds_last=2.0,
                 off_policy_steps_mean=1.0,
@@ -111,9 +113,68 @@ def test_external_request_picker_reuses_client_and_sends_prime_aware_fields():
         assert payload["request"]["group_id"] == 7
         assert payload["request"]["max_off_policy_level"] == 2
         assert payload["candidates"][1]["completed_rollouts"] == 5
+        assert payload["candidates"][1]["group_wall_seconds_last"] == 6.0
         assert payload["candidates"][1]["group_tail_seconds_last"] == 2.0
         assert payload["candidates"][1]["off_policy_steps_last"] == 2.0
         assert payload["candidates"][1]["endpoint_metrics"]["decode_throughput_tps"] == 123.0
+
+    asyncio.run(run())
+
+
+def test_prime_aware_request_picker_keeps_near_least_loaded_balance():
+    async def run() -> None:
+        clients = [
+            _client(0, "http://worker-a:8000/v1", "0"),
+            _client(1, "http://worker-a:8000/v1", "1"),
+        ]
+        stats = {
+            client_identity(clients[0]): CandidateStats(
+                request_wall_seconds_mean=120.0,
+                group_wall_seconds_mean=120.0,
+            ),
+            client_identity(clients[1]): CandidateStats(
+                request_wall_seconds_mean=1.0,
+                group_wall_seconds_mean=1.0,
+            ),
+        }
+
+        picked = await PrimeAwareRequestPicker(inflight_slack=1).select_client(
+            clients,
+            {
+                client_identity(clients[0]): 0,
+                client_identity(clients[1]): 5,
+            },
+            _context(),
+            stats,
+        )
+
+        assert picked.client_idx == 0
+
+    asyncio.run(run())
+
+
+def test_prime_aware_request_picker_uses_group_wall_when_balanced():
+    async def run() -> None:
+        clients = [
+            _client(0, "http://worker-a:8000/v1", "0"),
+            _client(1, "http://worker-a:8000/v1", "1"),
+        ]
+        stats = {
+            client_identity(clients[0]): CandidateStats(group_wall_seconds_mean=120.0),
+            client_identity(clients[1]): CandidateStats(group_wall_seconds_mean=30.0),
+        }
+
+        picked = await PrimeAwareRequestPicker().select_client(
+            clients,
+            {
+                client_identity(clients[0]): 2,
+                client_identity(clients[1]): 2,
+            },
+            _context(),
+            stats,
+        )
+
+        assert picked.client_idx == 1
 
     asyncio.run(run())
 

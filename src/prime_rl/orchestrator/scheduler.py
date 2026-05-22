@@ -184,6 +184,10 @@ class Scheduler:
             lambda: deque(maxlen=PICKER_HISTORY_SIZE)
         )
         self.last_request_wall_seconds_by_client: dict[ClientIdentity, float] = {}
+        self.group_wall_seconds_by_client: dict[ClientIdentity, deque[float]] = defaultdict(
+            lambda: deque(maxlen=PICKER_HISTORY_SIZE)
+        )
+        self.last_group_wall_seconds_by_client: dict[ClientIdentity, float] = {}
         self.group_tail_seconds_by_client: dict[ClientIdentity, deque[float]] = defaultdict(
             lambda: deque(maxlen=PICKER_HISTORY_SIZE)
         )
@@ -276,6 +280,7 @@ class Scheduler:
         for client in clients:
             identity = self._client_identity(client)
             wall_times = self.request_wall_seconds_by_client.get(identity, [])
+            group_wall_times = self.group_wall_seconds_by_client.get(identity, [])
             tail_times = self.group_tail_seconds_by_client.get(identity, [])
             off_policy_steps = self.off_policy_steps_by_client.get(identity, [])
             endpoint_label = endpoint_label_from_url(client.api_base_url)
@@ -284,6 +289,8 @@ class Scheduler:
                 cancelled_rollouts=self.cancelled_rollouts_by_client[identity],
                 request_wall_seconds_mean=sum(wall_times) / len(wall_times) if wall_times else None,
                 request_wall_seconds_last=self.last_request_wall_seconds_by_client.get(identity),
+                group_wall_seconds_mean=(sum(group_wall_times) / len(group_wall_times) if group_wall_times else None),
+                group_wall_seconds_last=self.last_group_wall_seconds_by_client.get(identity),
                 group_tail_seconds_mean=sum(tail_times) / len(tail_times) if tail_times else None,
                 group_tail_seconds_last=self.last_group_tail_seconds_by_client.get(identity),
                 off_policy_steps_mean=(sum(off_policy_steps) / len(off_policy_steps) if off_policy_steps else None),
@@ -741,6 +748,8 @@ class Scheduler:
                     self._record_client_value(
                         "rollout_group_wall_seconds", rollout_info.client_config, group_wall_seconds
                     )
+                    self.group_wall_seconds_by_client[identity].append(group_wall_seconds)
+                    self.last_group_wall_seconds_by_client[identity] = group_wall_seconds
                     if group.first_completion_at is not None:
                         group_tail_seconds = group_completed_at - group.first_completion_at
                     else:

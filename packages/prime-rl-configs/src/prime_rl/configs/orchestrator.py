@@ -893,6 +893,17 @@ class PrimeAwareRequestPickerConfig(BaseConfig):
 
     type: Literal["prime_aware"] = "prime_aware"
 
+    inflight_slack: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Maximum in-flight rollout skew allowed above the least-loaded candidate before applying "
+                "Prime-aware history scoring."
+            ),
+        ),
+    ] = 2
+
     inflight_weight: Annotated[
         float,
         Field(ge=0, description="Weight for Prime-tracked in-flight rollout requests on the candidate client."),
@@ -910,13 +921,21 @@ class PrimeAwareRequestPickerConfig(BaseConfig):
 
     request_wall_weight: Annotated[
         float,
-        Field(ge=0, description="Weight for recent Prime rollout request wall time on the candidate client."),
-    ] = 0.5
+        Field(
+            ge=0,
+            description="Weight for normalized excess Prime rollout request wall time on the candidate client.",
+        ),
+    ] = 1.0
+
+    group_wall_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for normalized excess rollout group wall time on the candidate client."),
+    ] = 3.0
 
     group_tail_weight: Annotated[
         float,
-        Field(ge=0, description="Weight for recent rollout group tail time on the candidate client."),
-    ] = 0.5
+        Field(ge=0, description="Weight for normalized excess rollout group tail time on the candidate client."),
+    ] = 1.0
 
     off_policy_weight: Annotated[
         float,
@@ -931,17 +950,25 @@ class PrimeAwareRequestPickerConfig(BaseConfig):
     decode_deficit_weight: Annotated[
         float,
         Field(ge=0, description="Weight for normalized decode-throughput deficit versus the fastest candidate."),
-    ] = 1.0
+    ] = 2.0
 
     completed_rps_deficit_weight: Annotated[
         float,
         Field(ge=0, description="Weight for normalized completed-request-rate deficit versus the fastest candidate."),
-    ] = 1.0
+    ] = 0.0
 
     cache_usage_weight: Annotated[
         float,
         Field(ge=0, description="Weight for vLLM GPU cache usage percentage on the candidate endpoint."),
     ] = 0.25
+
+    history_penalty_cap: Annotated[
+        float,
+        Field(
+            ge=0,
+            description="Maximum in-flight-equivalent score penalty contributed by request/group history.",
+        ),
+    ] = 4.0
 
 
 class ExternalRequestPickerConfig(BaseConfig):

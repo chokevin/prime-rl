@@ -83,15 +83,19 @@ def test_orchestrator_prime_aware_request_picker_config():
             "experimental": {
                 "request_picker": {
                     "type": "prime_aware",
+                    "inflight_slack": 1,
                     "waiting_weight": 2.0,
                     "decode_deficit_weight": 0.5,
+                    "history_penalty_cap": 2.0,
                 }
             },
         }
     )
     assert config.experimental.request_picker.type == "prime_aware"
+    assert config.experimental.request_picker.inflight_slack == 1
     assert config.experimental.request_picker.waiting_weight == 2.0
     assert config.experimental.request_picker.decode_deficit_weight == 0.5
+    assert config.experimental.request_picker.history_penalty_cap == 2.0
 
 
 class NestedConfig(BaseConfig):
