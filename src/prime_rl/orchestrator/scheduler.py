@@ -22,6 +22,7 @@ from prime_rl.orchestrator.request_picker import (
     client_metric_label,
     endpoint_label_from_url,
     request_picker_long_output_cold_start_ratio,
+    request_picker_wave_minimax_size,
     select_with_metrics,
     setup_request_picker,
 )
@@ -472,6 +473,111 @@ class Scheduler:
                 ),
             },
         )
+
+    def _group_predicted_completion_load(self, group: GroupState) -> float:
+        if group.predicted_completion_tokens is not None:
+            return group.predicted_completion_tokens
+        max_completion_tokens = self._max_completion_tokens_for_env(group.example["env_name"])
+        return float(max_completion_tokens or 1)
+
+    def _new_group_from_example(self, example: dict) -> tuple[int, GroupState]:
+        example_fingerprint = _example_fingerprint(example)
+        predicted_completion_tokens, completion_prediction_source = self._predict_completion_tokens(
+            example_fingerprint, example.get("env_name")
+        )
+        group_id = self.next_group_id
+        self.next_group_id += 1
+        group = GroupState(
+            example=example,
+            rollouts_to_schedule=self.rollouts_per_example,
+            example_fingerprint=example_fingerprint,
+            predicted_completion_tokens=predicted_completion_tokens,
+            completion_prediction_source=completion_prediction_source,
+        )
+        self.groups[group_id] = group
+        return group_id, group
+
+    def _candidate_wave_groups(self, remaining_capacity: int, wave_size: int) -> list[int]:
+        group_ids: list[int] = []
+        remaining = remaining_capacity
+        for group_id, group in self.groups.items():
+            if len(group_ids) >= wave_size or group.rollouts_to_schedule <= 0:
+                continue
+            env = self.train_envs.get(group.example["env_name"])
+            cost = group.rollouts_to_schedule if env.requires_group_scoring else 1
+            if cost <= remaining:
+                group_ids.append(group_id)
+                remaining -= cost
+
+        while len(group_ids) < wave_size and remaining >= self.rollouts_per_example:
+            example = self.buffer.sample_examples(n=1)[0]
+            group_id, _ = self._new_group_from_example(example)
+            group_ids.append(group_id)
+            remaining -= self.rollouts_per_example
+
+        return group_ids
+
+    async def _assign_wave_minimax_clients(self, group_ids: list[int]) -> dict[int, vf.ClientConfig]:
+        clients = await self._get_train_clients()
+        inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
+        candidate_stats = self._candidate_stats(clients)
+        projected_load = {
+            self._client_identity(client): candidate_stats[
+                self._client_identity(client)
+            ].inflight_predicted_completion_tokens
+            for client in clients
+        }
+        assigned_counts: Counter[ClientIdentity] = Counter()
+        assignments: dict[int, vf.ClientConfig] = {}
+
+        sorted_group_ids = sorted(
+            group_ids,
+            key=lambda group_id: self._group_predicted_completion_load(self.groups[group_id]),
+            reverse=True,
+        )
+        for group_id in sorted_group_ids:
+            group = self.groups[group_id]
+            load = self._group_predicted_completion_load(group)
+            client = min(
+                clients,
+                key=lambda candidate: (
+                    projected_load[self._client_identity(candidate)] + load,
+                    inflight[self._client_identity(candidate)] + assigned_counts[self._client_identity(candidate)],
+                    candidate.client_idx,
+                ),
+            )
+            identity = self._client_identity(client)
+            projected_load[identity] += load
+            assigned_counts[identity] += 1
+            assignments[group_id] = client
+
+        self._record_value("request_picker_wave_minimax_group_count", float(len(group_ids)))
+        if group_ids:
+            self._record_value(
+                "request_picker_wave_minimax_predicted_completion_tokens",
+                sum(self._group_predicted_completion_load(self.groups[group_id]) for group_id in group_ids),
+            )
+        self._log_replay_event(
+            "wave_assignment",
+            {
+                "step": self.step,
+                "ckpt_step": self.ckpt_step,
+                "refill_wave_id": self.current_refill_wave_id,
+                "group_ids": group_ids,
+                "assignments": [
+                    {
+                        "group_id": group_id,
+                        "client_label": client_metric_label(assignments[group_id]),
+                        "client_idx": assignments[group_id].client_idx,
+                        "dp_rank": assignments[group_id].extra_headers.get("X-data-parallel-rank"),
+                        "predicted_completion_tokens": self.groups[group_id].predicted_completion_tokens,
+                        "completion_prediction_source": self.groups[group_id].completion_prediction_source,
+                    }
+                    for group_id in sorted_group_ids
+                ],
+            },
+        )
+        return assignments
 
     def _record_contributing_rollouts(
         self,
@@ -932,20 +1038,7 @@ class Scheduler:
         if remaining_capacity < self.rollouts_per_example:
             return False
 
-        example = self.buffer.sample_examples(n=1)[0]
-        example_fingerprint = _example_fingerprint(example)
-        predicted_completion_tokens, completion_prediction_source = self._predict_completion_tokens(
-            example_fingerprint, example.get("env_name")
-        )
-        group_id = self.next_group_id
-        self.next_group_id += 1
-        self.groups[group_id] = GroupState(
-            example=example,
-            rollouts_to_schedule=self.rollouts_per_example,
-            example_fingerprint=example_fingerprint,
-            predicted_completion_tokens=predicted_completion_tokens,
-            completion_prediction_source=completion_prediction_source,
-        )
+        group_id, _ = self._new_group_from_example(self.buffer.sample_examples(n=1)[0])
         if await self.schedule_rollout(group_id=group_id):
             return True
         self.groups.pop(group_id, None)
@@ -954,8 +1047,34 @@ class Scheduler:
     async def _fill_inflight_requests(self) -> None:
         self.current_refill_wave_id = self.next_refill_wave_id
         self.next_refill_wave_id += 1
+        wave_size = request_picker_wave_minimax_size(self.request_picker)
+        if wave_size:
+            await self._fill_inflight_requests_wave_minimax(wave_size)
+            return
         while await self._schedule_next_request():
             pass
+
+    async def _fill_inflight_requests_wave_minimax(self, wave_size: int) -> None:
+        while True:
+            remaining_capacity = self.max_inflight_rollouts - self.inflight_rollout_count
+            if remaining_capacity <= 0:
+                return
+            group_ids = self._candidate_wave_groups(remaining_capacity, wave_size)
+            if not group_ids:
+                return
+            assignments = await self._assign_wave_minimax_clients(group_ids)
+            scheduled_any = False
+            for group_id in group_ids:
+                group = self.groups.get(group_id)
+                if group is None:
+                    continue
+                group.pinned_client = assignments[group_id]
+                if await self.schedule_rollout(group_id=group_id):
+                    scheduled_any = True
+                elif group.rollouts_to_schedule > 0 and not group.completed_rollouts:
+                    self.groups.pop(group_id, None)
+            if not scheduled_any:
+                return
 
     async def update_policy_loop(self):
         """Continuously checks for new policy checkpoints."""

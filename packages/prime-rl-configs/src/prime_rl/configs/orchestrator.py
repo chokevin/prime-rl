@@ -1076,6 +1076,18 @@ class PrimeAwareRequestPickerConfig(BaseConfig):
         ),
     ] = 0.0
 
+    wave_minimax_size: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "When >1, schedule refill requests in waves of this size and assign each wave to minimize "
+                "projected per-client predicted completion-token load. This is a soft placement policy, not "
+                "an admission cap."
+            ),
+        ),
+    ] = 0
+
 
 class ExternalRequestPickerConfig(BaseConfig):
     """HTTP adapter for Prime-aware request picking outside the generation data path."""

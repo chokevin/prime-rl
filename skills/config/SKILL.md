@@ -300,6 +300,7 @@ decode_guardrail_penalty = 0.0
 long_output_weight = 0.0
 long_output_threshold_tokens = "None"
 long_output_cold_start_ratio = 0.0
+wave_minimax_size = 0
 
 # External adapter: generation/admin traffic still goes directly to Prime-vLLM.
 [orchestrator.experimental.request_picker]
@@ -311,7 +312,7 @@ retry_backoff = 0.05
 ```
 
 Do not use this as an llm-d/Envoy data-path switch. The external picker receives Prime's logical rollout clients, in-flight counts, group/off-policy context, and recent per-endpoint metrics, then returns one candidate for Prime to use directly.
-The `prime_aware` picker uses the same Prime/vLLM signals in-process, so it is the preferred hill-climb variant when per-request external HTTP latency dominates. It first filters to candidates near the least-loaded in-flight count, then applies capped normalized request/group history penalties. This keeps DP-rank selection balanced when vLLM metrics are endpoint-level and identical across ranks. The optional tail/backpressure/guardrail knobs default off where they add new behavior; use them for H200 rollout-tail experiments that need to avoid clients with prior group-tail history, penalize high vLLM waiting queues, preserve decode throughput when raw completed-rps improves, or spread predicted-long completions away from clients with existing long-output load. Long-output placement uses exact example completion history first, then env-level completion history, then the opt-in `long_output_cold_start_ratio` fallback when no history exists.
+The `prime_aware` picker uses the same Prime/vLLM signals in-process, so it is the preferred hill-climb variant when per-request external HTTP latency dominates. It first filters to candidates near the least-loaded in-flight count, then applies capped normalized request/group history penalties. This keeps DP-rank selection balanced when vLLM metrics are endpoint-level and identical across ranks. The optional tail/backpressure/guardrail knobs default off where they add new behavior; use them for H200 rollout-tail experiments that need to avoid clients with prior group-tail history, penalize high vLLM waiting queues, preserve decode throughput when raw completed-rps improves, or spread predicted-long completions away from clients with existing long-output load. Long-output placement uses exact example completion history first, then env-level completion history, then the opt-in `long_output_cold_start_ratio` fallback when no history exists. `wave_minimax_size > 1` enables soft refill-wave assignment that minimizes projected per-client predicted completion-token load; it does not hard-cap total in-flight requests.
 
 ### Model fields
 

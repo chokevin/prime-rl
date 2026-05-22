@@ -24,6 +24,7 @@ def make_scheduler() -> Scheduler:
         weight_broadcast=SimpleNamespace(type="nccl", final_step_async_level=None),
     )
     scheduler.logger = MagicMock()
+    scheduler.rate_limiter = None
     scheduler.checkpoint_ready = asyncio.Event()
     scheduler.checkpoint_ready.set()
     scheduler.lora_name = None
@@ -34,6 +35,7 @@ def make_scheduler() -> Scheduler:
     scheduler.oldest_off_policy_at_pause = 0
     scheduler.inflight_requests = {}
     scheduler.groups = {}
+    scheduler.next_group_id = 0
     scheduler.next_request_id = 0
     scheduler.next_dispatch_wave_id = 0
     scheduler.next_refill_wave_id = 0
@@ -655,3 +657,121 @@ def test_replay_completion_event_joins_dispatch_to_actual_tokens_and_group_close
     assert completion["group_closed"] is True
     assert completion["group_wall_seconds"] == 45.0
     assert completion["group_slowest_request_client"].startswith("client_1_")
+
+
+def test_wave_minimax_assignment_spreads_predicted_long_groups():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        clients = [
+            vf.ClientConfig(
+                client_idx=1,
+                api_base_url="http://worker-a:8000/v1",
+                extra_headers={"X-data-parallel-rank": "0"},
+            ),
+            vf.ClientConfig(
+                client_idx=2,
+                api_base_url="http://worker-a:8000/v1",
+                extra_headers={"X-data-parallel-rank": "1"},
+            ),
+        ]
+        scheduler.inference_pool = SimpleNamespace(
+            train_clients=clients,
+            get_metrics=lambda: {},
+            get_client_metrics=lambda: {},
+        )
+        task = asyncio.create_task(asyncio.sleep(60))
+        scheduler.inflight_requests[task] = InflightRequest(
+            off_policy_steps=0,
+            client_config=clients[0],
+            env_name="math",
+            group_id=1,
+            request_started_at=1.0,
+            predicted_completion_tokens=4096.0,
+        )
+        scheduler.groups[10] = GroupState(
+            example={"env_name": "math"},
+            rollouts_to_schedule=1,
+            predicted_completion_tokens=4096.0,
+            completion_prediction_source="cold_start",
+        )
+        scheduler.groups[11] = GroupState(
+            example={"env_name": "math"},
+            rollouts_to_schedule=1,
+            predicted_completion_tokens=4096.0,
+            completion_prediction_source="cold_start",
+        )
+
+        assignments = await scheduler._assign_wave_minimax_clients([10, 11])
+
+        assert assignments[10] == clients[1]
+        assert assignments[11] == clients[0]
+        assert scheduler.metric_values["request_picker_wave_minimax_group_count"] == [2.0]
+        replay_events = [
+            call.args[0]
+            for call in scheduler.logger.info.call_args_list
+            if call.args and call.args[0].startswith("Scheduler replay event: ")
+        ]
+        wave = json.loads(replay_events[0].removeprefix("Scheduler replay event: "))
+        assert wave["event"] == "wave_assignment"
+        assert wave["group_ids"] == [10, 11]
+        assert [assignment["client_idx"] for assignment in wave["assignments"]] == [2, 1]
+
+        await safe_cancel_all([task])
+
+    asyncio.run(run())
+
+
+def test_wave_minimax_refill_pins_and_schedules_wave_without_cap():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        clients = [
+            vf.ClientConfig(
+                client_idx=1,
+                api_base_url="http://worker-a:8000/v1",
+                extra_headers={"X-data-parallel-rank": "0"},
+            ),
+            vf.ClientConfig(
+                client_idx=2,
+                api_base_url="http://worker-a:8000/v1",
+                extra_headers={"X-data-parallel-rank": "1"},
+            ),
+        ]
+        examples = iter(
+            [
+                {"env_name": "math", "prompt": "problem-a"},
+                {"env_name": "math", "prompt": "problem-b"},
+            ]
+        )
+
+        class Env:
+            requires_group_scoring = False
+
+            async def run_rollout(self, **kwargs):
+                await asyncio.sleep(60)
+
+        scheduler.train_envs = SimpleNamespace(get=lambda env_name: Env())
+        scheduler.buffer = SimpleNamespace(sample_examples=lambda n: [next(examples)])
+        scheduler.inference_pool = SimpleNamespace(
+            train_clients=clients,
+            get_metrics=lambda: {},
+            get_client_metrics=lambda: {},
+        )
+        scheduler.request_picker = PrimeAwareRequestPicker(
+            wave_minimax_size=2,
+            long_output_cold_start_ratio=1.0,
+        )
+        scheduler.max_inflight_rollouts = 2
+        scheduler.rollouts_per_example = 1
+
+        await scheduler._fill_inflight_requests()
+
+        assert len(scheduler.inflight_requests) == 2
+        pinned_clients = [info.client_config for info in scheduler.inflight_requests.values()]
+        assert pinned_clients == clients
+        assert all(info.predicted_completion_tokens == 4096.0 for info in scheduler.inflight_requests.values())
+        assert all(info.completion_prediction_source == "cold_start" for info in scheduler.inflight_requests.values())
+        assert scheduler.metric_values["request_picker_wave_minimax_group_count"] == [2.0]
+
+        await safe_cancel_all(list(scheduler.inflight_requests))
+
+    asyncio.run(run())
