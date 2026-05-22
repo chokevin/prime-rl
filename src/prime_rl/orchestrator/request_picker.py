@@ -156,7 +156,6 @@ class PrimeAwareRequestPicker:
         waiting_backpressure_penalty: float = 0.0,
         decode_guardrail_ratio: float = 0.0,
         decode_guardrail_penalty: float = 0.0,
-        max_inflight_per_client: int | None = None,
         long_output_weight: float = 0.0,
         long_output_threshold_tokens: int | None = None,
     ):
@@ -179,7 +178,6 @@ class PrimeAwareRequestPicker:
         self.waiting_backpressure_penalty = waiting_backpressure_penalty
         self.decode_guardrail_ratio = decode_guardrail_ratio
         self.decode_guardrail_penalty = decode_guardrail_penalty
-        self.max_inflight_per_client = max_inflight_per_client
         self.long_output_weight = long_output_weight
         self.long_output_threshold_tokens = long_output_threshold_tokens
         self.last_score: float | None = None
@@ -195,9 +193,6 @@ class PrimeAwareRequestPicker:
         candidate_inflight = {
             client_identity(client): inflight.get(client_identity(client), 0) for client in candidates
         }
-        eligible_candidates = _filter_by_inflight_cap(candidates, candidate_inflight, self.max_inflight_per_client)
-        if eligible_candidates:
-            candidates = eligible_candidates
         min_inflight = min(candidate_inflight.values(), default=0)
         balanced_candidates = [
             client
@@ -577,7 +572,6 @@ def setup_request_picker(config) -> RequestPicker:
             waiting_backpressure_penalty=config.waiting_backpressure_penalty,
             decode_guardrail_ratio=config.decode_guardrail_ratio,
             decode_guardrail_penalty=config.decode_guardrail_penalty,
-            max_inflight_per_client=config.max_inflight_per_client,
             long_output_weight=config.long_output_weight,
             long_output_threshold_tokens=config.long_output_threshold_tokens,
         )
@@ -613,29 +607,3 @@ async def select_with_metrics(
         selected_score=float(selected_score) if isinstance(selected_score, (int, float)) else None,
         selected_score_components=selected_score_components if isinstance(selected_score_components, dict) else None,
     )
-
-
-def request_picker_inflight_cap(picker: RequestPicker) -> int | None:
-    cap = getattr(picker, "max_inflight_per_client", None)
-    return cap if isinstance(cap, int) else None
-
-
-def has_request_picker_capacity(
-    picker: RequestPicker,
-    candidates: list[vf.ClientConfig],
-    inflight: Mapping[ClientIdentity, int],
-) -> bool:
-    cap = request_picker_inflight_cap(picker)
-    if cap is None:
-        return True
-    return any(inflight.get(client_identity(client), 0) < cap for client in candidates)
-
-
-def _filter_by_inflight_cap(
-    candidates: list[vf.ClientConfig],
-    candidate_inflight: Mapping[ClientIdentity, int],
-    cap: int | None,
-) -> list[vf.ClientConfig]:
-    if cap is None:
-        return candidates
-    return [client for client in candidates if candidate_inflight.get(client_identity(client), 0) < cap]

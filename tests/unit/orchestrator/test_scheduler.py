@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import verifiers as vf
 
-from prime_rl.orchestrator.request_picker import DirectRequestPicker, PrimeAwareRequestPicker
+from prime_rl.orchestrator.request_picker import DirectRequestPicker
 from prime_rl.orchestrator.scheduler import GroupState, InflightRequest, Scheduler
 from prime_rl.utils.async_utils import safe_cancel, safe_cancel_all
 
@@ -475,55 +475,5 @@ def test_candidate_stats_include_completion_history_and_predicted_inflight_load(
         assert stats[identity].inflight_predicted_completion_tokens == 2048.0
 
         await safe_cancel_all([task])
-
-    asyncio.run(run())
-
-
-def test_select_request_client_backpressures_when_all_clients_hit_cap():
-    async def run() -> None:
-        scheduler = make_scheduler()
-        clients = [
-            vf.ClientConfig(
-                client_idx=1,
-                api_base_url="http://worker-a:8000/v1",
-                extra_headers={"X-data-parallel-rank": "0"},
-            ),
-            vf.ClientConfig(
-                client_idx=2,
-                api_base_url="http://worker-a:8000/v1",
-                extra_headers={"X-data-parallel-rank": "1"},
-            ),
-        ]
-        scheduler.inference_pool = SimpleNamespace(
-            train_clients=clients,
-            get_metrics=lambda: {},
-            get_client_metrics=lambda: {},
-        )
-        scheduler.request_picker = PrimeAwareRequestPicker(max_inflight_per_client=1)
-        scheduler.groups[1] = GroupState(example={"env_name": "math"}, rollouts_to_schedule=1)
-        tasks = [asyncio.create_task(asyncio.sleep(60)) for _ in clients]
-        scheduler.inflight_requests = {
-            task: InflightRequest(
-                off_policy_steps=0,
-                client_config=client,
-                env_name="math",
-                group_id=idx,
-                request_started_at=1.0,
-            )
-            for idx, (task, client) in enumerate(zip(tasks, clients, strict=True))
-        }
-
-        client, selected_inflight = await scheduler._select_request_client(
-            1, scheduler.groups[1], "math", cache_salt="7"
-        )
-
-        assert client is None
-        assert selected_inflight == 0
-        assert scheduler.metric_values["request_picker_max_inflight_per_client"] == [1.0]
-        assert scheduler.metric_values["request_picker_inflight_capped_client_count"] == [2.0]
-        assert scheduler.metric_values["request_picker_inflight_available_client_count"] == [0.0]
-        assert scheduler.metric_values["request_picker_backpressure_all_clients_capped"] == [1.0]
-
-        await safe_cancel_all(tasks)
 
     asyncio.run(run())

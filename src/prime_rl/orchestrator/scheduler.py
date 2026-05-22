@@ -21,8 +21,6 @@ from prime_rl.orchestrator.request_picker import (
     client_identity,
     client_metric_label,
     endpoint_label_from_url,
-    has_request_picker_capacity,
-    request_picker_inflight_cap,
     select_with_metrics,
     setup_request_picker,
 )
@@ -484,18 +482,6 @@ class Scheduler:
     ) -> tuple[vf.ClientConfig | None, int]:
         clients = await self._get_train_clients()
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
-        inflight_cap = request_picker_inflight_cap(self.request_picker)
-        if inflight_cap is not None:
-            self._record_value("request_picker_max_inflight_per_client", float(inflight_cap))
-            capped_count = sum(inflight[self._client_identity(client)] >= inflight_cap for client in clients)
-            self._record_value("request_picker_inflight_capped_client_count", float(capped_count))
-            self._record_value(
-                "request_picker_inflight_available_client_count",
-                float(len(clients) - capped_count),
-            )
-            if not has_request_picker_capacity(self.request_picker, clients, inflight):
-                self._record_value("request_picker_backpressure_all_clients_capped", 1.0)
-                return None, 0
         self._ensure_group_prediction(group)
         context = RequestPickContext(
             env_name=env_name,
@@ -604,15 +590,6 @@ class Scheduler:
         selected_inflight = 0
         if group.pinned_client is not None:
             client_config = group.pinned_client
-            inflight_cap = request_picker_inflight_cap(self.request_picker)
-            if inflight_cap is not None:
-                inflight = Counter(
-                    self._client_identity(info.client_config) for info in self.inflight_requests.values()
-                )
-                if inflight[self._client_identity(client_config)] >= inflight_cap:
-                    self._record_value("request_picker_max_inflight_per_client", float(inflight_cap))
-                    self._record_value("request_picker_backpressure_pinned_client_capped", 1.0)
-                    return False
         else:
             client_config, selected_inflight = await self._select_request_client(group_id, group, env_name, cache_salt)
             if client_config is None:
