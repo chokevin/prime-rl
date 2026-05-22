@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import verifiers as vf
 
-from prime_rl.orchestrator.request_picker import DirectRequestPicker
+from prime_rl.orchestrator.request_picker import DirectRequestPicker, PrimeAwareRequestPicker
 from prime_rl.orchestrator.scheduler import GroupState, InflightRequest, Scheduler
 from prime_rl.utils.async_utils import safe_cancel, safe_cancel_all
 
@@ -55,6 +55,7 @@ def make_scheduler() -> Scheduler:
     scheduler.completion_tokens_by_client = defaultdict(list)
     scheduler.last_completion_tokens_by_client = {}
     scheduler.completion_tokens_by_fingerprint = defaultdict(list)
+    scheduler.completion_tokens_by_env = defaultdict(list)
     scheduler.group_wall_seconds_by_client = defaultdict(list)
     scheduler.last_group_wall_seconds_by_client = {}
     scheduler.group_tail_seconds_by_client = defaultdict(list)
@@ -445,6 +446,35 @@ def test_group_completion_history_predicts_future_completion_tokens():
 
     assert next_group.example_fingerprint == group.example_fingerprint
     assert next_group.predicted_completion_tokens == 4096.0
+    assert next_group.completion_prediction_source == "fingerprint"
+
+
+def test_env_completion_history_predicts_unknown_fingerprints_after_warmup():
+    scheduler = make_scheduler()
+    scheduler.completion_tokens_by_env["math"].extend([3072.0, 4096.0])
+
+    group = GroupState(
+        example={"env_name": "math", "prompt": "unseen problem"},
+        rollouts_to_schedule=1,
+    )
+    scheduler._ensure_group_prediction(group)
+
+    assert group.predicted_completion_tokens == 3584.0
+    assert group.completion_prediction_source == "env"
+
+
+def test_long_output_cold_start_ratio_predicts_without_history():
+    scheduler = make_scheduler()
+    scheduler.request_picker = PrimeAwareRequestPicker(long_output_cold_start_ratio=1.0)
+
+    group = GroupState(
+        example={"env_name": "math", "prompt": "cold start problem"},
+        rollouts_to_schedule=1,
+    )
+    scheduler._ensure_group_prediction(group)
+
+    assert group.predicted_completion_tokens == 4096.0
+    assert group.completion_prediction_source == "cold_start"
 
 
 def test_candidate_stats_include_completion_history_and_predicted_inflight_load():
@@ -473,6 +503,63 @@ def test_candidate_stats_include_completion_history_and_predicted_inflight_load(
         assert stats[identity].completion_tokens_mean == 2560.0
         assert stats[identity].completion_tokens_last == 4096.0
         assert stats[identity].inflight_predicted_completion_tokens == 2048.0
+
+        await safe_cancel_all([task])
+
+    asyncio.run(run())
+
+
+def test_long_output_cold_start_activates_candidate_score_metrics():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        clients = [
+            vf.ClientConfig(
+                client_idx=1,
+                api_base_url="http://worker-a:8000/v1",
+                extra_headers={"X-data-parallel-rank": "0"},
+            ),
+            vf.ClientConfig(
+                client_idx=2,
+                api_base_url="http://worker-a:8000/v1",
+                extra_headers={"X-data-parallel-rank": "1"},
+            ),
+        ]
+        scheduler.inference_pool = SimpleNamespace(
+            train_clients=clients,
+            get_metrics=lambda: {},
+            get_client_metrics=lambda: {},
+        )
+        scheduler.request_picker = PrimeAwareRequestPicker(
+            inflight_weight=0.0,
+            waiting_weight=0.0,
+            running_weight=0.0,
+            request_wall_weight=0.0,
+            group_wall_weight=0.0,
+            group_tail_weight=0.0,
+            off_policy_weight=0.0,
+            cancelled_weight=0.0,
+            decode_deficit_weight=0.0,
+            cache_usage_weight=0.0,
+            long_output_weight=4.0,
+            long_output_cold_start_ratio=1.0,
+        )
+        task = asyncio.create_task(asyncio.sleep(60))
+        scheduler.inflight_requests[task] = InflightRequest(
+            off_policy_steps=0,
+            client_config=clients[0],
+            env_name="math",
+            group_id=1,
+            request_started_at=1.0,
+            predicted_completion_tokens=4096.0,
+        )
+        scheduler.groups[2] = GroupState(example={"env_name": "math"}, rollouts_to_schedule=1)
+
+        client, _ = await scheduler._select_request_client(2, scheduler.groups[2], "math", cache_salt="7")
+
+        assert client == clients[1]
+        assert scheduler.groups[2].predicted_completion_tokens == 4096.0
+        assert scheduler.groups[2].completion_prediction_source == "cold_start"
+        assert scheduler.metric_values["request_picker_score_component/long_output/max"][0] > 0.0
 
         await safe_cancel_all([task])
 

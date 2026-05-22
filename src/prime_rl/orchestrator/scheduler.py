@@ -21,6 +21,7 @@ from prime_rl.orchestrator.request_picker import (
     client_identity,
     client_metric_label,
     endpoint_label_from_url,
+    request_picker_long_output_cold_start_ratio,
     select_with_metrics,
     setup_request_picker,
 )
@@ -138,6 +139,7 @@ class GroupState:
     slowest_request_client: vf.ClientConfig | None = None
     example_fingerprint: str | None = None
     predicted_completion_tokens: float | None = None
+    completion_prediction_source: str = "none"
 
 
 class Scheduler:
@@ -232,6 +234,7 @@ class Scheduler:
         self.completion_tokens_by_fingerprint: dict[str, deque[float]] = defaultdict(
             lambda: deque(maxlen=PICKER_HISTORY_SIZE)
         )
+        self.completion_tokens_by_env: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=PICKER_HISTORY_SIZE))
         self.group_wall_seconds_by_client: dict[ClientIdentity, deque[float]] = defaultdict(
             lambda: deque(maxlen=PICKER_HISTORY_SIZE)
         )
@@ -341,6 +344,7 @@ class Scheduler:
             group.slowest_request_client = rollout_info.client_config
         if group.example_fingerprint is not None:
             self.completion_tokens_by_fingerprint[group.example_fingerprint].append(float(completion_tokens))
+        self.completion_tokens_by_env[rollout_info.env_name].append(float(completion_tokens))
         identity = self._client_identity(rollout_info.client_config)
         self.completion_tokens_by_client[identity].append(float(completion_tokens))
         self.last_completion_tokens_by_client[identity] = float(completion_tokens)
@@ -462,17 +466,31 @@ class Scheduler:
             )
         return stats
 
-    def _predict_completion_tokens(self, example_fingerprint: str) -> float | None:
+    def _predict_completion_tokens(self, example_fingerprint: str, env_name: str | None) -> tuple[float | None, str]:
         completion_tokens = self.completion_tokens_by_fingerprint.get(example_fingerprint)
-        if not completion_tokens:
-            return None
-        return sum(completion_tokens) / len(completion_tokens)
+        if completion_tokens:
+            return sum(completion_tokens) / len(completion_tokens), "fingerprint"
 
-    def _ensure_group_prediction(self, group: GroupState) -> None:
+        if env_name is not None:
+            env_completion_tokens = self.completion_tokens_by_env.get(env_name)
+            if env_completion_tokens:
+                return sum(env_completion_tokens) / len(env_completion_tokens), "env"
+
+            max_completion_tokens = self._max_completion_tokens_for_env(env_name)
+            cold_start_ratio = request_picker_long_output_cold_start_ratio(self.request_picker)
+            if max_completion_tokens is not None and cold_start_ratio > 0:
+                return cold_start_ratio * max_completion_tokens, "cold_start"
+
+        return None, "none"
+
+    def _ensure_group_prediction(self, group: GroupState, env_name: str | None = None) -> None:
         if group.example_fingerprint is None:
             group.example_fingerprint = _example_fingerprint(group.example)
         if group.predicted_completion_tokens is None:
-            group.predicted_completion_tokens = self._predict_completion_tokens(group.example_fingerprint)
+            resolved_env_name = env_name or group.example.get("env_name")
+            group.predicted_completion_tokens, group.completion_prediction_source = self._predict_completion_tokens(
+                group.example_fingerprint, resolved_env_name
+            )
 
     def _max_completion_tokens_for_env(self, env_name: str) -> int | None:
         return self.max_completion_tokens_by_env.get(env_name, self.default_max_completion_tokens)
@@ -482,7 +500,7 @@ class Scheduler:
     ) -> tuple[vf.ClientConfig | None, int]:
         clients = await self._get_train_clients()
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
-        self._ensure_group_prediction(group)
+        self._ensure_group_prediction(group, env_name)
         context = RequestPickContext(
             env_name=env_name,
             group_id=group_id,
@@ -509,6 +527,7 @@ class Scheduler:
             selected_inflight = inflight[self._client_identity(client)]
             selected_score = float(selected_inflight)
             selected_score_components = None
+            score_component_stats = None
         else:
             result = await select_with_metrics(
                 self.request_picker,
@@ -523,6 +542,7 @@ class Scheduler:
             selected_inflight = result.selected_inflight
             selected_score = result.selected_score
             selected_score_components = result.selected_score_components
+            score_component_stats = result.score_component_stats
 
         self._record_value("request_picker_latency_seconds", latency_seconds)
         self._record_value("request_picker_selected_inflight", float(selected_inflight))
@@ -533,6 +553,9 @@ class Scheduler:
         if selected_score_components is not None:
             for component, value in selected_score_components.items():
                 self._record_value(f"request_picker_selected_score_component/{component}", value)
+        if score_component_stats is not None:
+            for component_stat, value in score_component_stats.items():
+                self._record_value(f"request_picker_score_component/{component_stat}", value)
         selected_metrics = candidate_stats.get(self._client_identity(client), CandidateStats()).endpoint_metrics or {}
         self._record_client_value(
             "scheduler/client_metrics_available",
@@ -612,6 +635,7 @@ class Scheduler:
             "rollout_request_completion_prediction_available",
             1.0 if group.predicted_completion_tokens is not None else 0.0,
         )
+        self._record_value(f"rollout_request_completion_prediction_source/{group.completion_prediction_source}", 1.0)
         if group.predicted_completion_tokens is not None:
             self._record_value("rollout_request_predicted_completion_tokens", group.predicted_completion_tokens)
             self._record_client_value(
@@ -693,13 +717,17 @@ class Scheduler:
 
         example = self.buffer.sample_examples(n=1)[0]
         example_fingerprint = _example_fingerprint(example)
+        predicted_completion_tokens, completion_prediction_source = self._predict_completion_tokens(
+            example_fingerprint, example.get("env_name")
+        )
         group_id = self.next_group_id
         self.next_group_id += 1
         self.groups[group_id] = GroupState(
             example=example,
             rollouts_to_schedule=self.rollouts_per_example,
             example_fingerprint=example_fingerprint,
-            predicted_completion_tokens=self._predict_completion_tokens(example_fingerprint),
+            predicted_completion_tokens=predicted_completion_tokens,
+            completion_prediction_source=completion_prediction_source,
         )
         if await self.schedule_rollout(group_id=group_id):
             return True

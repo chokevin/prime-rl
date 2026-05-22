@@ -413,6 +413,8 @@ def test_prime_aware_request_picker_spreads_predicted_long_outputs():
         assert result.client.client_idx == 1
         assert result.selected_score_components is not None
         assert result.selected_score_components["long_output"] == 0.0
+        assert result.score_component_stats is not None
+        assert result.score_component_stats["long_output/max"] > 0.0
 
     asyncio.run(run())
 

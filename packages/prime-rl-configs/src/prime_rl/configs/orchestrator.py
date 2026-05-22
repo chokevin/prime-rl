@@ -1064,6 +1064,18 @@ class PrimeAwareRequestPickerConfig(BaseConfig):
         ),
     ] = None
 
+    long_output_cold_start_ratio: Annotated[
+        float,
+        Field(
+            ge=0,
+            description=(
+                "Fallback completion-token prediction as a ratio of max_completion_tokens when no exact "
+                "fingerprint or env-level completion history exists. Only affects long-output placement when "
+                "long_output_weight is non-zero."
+            ),
+        ),
+    ] = 0.0
+
 
 class ExternalRequestPickerConfig(BaseConfig):
     """HTTP adapter for Prime-aware request picking outside the generation data path."""

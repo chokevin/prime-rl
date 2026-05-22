@@ -81,6 +81,7 @@ class RequestPickResult:
     selected_inflight: int
     selected_score: float | None = None
     selected_score_components: dict[str, float] | None = None
+    score_component_stats: dict[str, float] | None = None
 
 
 class RequestPicker(Protocol):
@@ -158,6 +159,7 @@ class PrimeAwareRequestPicker:
         decode_guardrail_penalty: float = 0.0,
         long_output_weight: float = 0.0,
         long_output_threshold_tokens: int | None = None,
+        long_output_cold_start_ratio: float = 0.0,
     ):
         self.inflight_slack = inflight_slack
         self.inflight_weight = inflight_weight
@@ -180,8 +182,10 @@ class PrimeAwareRequestPicker:
         self.decode_guardrail_penalty = decode_guardrail_penalty
         self.long_output_weight = long_output_weight
         self.long_output_threshold_tokens = long_output_threshold_tokens
+        self.long_output_cold_start_ratio = long_output_cold_start_ratio
         self.last_score: float | None = None
         self.last_score_components: dict[str, float] | None = None
+        self.last_score_component_stats: dict[str, float] | None = None
 
     async def select_client(
         self,
@@ -205,6 +209,7 @@ class PrimeAwareRequestPicker:
             )
             for client in balanced_candidates
         }
+        self.last_score_component_stats = _score_component_stats(score_components.values())
         scores = {identity: sum(components.values()) for identity, components in score_components.items()}
         client = min(
             balanced_candidates,
@@ -574,6 +579,7 @@ def setup_request_picker(config) -> RequestPicker:
             decode_guardrail_penalty=config.decode_guardrail_penalty,
             long_output_weight=config.long_output_weight,
             long_output_threshold_tokens=config.long_output_threshold_tokens,
+            long_output_cold_start_ratio=config.long_output_cold_start_ratio,
         )
     if config.type == "external":
         return ExternalRequestPicker(
@@ -598,6 +604,7 @@ async def select_with_metrics(
     attempts = getattr(picker, "last_attempts", 1)
     selected_score = getattr(picker, "last_score", None)
     selected_score_components = getattr(picker, "last_score_components", None)
+    score_component_stats = getattr(picker, "last_score_component_stats", None)
     return RequestPickResult(
         client=client,
         latency_seconds=latency,
@@ -606,4 +613,23 @@ async def select_with_metrics(
         selected_inflight=inflight.get(client_identity(client), 0),
         selected_score=float(selected_score) if isinstance(selected_score, (int, float)) else None,
         selected_score_components=selected_score_components if isinstance(selected_score_components, dict) else None,
+        score_component_stats=score_component_stats if isinstance(score_component_stats, dict) else None,
     )
+
+
+def request_picker_long_output_cold_start_ratio(picker: RequestPicker) -> float:
+    ratio = getattr(picker, "long_output_cold_start_ratio", 0.0)
+    return float(ratio) if isinstance(ratio, (int, float)) and ratio > 0 else 0.0
+
+
+def _score_component_stats(component_values: Iterable[Mapping[str, float]]) -> dict[str, float]:
+    values_by_component: dict[str, list[float]] = {}
+    for components in component_values:
+        for component, value in components.items():
+            values_by_component.setdefault(component, []).append(value)
+
+    stats: dict[str, float] = {}
+    for component, values in values_by_component.items():
+        stats[f"{component}/mean"] = sum(values) / len(values)
+        stats[f"{component}/max"] = max(values)
+    return stats
