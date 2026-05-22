@@ -241,6 +241,19 @@ allow_async_level_gt_1 = true
 
 The orchestrator requires `strict_async_level = false` and `max_async_level <= max_off_policy_steps` for this mode.
 
+If an external launcher still hard-validates NCCL `max_async_level = 1`, keep the shared `max_async_level` at 1 and use the finite-run final-step drain knob instead:
+
+```toml
+max_async_level = 1
+
+[weight_broadcast]
+type = "nccl"
+allow_async_level_gt_1 = true
+final_step_async_level = 2
+```
+
+This skips the last two trainer NCCL broadcasts and makes the orchestrator stop chasing newer checkpoints during the matching final drain window. It still requires `strict_async_level = false` and `final_step_async_level <= max_off_policy_steps`.
+
 ### SFT hard distill override
 
 For hosted multi-tenant runs where the trainer image's `trainer.loss.type` is fixed, the orchestrator exposes a per-run override that forces SFT loss on every micro-batch without rebuilding the trainer. Set `orchestrator.use_sft_loss = true` alongside `orchestrator.teacher_rollout_model`; both must be configured together (the orchestrator validator enforces this). The orchestrator stamps each `TrainingSample.sft_loss = True`, which the trainer's `compute_loss` honors by dispatching to `sft_loss_fn` per batch — independent of the trainer's configured default loss.

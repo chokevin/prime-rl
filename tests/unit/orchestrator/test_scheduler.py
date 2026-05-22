@@ -18,7 +18,11 @@ def make_scheduler() -> Scheduler:
     scheduler.strict_async_level = False
     scheduler.step = 9
     scheduler.ckpt_step = 7
-    scheduler.config = SimpleNamespace(output_dir=Path("/tmp/prime-rl-test"))
+    scheduler.config = SimpleNamespace(
+        output_dir=Path("/tmp/prime-rl-test"),
+        max_steps=10,
+        weight_broadcast=SimpleNamespace(type="nccl", final_step_async_level=None),
+    )
     scheduler.logger = MagicMock()
     scheduler.checkpoint_ready = asyncio.Event()
     scheduler.checkpoint_ready.set()
@@ -149,6 +153,23 @@ def test_maybe_update_policy_reuses_inflight_update_after_cancellation():
         assert scheduler.ckpt_step == 8
 
     asyncio.run(run())
+
+
+def test_final_step_async_level_does_not_chase_newer_checkpoint():
+    scheduler = make_scheduler()
+    scheduler.config.weight_broadcast.final_step_async_level = 2
+
+    with patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=8):
+        assert scheduler._compute_next_ckpt_step() == 7
+
+
+def test_final_step_async_level_keeps_normal_checkpoint_before_drain():
+    scheduler = make_scheduler()
+    scheduler.step = 8
+    scheduler.config.weight_broadcast.final_step_async_level = 2
+
+    with patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=7):
+        assert scheduler._compute_next_ckpt_step() == 7
 
 
 def test_stop_cancels_inflight_policy_update_task():

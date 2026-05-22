@@ -866,6 +866,16 @@ class NCCLWeightBroadcastConfig(BaseModel):
             )
         ),
     ] = False
+    final_step_async_level: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Use this async level only for the finite-run final step drain. "
+                "When greater than max_async_level, the orchestrator stops chasing newer checkpoints in that drain window."
+            ),
+        ),
+    ] = None
     quantize_in_weight_transfer: Annotated[
         bool,
         Field(description="Use kernel-format FP8 quantized NCCL transfer for weight updates."),
@@ -1446,14 +1456,21 @@ class OrchestratorConfig(BaseConfig):
     @model_validator(mode="after")
     def nccl_max_async_level(self):
         if self.weight_broadcast.type == "nccl":
-            if not self.max_async_level == 1 and not self.weight_broadcast.allow_async_level_gt_1:
+            final_step_async_level = self.weight_broadcast.final_step_async_level or self.max_async_level
+            if (
+                self.max_async_level != 1 or final_step_async_level > self.max_async_level
+            ) and not self.weight_broadcast.allow_async_level_gt_1:
                 raise ValueError(
                     "max_async_level must be 1 for NCCL broadcast unless "
                     "weight_broadcast.allow_async_level_gt_1 is enabled"
                 )
-            if self.max_async_level > 1 and self.strict_async_level:
+            if final_step_async_level > self.max_async_level and self.max_steps is None:
+                raise ValueError("weight_broadcast.final_step_async_level requires max_steps")
+            if final_step_async_level > self.max_async_level and final_step_async_level >= self.max_steps:
+                raise ValueError("weight_broadcast.final_step_async_level must be < max_steps")
+            if final_step_async_level > 1 and self.strict_async_level:
                 raise ValueError("NCCL broadcast async levels above 1 require strict_async_level=false")
-            if self.max_async_level > 1 and self.max_async_level > self.max_off_policy_steps:
+            if final_step_async_level > 1 and final_step_async_level > self.max_off_policy_steps:
                 raise ValueError("max_async_level must be <= max_off_policy_steps")
         return self
 

@@ -267,6 +267,7 @@ def train(config: TrainerConfig):
                 progress_step=progress.step,
                 max_steps=config.max_steps,
                 max_async_level=config.max_async_level,
+                final_step_async_level=getattr(config.weight_broadcast, "final_step_async_level", None),
                 weight_broadcast_type=config.weight_broadcast.type,
             ):
                 broadcast_weights_start_time = time.perf_counter()

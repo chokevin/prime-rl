@@ -758,6 +758,16 @@ class NCCLWeightBroadcastConfig(BaseWeightBroadcastConfig):
             )
         ),
     ] = False
+    final_step_async_level: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Use this async level only for the finite-run final step drain. "
+                "When greater than max_async_level, the trainer skips that many final NCCL broadcasts."
+            ),
+        ),
+    ] = None
     # TODO: Should not be configurable, but auto-inferred
     inference_world_size: Annotated[int, Field(description="The number of GPUs used for inference.")] = 1
     quantize_in_weight_transfer: Annotated[
@@ -967,15 +977,20 @@ class TrainerConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_weight_broadcast_type(self):
-        if (
-            self.weight_broadcast.type == "nccl"
-            and self.max_async_level != 1
-            and not self.weight_broadcast.allow_async_level_gt_1
-        ):
-            raise ValueError(
-                "NCCL weight broadcast only works with async level 1 unless "
-                "weight_broadcast.allow_async_level_gt_1 is enabled"
-            )
+        if self.weight_broadcast.type == "nccl":
+            final_step_async_level = self.weight_broadcast.final_step_async_level or self.max_async_level
+            if (
+                self.max_async_level != 1 or final_step_async_level > self.max_async_level
+            ) and not self.weight_broadcast.allow_async_level_gt_1:
+                raise ValueError(
+                    "NCCL weight broadcast only works with async level 1 unless "
+                    "weight_broadcast.allow_async_level_gt_1 is enabled"
+                )
+            if final_step_async_level > self.max_async_level:
+                if self.max_steps is None:
+                    raise ValueError("weight_broadcast.final_step_async_level requires max_steps")
+                if final_step_async_level >= self.max_steps:
+                    raise ValueError("weight_broadcast.final_step_async_level must be < max_steps")
         return self
 
     @model_validator(mode="after")

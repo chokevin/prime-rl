@@ -299,6 +299,16 @@ class SharedWeightBroadcastConfig(BaseConfig):
             )
         ),
     ] = False
+    final_step_async_level: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Use this async level only for the finite-run final step drain. Experimental; pairs the "
+                "trainer's final NCCL broadcast skips with the orchestrator's final checkpoint choice."
+            ),
+        ),
+    ] = None
     quantize_in_weight_transfer: Annotated[
         bool,
         Field(
@@ -887,6 +897,7 @@ class RLConfig(BaseConfig):
                     port=self.weight_broadcast.port,
                     timeout=self.weight_broadcast.timeout,
                     allow_async_level_gt_1=self.weight_broadcast.allow_async_level_gt_1,
+                    final_step_async_level=self.weight_broadcast.final_step_async_level,
                     quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
                 )
                 self.orchestrator.weight_broadcast = OrchestratorNCCLWeightBroadcastConfig(
@@ -895,6 +906,7 @@ class RLConfig(BaseConfig):
                     timeout=self.weight_broadcast.timeout,
                     inference_world_size=inference_world_size,
                     allow_async_level_gt_1=self.weight_broadcast.allow_async_level_gt_1,
+                    final_step_async_level=self.weight_broadcast.final_step_async_level,
                     quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
                 )
             elif self.weight_broadcast.type == "filesystem":
@@ -912,7 +924,8 @@ class RLConfig(BaseConfig):
         if self.trainer.weight_broadcast.type != "nccl":
             return self
 
-        if self.trainer.max_async_level == 1:
+        final_step_async_level = self.trainer.weight_broadcast.final_step_async_level or self.trainer.max_async_level
+        if self.trainer.max_async_level == 1 and final_step_async_level == self.trainer.max_async_level:
             return self
 
         trainer_opt_in = self.trainer.weight_broadcast.allow_async_level_gt_1
@@ -922,12 +935,14 @@ class RLConfig(BaseConfig):
                 "NCCL weight broadcast only works with async level 1 unless "
                 "weight_broadcast.allow_async_level_gt_1 is enabled"
             )
+        if final_step_async_level > self.trainer.max_async_level:
+            if self.trainer.max_steps is None or self.orchestrator.max_steps is None:
+                raise ValueError("weight_broadcast.final_step_async_level requires max_steps")
+            if final_step_async_level >= self.trainer.max_steps:
+                raise ValueError("weight_broadcast.final_step_async_level must be < max_steps")
         if self.orchestrator.strict_async_level:
             raise ValueError("NCCL broadcast async levels above 1 require strict_async_level=false")
-        if (
-            self.orchestrator.max_async_level > 1
-            and self.orchestrator.max_async_level > self.orchestrator.max_off_policy_steps
-        ):
+        if final_step_async_level > self.orchestrator.max_off_policy_steps:
             raise ValueError("max_async_level must be <= max_off_policy_steps")
 
         return self

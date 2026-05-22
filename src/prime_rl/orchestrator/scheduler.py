@@ -210,6 +210,20 @@ class Scheduler:
         assert self.batch_size is not None
         return self.batch_size
 
+    def _effective_max_async_level(self) -> int:
+        weight_broadcast = self.config.weight_broadcast
+        final_step_async_level = (
+            weight_broadcast.final_step_async_level
+            if weight_broadcast.type == "nccl" and weight_broadcast.final_step_async_level is not None
+            else self.max_async_level
+        )
+        max_steps = self.config.max_steps
+        if max_steps is None or final_step_async_level <= self.max_async_level:
+            return self.max_async_level
+
+        last_broadcast_step = max(max_steps - final_step_async_level - 1, 0)
+        return max(self.max_async_level, self.step - last_broadcast_step)
+
     def get_batch_progress_increment(self, rollouts: list[vf.RolloutOutput]) -> int:
         if self.uses_token_batching:
             return sum(get_seq_len(rollout) for rollout in rollouts)
@@ -481,17 +495,19 @@ class Scheduler:
 
     def _compute_next_ckpt_step(self) -> int:
         latest_ckpt_step = get_latest_ckpt_step(get_broadcast_dir(self.config.output_dir)) or 0
-        async_away_ckpt_step = max(self.step - self.max_async_level, 0)
-        if self.strict_async_level:
+        effective_max_async_level = self._effective_max_async_level()
+        async_away_ckpt_step = max(self.step - effective_max_async_level, 0)
+        if self.strict_async_level or effective_max_async_level > self.max_async_level:
             return async_away_ckpt_step
         return max(async_away_ckpt_step, latest_ckpt_step)
 
     async def _apply_policy_update(self, next_ckpt_step: int) -> None:
-        async_away_ckpt_step = max(self.step - self.max_async_level, 0)
+        effective_max_async_level = self._effective_max_async_level()
+        async_away_ckpt_step = max(self.step - effective_max_async_level, 0)
         if next_ckpt_step == async_away_ckpt_step:
             self.logger.info(
                 f"Orchestrator paused: waiting for trainer process to complete checkpoint {next_ckpt_step} "
-                f"(>{self.max_async_level} step(s) ahead). Training is progressing normally."
+                f"(>{effective_max_async_level} step(s) ahead). Training is progressing normally."
             )
             self.checkpoint_ready.clear()
             wait_for_ckpt_start_time = time.perf_counter()

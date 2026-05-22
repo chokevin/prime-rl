@@ -209,6 +209,83 @@ def test_shared_nccl_async_level_above_one_propagates_opt_in_and_guards_orchestr
         )
 
 
+def test_nccl_final_step_async_level_uses_opt_in_with_default_max_async_level():
+    config = RLConfig.model_validate(
+        {
+            "max_steps": 10,
+            "max_async_level": 1,
+            "weight_broadcast": {
+                "type": "nccl",
+                "allow_async_level_gt_1": True,
+                "final_step_async_level": 2,
+            },
+            "trainer": {},
+            "orchestrator": {
+                "use_renderer": False,
+                "max_off_policy_steps": 4,
+                "strict_async_level": False,
+            },
+        }
+    )
+    assert config.trainer.max_async_level == 1
+    assert config.trainer.weight_broadcast.final_step_async_level == 2
+    assert config.orchestrator.max_async_level == 1
+    assert config.orchestrator.weight_broadcast.final_step_async_level == 2
+
+    with pytest.raises(ValidationError, match="allow_async_level_gt_1"):
+        RLConfig.model_validate(
+            {
+                "max_steps": 10,
+                "max_async_level": 1,
+                "weight_broadcast": {"type": "nccl", "final_step_async_level": 2},
+                "trainer": {},
+                "orchestrator": {
+                    "use_renderer": False,
+                    "max_off_policy_steps": 4,
+                    "strict_async_level": False,
+                },
+            }
+        )
+
+    with pytest.raises(ValidationError, match="strict_async_level=false"):
+        RLConfig.model_validate(
+            {
+                "max_steps": 10,
+                "max_async_level": 1,
+                "weight_broadcast": {
+                    "type": "nccl",
+                    "allow_async_level_gt_1": True,
+                    "final_step_async_level": 2,
+                },
+                "trainer": {},
+                "orchestrator": {
+                    "use_renderer": False,
+                    "max_off_policy_steps": 4,
+                    "strict_async_level": True,
+                },
+            }
+        )
+
+    with pytest.raises(ValidationError, match="max_async_level must be <= max_off_policy_steps"):
+        RLConfig.model_validate(
+            {
+                "max_steps": 10,
+                "max_async_level": 1,
+                "weight_broadcast": {
+                    "type": "nccl",
+                    "allow_async_level_gt_1": True,
+                    "final_step_async_level": 5,
+                },
+                "trainer": {},
+                "orchestrator": {
+                    "use_renderer": False,
+                    "max_off_policy_steps": 4,
+                    "strict_async_level": False,
+                },
+            }
+        )
+
+
 class NestedConfig(BaseConfig):
     lr: float = 1e-4
     weight_decay: float = 0.01
