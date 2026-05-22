@@ -530,6 +530,67 @@ class Scheduler:
         penalty += float(completed_rps_weight) * rate_deficit("completed_requests_per_s")
         return request_load * penalty
 
+    def _wave_minimax_prime_proxy_penalty(
+        self,
+        stats: CandidateStats,
+        all_stats: list[CandidateStats],
+        request_load: float,
+    ) -> float:
+        completed_rps_weight = getattr(self.request_picker, "completed_rps_deficit_weight", 0.0)
+        decode_penalty = getattr(self.request_picker, "decode_guardrail_penalty", 0.0)
+        if not isinstance(completed_rps_weight, (int, float)):
+            completed_rps_weight = 0.0
+        if not isinstance(decode_penalty, (int, float)):
+            decode_penalty = 0.0
+
+        def latency_excess(value: float | None, values: list[float | None]) -> float:
+            observed = [item for item in values if item is not None and item >= 0]
+            if value is None or len(observed) < 2:
+                return 0.0
+            reference = min(observed)
+            if value <= reference:
+                return 0.0
+            return (value - reference) / max(sum(observed) / len(observed), 1.0)
+
+        def inverse_rate_deficit(value: float, values: list[float]) -> float:
+            if value <= 0 or len(values) < 2:
+                return 0.0
+            best = max(values)
+            if best <= 0:
+                return 0.0
+            return max(best - value, 0.0) / best
+
+        def mean_or_latest(mean: float | None, latest: float | None) -> float | None:
+            return latest if latest is not None else mean
+
+        completed_counts = [float(candidate.completed_rollouts) for candidate in all_stats]
+        completed_rate_penalty = inverse_rate_deficit(float(stats.completed_rollouts), completed_counts)
+        wall_penalty = latency_excess(
+            mean_or_latest(stats.request_wall_seconds_mean, stats.request_wall_seconds_last),
+            [
+                mean_or_latest(candidate.request_wall_seconds_mean, candidate.request_wall_seconds_last)
+                for candidate in all_stats
+            ],
+        )
+        group_wall_penalty = latency_excess(
+            mean_or_latest(stats.group_wall_seconds_mean, stats.group_wall_seconds_last),
+            [
+                mean_or_latest(candidate.group_wall_seconds_mean, candidate.group_wall_seconds_last)
+                for candidate in all_stats
+            ],
+        )
+        completion_length_penalty = latency_excess(
+            mean_or_latest(stats.completion_tokens_mean, stats.completion_tokens_last),
+            [
+                mean_or_latest(candidate.completion_tokens_mean, candidate.completion_tokens_last)
+                for candidate in all_stats
+            ],
+        )
+
+        proxy_penalty = float(completed_rps_weight) * completed_rate_penalty
+        proxy_penalty += float(decode_penalty) * (wall_penalty + group_wall_penalty + completion_length_penalty)
+        return request_load * proxy_penalty
+
     def _new_group_from_example(self, example: dict) -> tuple[int, GroupState]:
         example_fingerprint = _example_fingerprint(example)
         predicted_completion_tokens, completion_prediction_source = self._predict_completion_tokens(
@@ -599,6 +660,11 @@ class Scheduler:
                         candidate_stats[self._client_identity(candidate)],
                         stats_list,
                         load,
+                    )
+                    + self._wave_minimax_prime_proxy_penalty(
+                        candidate_stats[self._client_identity(candidate)],
+                        stats_list,
+                        load,
                     ),
                     inflight[self._client_identity(candidate)] + assigned_counts[self._client_identity(candidate)],
                     candidate.client_idx,
@@ -606,6 +672,10 @@ class Scheduler:
             )
             identity = self._client_identity(client)
             assignment_penalties[group_id] = self._wave_minimax_throughput_penalty(
+                candidate_stats[identity],
+                stats_list,
+                load,
+            ) + self._wave_minimax_prime_proxy_penalty(
                 candidate_stats[identity],
                 stats_list,
                 load,

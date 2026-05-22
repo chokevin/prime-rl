@@ -778,6 +778,71 @@ def test_wave_minimax_assignment_uses_throughput_guardrails():
     asyncio.run(run())
 
 
+def test_wave_minimax_assignment_uses_prime_side_proxy_when_dp_metrics_are_ambiguous():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        clients = [
+            vf.ClientConfig(
+                client_idx=1,
+                api_base_url="http://shared-router:8000/v1",
+                extra_headers={"X-data-parallel-rank": "0"},
+            ),
+            vf.ClientConfig(
+                client_idx=2,
+                api_base_url="http://shared-router:8000/v1",
+                extra_headers={"X-data-parallel-rank": "1"},
+            ),
+        ]
+        slow_identity = Scheduler._client_identity(clients[0])
+        fast_identity = Scheduler._client_identity(clients[1])
+        scheduler.request_wall_seconds_by_client[slow_identity].extend([500.0])
+        scheduler.request_wall_seconds_by_client[fast_identity].extend([50.0])
+        scheduler.group_wall_seconds_by_client[slow_identity].extend([500.0])
+        scheduler.group_wall_seconds_by_client[fast_identity].extend([50.0])
+        scheduler.completion_tokens_by_client[slow_identity].extend([4096.0])
+        scheduler.completion_tokens_by_client[fast_identity].extend([512.0])
+        scheduler.completed_rollouts_by_client[slow_identity] = 1
+        scheduler.completed_rollouts_by_client[fast_identity] = 8
+        scheduler.inference_pool = SimpleNamespace(
+            train_clients=clients,
+            get_metrics=lambda: {},
+            get_client_metrics=lambda: {
+                "shared_router_8000": {
+                    "decode_throughput_tps": 100.0,
+                    "completed_requests_per_s": 2.0,
+                },
+            },
+        )
+        scheduler.request_picker = PrimeAwareRequestPicker(
+            wave_minimax_size=2,
+            decode_guardrail_ratio=0.1,
+            decode_guardrail_penalty=8.0,
+            completed_rps_deficit_weight=8.0,
+        )
+        scheduler.groups[10] = GroupState(
+            example={"env_name": "math"},
+            rollouts_to_schedule=1,
+            predicted_completion_tokens=4096.0,
+            completion_prediction_source="cold_start",
+        )
+
+        assignments = await scheduler._assign_wave_minimax_clients([10])
+
+        assert assignments[10] == clients[1]
+        stats = scheduler._candidate_stats(clients)
+        assert stats[slow_identity].endpoint_metrics == stats[fast_identity].endpoint_metrics
+        replay_events = [
+            call.args[0]
+            for call in scheduler.logger.info.call_args_list
+            if call.args and call.args[0].startswith("Scheduler replay event: ")
+        ]
+        wave = json.loads(replay_events[0].removeprefix("Scheduler replay event: "))
+        assert wave["assignments"][0]["client_idx"] == 2
+        assert wave["assignments"][0]["throughput_penalty"] == 0.0
+
+    asyncio.run(run())
+
+
 def test_wave_minimax_refill_pins_and_schedules_wave_without_cap():
     async def run() -> None:
         scheduler = make_scheduler()
