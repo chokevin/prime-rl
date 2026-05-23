@@ -104,6 +104,49 @@ def test_orchestrator_prime_aware_request_picker_config():
     assert config.experimental.request_picker.wave_overhang_start_progress == 0.75
 
 
+def test_throughput_guarded_wave_requires_admin_base_url_for_dp_router_metrics():
+    with pytest.raises(ValidationError, match="requires client.admin_base_url"):
+        OrchestratorConfig.model_validate(
+            {
+                "use_renderer": False,
+                "collect_inference_metrics": True,
+                "client": {
+                    "base_url": ["http://router:8000/v1"],
+                    "dp_rank_count": 4,
+                },
+                "experimental": {
+                    "request_picker": {
+                        "type": "prime_aware",
+                        "wave_minimax_size": 32,
+                        "decode_guardrail_penalty": 8.0,
+                        "completed_rps_deficit_weight": 8.0,
+                    }
+                },
+            }
+        )
+
+    config = OrchestratorConfig.model_validate(
+        {
+            "use_renderer": False,
+            "collect_inference_metrics": True,
+            "client": {
+                "base_url": ["http://router:8000/v1"],
+                "admin_base_url": ["http://worker-a:8100", "http://worker-b:8100"],
+                "dp_rank_count": 4,
+            },
+            "experimental": {
+                "request_picker": {
+                    "type": "prime_aware",
+                    "wave_minimax_size": 32,
+                    "decode_guardrail_penalty": 8.0,
+                    "completed_rps_deficit_weight": 8.0,
+                }
+            },
+        }
+    )
+    assert config.client.admin_base_url == ["http://worker-a:8100", "http://worker-b:8100"]
+
+
 def test_nccl_async_level_above_one_requires_explicit_opt_in():
     with pytest.raises(ValidationError, match="allow_async_level_gt_1"):
         TrainerConfig.model_validate(

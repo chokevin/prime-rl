@@ -1496,6 +1496,30 @@ class OrchestratorConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
+    def validate_throughput_wave_metrics(self):
+        picker = self.experimental.request_picker
+        if picker.type != "prime_aware":
+            return self
+        if not self.collect_inference_metrics:
+            return self
+        uses_throughput_guarded_wave = picker.wave_minimax_size > 1 and (
+            picker.decode_guardrail_penalty > 0
+            or picker.completed_rps_deficit_weight > 0
+            or picker.waiting_backpressure_penalty > 0
+        )
+        if not uses_throughput_guarded_wave:
+            return self
+        if self.client.dp_rank_count <= 1:
+            return self
+        if self.client.admin_base_url:
+            return self
+        raise ValueError(
+            "Throughput-guarded wave_minimax with client.dp_rank_count > 1 requires client.admin_base_url "
+            "when collect_inference_metrics is true. Otherwise the collector polls the shared rollout "
+            "base_url/router and scheduler candidates receive no backend vLLM throughput metrics."
+        )
+
+    @model_validator(mode="after")
     def validate_renderer_vs_vlm(self):
         """The renderer client takes plain message dicts and tokenizes
         them client-side. VLMs need server-side image preprocessing and
