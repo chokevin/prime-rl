@@ -1088,6 +1088,30 @@ class PrimeAwareRequestPickerConfig(BaseConfig):
         ),
     ] = 0
 
+    wave_overhang_limit: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "When >0 with wave_minimax_size enabled, reduce or stop refill waves after the current step has "
+                "dispatched this many more requests than have completed. This is an adaptive late-drain guard, "
+                "not a replacement for max_inflight_rollouts."
+            ),
+        ),
+    ] = 0
+
+    wave_overhang_start_progress: Annotated[
+        float,
+        Field(
+            ge=0,
+            le=1,
+            description=(
+                "Batch progress fraction at which wave_overhang_limit starts applying. Use values below 1.0 to "
+                "cap late-step overhang while leaving the initial fill unchanged."
+            ),
+        ),
+    ] = 1.0
+
 
 class ExternalRequestPickerConfig(BaseConfig):
     """HTTP adapter for Prime-aware request picking outside the generation data path."""

@@ -88,6 +88,8 @@ def test_orchestrator_prime_aware_request_picker_config():
                     "decode_deficit_weight": 0.5,
                     "history_penalty_cap": 2.0,
                     "wave_minimax_size": 16,
+                    "wave_overhang_limit": 8,
+                    "wave_overhang_start_progress": 0.75,
                 }
             },
         }
@@ -98,6 +100,8 @@ def test_orchestrator_prime_aware_request_picker_config():
     assert config.experimental.request_picker.decode_deficit_weight == 0.5
     assert config.experimental.request_picker.history_penalty_cap == 2.0
     assert config.experimental.request_picker.wave_minimax_size == 16
+    assert config.experimental.request_picker.wave_overhang_limit == 8
+    assert config.experimental.request_picker.wave_overhang_start_progress == 0.75
 
 
 def test_nccl_async_level_above_one_requires_explicit_opt_in():

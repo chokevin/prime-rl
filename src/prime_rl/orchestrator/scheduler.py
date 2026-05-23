@@ -6,6 +6,7 @@ import json
 import time
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 import verifiers as vf
 from aiolimiter import AsyncLimiter
@@ -23,6 +24,8 @@ from prime_rl.orchestrator.request_picker import (
     endpoint_label_from_url,
     request_picker_long_output_cold_start_ratio,
     request_picker_wave_minimax_size,
+    request_picker_wave_overhang_limit,
+    request_picker_wave_overhang_start_progress,
     select_with_metrics,
     setup_request_picker,
 )
@@ -58,6 +61,39 @@ SCHEDULER_INSTRUMENTATION_KEYS = {
 }
 
 PICKER_HISTORY_SIZE = 128
+
+SUM_ENDPOINT_METRICS = {
+    "completed_requests_per_s",
+    "decode_throughput_tps",
+    "num_requests_running",
+    "num_requests_waiting",
+    "prefill_throughput_tps",
+}
+MAX_ENDPOINT_METRICS = {
+    "gpu_cache_usage_perc",
+    "gpu_prefix_cache_hit_rate",
+}
+
+
+def endpoint_host_label_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    host = parsed.hostname or (parsed.netloc or parsed.path).split(":")[0]
+    return host.replace(".", "_").replace("-", "_")
+
+
+def merge_endpoint_metric_snapshots(snapshots: list[dict[str, float]]) -> dict[str, float]:
+    merged: dict[str, float] = {}
+    for snapshot in snapshots:
+        for name, value in snapshot.items():
+            if not isinstance(value, (int, float)):
+                continue
+            if name in MAX_ENDPOINT_METRICS:
+                merged[name] = max(merged.get(name, 0.0), float(value))
+            elif name in SUM_ENDPOINT_METRICS:
+                merged[name] = merged.get(name, 0.0) + float(value)
+            else:
+                merged[name] = float(value)
+    return merged
 
 
 def _example_fingerprint(example: dict) -> str:
@@ -208,6 +244,8 @@ class Scheduler:
         self.next_dispatch_wave_id = 0
         self.next_refill_wave_id = 0
         self.current_refill_wave_id = 0
+        self.step_dispatched_requests = 0
+        self.step_completed_requests = 0
         self.groups: dict[int, GroupState] = {}
 
         self.step, self.ckpt_step = 0, 0
@@ -368,6 +406,8 @@ class Scheduler:
             "num_requests_waiting": metrics.get("num_requests_waiting"),
             "gpu_cache_usage_perc": metrics.get("gpu_cache_usage_perc"),
             "metrics_available": metrics.get("metrics_available", 0.0),
+            "metrics_scope_endpoint_exact": metrics.get("metrics_scope_endpoint_exact", 0.0),
+            "metrics_scope_host_match_count": metrics.get("metrics_scope_host_match_count", 0.0),
             "metrics_scope_dp_rank_precise": metrics.get("metrics_scope_dp_rank_precise", 0.0),
             "metrics_scope_base_url_client_count": metrics.get("metrics_scope_base_url_client_count", 0.0),
         }
@@ -479,6 +519,26 @@ class Scheduler:
             return group.predicted_completion_tokens
         max_completion_tokens = self._max_completion_tokens_for_env(group.example["env_name"])
         return float(max_completion_tokens or 1)
+
+    def _endpoint_metrics_for_client(
+        self,
+        client: vf.ClientConfig,
+        endpoint_metrics: dict[str, dict[str, float]],
+    ) -> tuple[dict[str, float], float, float]:
+        endpoint_label = endpoint_label_from_url(client.api_base_url)
+        exact = endpoint_metrics.get(endpoint_label)
+        if exact:
+            return dict(exact), 1.0, 1.0
+
+        host_label = endpoint_host_label_from_url(client.api_base_url)
+        host_matches = [
+            snapshot
+            for label, snapshot in endpoint_metrics.items()
+            if label == host_label or label.startswith(f"{host_label}_")
+        ]
+        if not host_matches:
+            return {}, 0.0, 0.0
+        return merge_endpoint_metric_snapshots(host_matches), 0.0, float(len(host_matches))
 
     def _wave_minimax_throughput_penalty(
         self,
@@ -833,11 +893,15 @@ class Scheduler:
             tail_times = self.group_tail_seconds_by_client.get(identity, [])
             off_policy_steps = self.off_policy_steps_by_client.get(identity, [])
             endpoint_label = endpoint_label_from_url(client.api_base_url)
-            endpoint_metric_snapshot = dict(endpoint_metrics.get(endpoint_label, {}))
+            endpoint_metric_snapshot, endpoint_exact_match, host_match_count = self._endpoint_metrics_for_client(
+                client, endpoint_metrics
+            )
             metrics_available = float(bool(endpoint_metric_snapshot))
             endpoint_metric_snapshot["metrics_available"] = metrics_available
+            endpoint_metric_snapshot["metrics_scope_endpoint_exact"] = endpoint_exact_match
+            endpoint_metric_snapshot["metrics_scope_host_match_count"] = host_match_count
             endpoint_metric_snapshot["metrics_scope_dp_rank_precise"] = float(
-                metrics_available > 0.0 and endpoint_client_counts[endpoint_label] == 1
+                metrics_available > 0.0 and endpoint_exact_match > 0.0 and endpoint_client_counts[endpoint_label] == 1
             )
             endpoint_metric_snapshot["metrics_scope_base_url_client_count"] = float(
                 endpoint_client_counts[endpoint_label]
@@ -1143,6 +1207,9 @@ class Scheduler:
             predicted_completion_tokens=group.predicted_completion_tokens,
             completion_prediction_source=group.completion_prediction_source,
         )
+        self.step_dispatched_requests += 1
+        self._record_value("request_picker_step_dispatched_requests", float(self.step_dispatched_requests))
+        self._record_value("request_picker_step_dispatch_overhang", float(self.step_dispatch_overhang))
         return True
 
     @property
@@ -1153,6 +1220,40 @@ class Scheduler:
     def inflight_sample_count(self) -> int:
         pending = sum(g.rollouts_to_schedule for g in self.groups.values())
         return self.inflight_rollout_count + pending
+
+    @property
+    def step_dispatch_overhang(self) -> int:
+        return max(self.step_dispatched_requests - self.step_completed_requests, 0)
+
+    def _effective_wave_minimax_size(self, wave_size: int, batch_progress: int | None) -> int:
+        limit = request_picker_wave_overhang_limit(self.request_picker)
+        if limit <= 0:
+            return wave_size
+
+        progress_fraction = 0.0
+        if batch_progress is not None and self.batch_target > 0:
+            progress_fraction = min(max(batch_progress / self.batch_target, 0.0), 1.0)
+
+        overhang = self.step_dispatch_overhang
+        self._record_value("request_picker_wave_overhang", float(overhang))
+        self._record_value("request_picker_wave_overhang_limit", float(limit))
+        self._record_value("request_picker_wave_overhang_progress", progress_fraction)
+
+        start_progress = request_picker_wave_overhang_start_progress(self.request_picker)
+        if progress_fraction < start_progress:
+            self._record_value("request_picker_wave_effective_size", float(wave_size))
+            return wave_size
+
+        remaining = limit - overhang
+        if remaining <= 0:
+            self._record_value("request_picker_wave_overhang_limited", 1.0)
+            self._record_value("request_picker_wave_effective_size", 0.0)
+            return 0
+
+        effective_size = min(wave_size, remaining)
+        self._record_value("request_picker_wave_overhang_limited", 1.0 if effective_size < wave_size else 0.0)
+        self._record_value("request_picker_wave_effective_size", float(effective_size))
+        return effective_size
 
     async def _schedule_next_request(self) -> bool:
         remaining_capacity = self.max_inflight_rollouts - self.inflight_rollout_count
@@ -1178,22 +1279,25 @@ class Scheduler:
         self.groups.pop(group_id, None)
         return False
 
-    async def _fill_inflight_requests(self) -> None:
+    async def _fill_inflight_requests(self, batch_progress: int | None = None) -> None:
         self.current_refill_wave_id = self.next_refill_wave_id
         self.next_refill_wave_id += 1
         wave_size = request_picker_wave_minimax_size(self.request_picker)
         if wave_size:
-            await self._fill_inflight_requests_wave_minimax(wave_size)
+            await self._fill_inflight_requests_wave_minimax(wave_size, batch_progress=batch_progress)
             return
         while await self._schedule_next_request():
             pass
 
-    async def _fill_inflight_requests_wave_minimax(self, wave_size: int) -> None:
+    async def _fill_inflight_requests_wave_minimax(self, wave_size: int, batch_progress: int | None = None) -> None:
         while True:
             remaining_capacity = self.max_inflight_rollouts - self.inflight_rollout_count
             if remaining_capacity <= 0:
                 return
-            group_ids = self._candidate_wave_groups(remaining_capacity, wave_size)
+            effective_wave_size = self._effective_wave_minimax_size(wave_size, batch_progress)
+            if effective_wave_size <= 0:
+                return
+            group_ids = self._candidate_wave_groups(remaining_capacity, effective_wave_size)
             if not group_ids:
                 return
             assignments = await self._assign_wave_minimax_clients(group_ids)
@@ -1324,6 +1428,8 @@ class Scheduler:
     async def generate_batch(self, step: int) -> list[vf.RolloutOutput]:
         """Continuously generates a batch of rollouts."""
         self.step = step
+        self.step_dispatched_requests = 0
+        self.step_completed_requests = 0
 
         if self.enable_policy_updates:
             # Cancel the previous update policy task to avoid concurrent updates
@@ -1353,7 +1459,7 @@ class Scheduler:
             refill_start = time.perf_counter()
             if self._last_refill_end_time is not None:
                 self._record_value("scheduler_refill_gap_seconds", refill_start - self._last_refill_end_time)
-            await self._fill_inflight_requests()
+            await self._fill_inflight_requests(batch_progress=batch_progress)
             self._last_refill_end_time = time.perf_counter()
             inflight_tasks = list(self.inflight_requests.keys())
 
@@ -1472,6 +1578,11 @@ class Scheduler:
                     group.rollouts_to_schedule += len(rollouts) - len(valid_rollouts)
                     group.completed_rollouts.extend(valid_rollouts)
                     if len(group.completed_rollouts) < self.rollouts_per_example:
+                        self.step_completed_requests += 1
+                        self._record_value(
+                            "request_picker_step_completed_requests", float(self.step_completed_requests)
+                        )
+                        self._record_value("request_picker_step_dispatch_overhang", float(self.step_dispatch_overhang))
                         self._log_completion_replay_event(
                             rollout_info=rollout_info,
                             group=group,
@@ -1510,6 +1621,9 @@ class Scheduler:
                         group_wall_seconds,
                         group_tail_seconds,
                     )
+                    self.step_completed_requests += 1
+                    self._record_value("request_picker_step_completed_requests", float(self.step_completed_requests))
+                    self._record_value("request_picker_step_dispatch_overhang", float(self.step_dispatch_overhang))
                     self._log_completion_replay_event(
                         rollout_info=rollout_info,
                         group=completed_group,
@@ -1556,7 +1670,7 @@ class Scheduler:
         refill_start = time.perf_counter()
         if self._last_refill_end_time is not None:
             self._record_value("scheduler_refill_gap_seconds", refill_start - self._last_refill_end_time)
-        await self._fill_inflight_requests()
+        await self._fill_inflight_requests(batch_progress=batch_progress)
         self._last_refill_end_time = time.perf_counter()
 
         batch_rollouts = self.finalize_batch_rollouts(batch_rollouts)

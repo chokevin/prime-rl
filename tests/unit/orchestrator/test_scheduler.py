@@ -29,6 +29,8 @@ def make_scheduler() -> Scheduler:
     scheduler.checkpoint_ready.set()
     scheduler.lora_name = None
     scheduler.model_name = "test-model"
+    scheduler.batch_size = 4
+    scheduler.token_batch_size = None
     scheduler.update_weights_time = 0
     scheduler.wait_for_ckpt_time = 0
     scheduler.inflight_rollouts_at_pause = 0
@@ -40,6 +42,8 @@ def make_scheduler() -> Scheduler:
     scheduler.next_dispatch_wave_id = 0
     scheduler.next_refill_wave_id = 0
     scheduler.current_refill_wave_id = 0
+    scheduler.step_dispatched_requests = 0
+    scheduler.step_completed_requests = 0
     scheduler.max_off_policy_steps = 1
     scheduler.cancelled_rollouts_count = 0
     scheduler.policy_update_lock = asyncio.Lock()
@@ -414,6 +418,37 @@ def test_candidate_stats_marks_endpoint_metrics_scope_for_dp_rank_clients():
         assert metrics["metrics_scope_dp_rank_precise"] == 0.0
         assert metrics["metrics_scope_base_url_client_count"] == 2.0
         assert metrics["num_requests_waiting"] == 2.0
+
+
+def test_candidate_stats_maps_backend_admin_metrics_to_router_clients_on_same_host():
+    scheduler = make_scheduler()
+    scheduler.inference_pool = SimpleNamespace(
+        get_metrics=lambda: {},
+        get_client_metrics=lambda: {
+            "worker_a_8100": {
+                "decode_throughput_tps": 100.0,
+                "completed_requests_per_s": 2.0,
+                "num_requests_waiting": 3.0,
+            }
+        },
+    )
+    client = vf.ClientConfig(
+        client_idx=1,
+        api_base_url="http://worker-a:8000/v1",
+        extra_headers={"X-data-parallel-rank": "0"},
+    )
+
+    stats = scheduler._candidate_stats([client])
+    metrics = stats[Scheduler._client_identity(client)].endpoint_metrics
+
+    assert metrics is not None
+    assert metrics["metrics_available"] == 1.0
+    assert metrics["metrics_scope_endpoint_exact"] == 0.0
+    assert metrics["metrics_scope_host_match_count"] == 1.0
+    assert metrics["metrics_scope_dp_rank_precise"] == 0.0
+    assert metrics["decode_throughput_tps"] == 100.0
+    assert metrics["completed_requests_per_s"] == 2.0
+    assert metrics["num_requests_waiting"] == 3.0
 
 
 def test_group_completion_history_predicts_future_completion_tokens():
@@ -897,3 +932,77 @@ def test_wave_minimax_refill_pins_and_schedules_wave_without_cap():
         await safe_cancel_all(list(scheduler.inflight_requests))
 
     asyncio.run(run())
+
+
+def test_wave_minimax_refill_stops_when_overhang_limit_is_reached_after_progress_gate():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        clients = [
+            vf.ClientConfig(
+                client_idx=1,
+                api_base_url="http://worker-a:8000/v1",
+                extra_headers={"X-data-parallel-rank": "0"},
+            ),
+            vf.ClientConfig(
+                client_idx=2,
+                api_base_url="http://worker-a:8000/v1",
+                extra_headers={"X-data-parallel-rank": "1"},
+            ),
+        ]
+        examples = iter(
+            [
+                {"env_name": "math", "prompt": "problem-a"},
+                {"env_name": "math", "prompt": "problem-b"},
+            ]
+        )
+
+        class Env:
+            requires_group_scoring = False
+
+            async def run_rollout(self, **kwargs):
+                await asyncio.sleep(60)
+
+        scheduler.train_envs = SimpleNamespace(get=lambda env_name: Env())
+        scheduler.buffer = SimpleNamespace(sample_examples=lambda n: [next(examples)])
+        scheduler.inference_pool = SimpleNamespace(
+            train_clients=clients,
+            get_metrics=lambda: {},
+            get_client_metrics=lambda: {},
+        )
+        scheduler.request_picker = PrimeAwareRequestPicker(
+            wave_minimax_size=2,
+            long_output_cold_start_ratio=1.0,
+            wave_overhang_limit=1,
+            wave_overhang_start_progress=0.5,
+        )
+        scheduler.max_inflight_rollouts = 2
+        scheduler.rollouts_per_example = 1
+        scheduler.batch_size = 4
+        scheduler.step_dispatched_requests = 3
+        scheduler.step_completed_requests = 2
+
+        await scheduler._fill_inflight_requests(batch_progress=2)
+
+        assert len(scheduler.inflight_requests) == 0
+        assert scheduler.metric_values["request_picker_wave_overhang_limited"] == [1.0]
+        assert scheduler.metric_values["request_picker_wave_effective_size"] == [0.0]
+
+    asyncio.run(run())
+
+
+def test_wave_minimax_refill_reduces_wave_to_overhang_headroom():
+    scheduler = make_scheduler()
+    scheduler.batch_size = 8
+    scheduler.step_dispatched_requests = 5
+    scheduler.step_completed_requests = 3
+    scheduler.request_picker = PrimeAwareRequestPicker(
+        wave_minimax_size=32,
+        wave_overhang_limit=5,
+        wave_overhang_start_progress=0.5,
+    )
+
+    assert scheduler._effective_wave_minimax_size(32, batch_progress=4) == 3
+    assert scheduler.metric_values["request_picker_wave_overhang"] == [2.0]
+    assert scheduler.metric_values["request_picker_wave_overhang_limit"] == [5.0]
+    assert scheduler.metric_values["request_picker_wave_overhang_limited"] == [1.0]
+    assert scheduler.metric_values["request_picker_wave_effective_size"] == [3.0]

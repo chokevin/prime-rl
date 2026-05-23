@@ -163,6 +163,8 @@ class PrimeAwareRequestPicker:
         long_output_threshold_tokens: int | None = None,
         long_output_cold_start_ratio: float = 0.0,
         wave_minimax_size: int = 0,
+        wave_overhang_limit: int = 0,
+        wave_overhang_start_progress: float = 1.0,
     ):
         self.inflight_slack = inflight_slack
         self.inflight_weight = inflight_weight
@@ -187,6 +189,8 @@ class PrimeAwareRequestPicker:
         self.long_output_threshold_tokens = long_output_threshold_tokens
         self.long_output_cold_start_ratio = long_output_cold_start_ratio
         self.wave_minimax_size = wave_minimax_size
+        self.wave_overhang_limit = wave_overhang_limit
+        self.wave_overhang_start_progress = wave_overhang_start_progress
         self.last_score: float | None = None
         self.last_score_components: dict[str, float] | None = None
         self.last_score_component_stats: dict[str, float] | None = None
@@ -589,6 +593,8 @@ def setup_request_picker(config) -> RequestPicker:
             long_output_threshold_tokens=config.long_output_threshold_tokens,
             long_output_cold_start_ratio=config.long_output_cold_start_ratio,
             wave_minimax_size=config.wave_minimax_size,
+            wave_overhang_limit=config.wave_overhang_limit,
+            wave_overhang_start_progress=config.wave_overhang_start_progress,
         )
     if config.type == "external":
         return ExternalRequestPicker(
@@ -640,6 +646,18 @@ def request_picker_long_output_cold_start_ratio(picker: RequestPicker) -> float:
 def request_picker_wave_minimax_size(picker: RequestPicker) -> int:
     size = getattr(picker, "wave_minimax_size", 0)
     return int(size) if isinstance(size, int) and size > 1 else 0
+
+
+def request_picker_wave_overhang_limit(picker: RequestPicker) -> int:
+    limit = getattr(picker, "wave_overhang_limit", 0)
+    return int(limit) if isinstance(limit, int) and limit > 0 else 0
+
+
+def request_picker_wave_overhang_start_progress(picker: RequestPicker) -> float:
+    progress = getattr(picker, "wave_overhang_start_progress", 1.0)
+    if not isinstance(progress, (int, float)):
+        return 1.0
+    return min(max(float(progress), 0.0), 1.0)
 
 
 def _score_component_stats(component_values: Iterable[Mapping[str, float]]) -> dict[str, float]:

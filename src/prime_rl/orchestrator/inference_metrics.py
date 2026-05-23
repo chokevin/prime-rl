@@ -113,6 +113,7 @@ class InferenceMetricsCollector:
         self._prev_server_counters: dict[tuple[str, str], tuple[float, float]] = {}
         self._prev_histograms: dict[str, tuple[float, float, float]] = {}
         self._task: asyncio.Task | None = None
+        self._last_unavailable_warning_at = 0.0
 
     async def start(self):
         wandb.define_metric("inference/*", step_metric="_timestamp")
@@ -140,6 +141,11 @@ class InferenceMetricsCollector:
                 return None
 
         results = await asyncio.gather(*[fetch(client) for client in self.admin_clients])
+        failed_fetch_count = sum(result is None for result in results)
+        if failed_fetch_count:
+            self._warn_metrics_unavailable(
+                f"{failed_fetch_count}/{len(self.admin_clients)} inference /metrics endpoint(s) did not respond"
+            )
 
         # For dual-agg gauges, collect per-server values to compute both max and mean
         dual_agg_values: dict[str, list[float]] = {}
@@ -188,7 +194,10 @@ class InferenceMetricsCollector:
                 agg_histograms[name] = (prev[0] + h_sum, prev[1] + h_count)
 
         if n_servers == 0:
+            self._warn_metrics_unavailable("no inference /metrics endpoints responded")
             return
+        if not any(values for values in endpoint_metrics.values()):
+            self._warn_metrics_unavailable("inference /metrics responded but no tracked vLLM metrics were parsed")
         if self.metric_sink is not None:
             self.metric_sink(endpoint_metrics)
 
@@ -279,3 +288,12 @@ class InferenceMetricsCollector:
             except asyncio.CancelledError:
                 pass
             self._task = None
+
+    def _warn_metrics_unavailable(self, reason: str) -> None:
+        now = time.monotonic()
+        if now - self._last_unavailable_warning_at < 60.0:
+            return
+        self._last_unavailable_warning_at = now
+        self.logger.warning(
+            f"Inference metrics unavailable ({reason}); request picker throughput/cache signals will be absent."
+        )
