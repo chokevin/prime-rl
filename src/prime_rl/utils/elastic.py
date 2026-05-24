@@ -139,6 +139,7 @@ class ElasticInferencePool:
         self._train_clients: list[vf.ClientConfig] = []
         self._eval_clients: list[vf.ClientConfig] = []
         self._client_urls: list[str] = []
+        self._client_metrics: dict[str, dict[str, float]] = {}
 
         self._eval_index = 0
 
@@ -509,10 +510,13 @@ class ElasticInferencePool:
 
         raise TimeoutError(f"Timed out waiting for {min_servers} ready servers (got {self.num_ready_servers})")
 
-    async def update_weights(self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0) -> None:
+    async def update_weights(
+        self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0
+    ) -> dict[str, float] | None:
         if lora_name is None:
             raise ValueError("Elastic inference pool requires LoRA training (lora_name must be set)")
         await self.sync_weights(weight_dir, lora_name, step)
+        return None
 
     def get_metrics(self) -> dict[str, float]:
         return {
@@ -520,3 +524,9 @@ class ElasticInferencePool:
             "elastic/num_ready_servers": self.num_ready_servers,
             "elastic/desired_step": self._desired.step,
         }
+
+    def update_client_metrics(self, metrics: dict[str, dict[str, float]]) -> None:
+        self._client_metrics = metrics
+
+    def get_client_metrics(self) -> dict[str, dict[str, float]]:
+        return self._client_metrics

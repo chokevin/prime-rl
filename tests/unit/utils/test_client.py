@@ -6,7 +6,7 @@ import httpx
 import verifiers as vf
 
 from prime_rl.configs.shared import ClientConfig
-from prime_rl.utils.client import _is_retryable_lora_error, load_lora_adapter, setup_clients
+from prime_rl.utils.client import _is_retryable_lora_error, load_lora_adapter, setup_clients, update_weights
 
 
 def test_is_retryable_lora_error_returns_true_for_404():
@@ -47,6 +47,39 @@ def test_load_lora_adapter_succeeds_on_first_attempt():
         json={"lora_name": "test-lora", "lora_path": "/test/path"},
         timeout=httpx.Timeout(connect=10.0, read=30.0, write=60.0, pool=10.0),
     )
+
+
+def test_update_weights_creates_durable_ready_marker_and_returns_split_metrics(tmp_path):
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        base_url = "http://worker-a:8000"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def post(self, path: str, **kwargs) -> FakeResponse:
+            self.calls.append((path, kwargs))
+            return FakeResponse()
+
+    async def run() -> None:
+        client = FakeClient()
+        weight_dir = tmp_path / "broadcasts" / "step_1"
+
+        metrics = await update_weights([client], weight_dir)
+
+        assert (weight_dir / "NCCL_READY").exists()
+        assert [path for path, _ in client.calls] == ["/pause", "/update_weights", "/resume"]
+        assert client.calls[1][1]["json"] == {"weight_dir": weight_dir.as_posix()}
+        assert "time/update_ready_marker" in metrics
+        assert "time/update_pause" in metrics
+        assert "time/update_fanout" in metrics
+        assert "time/update_resume" in metrics
+        assert "time/update_total" in metrics
+
+    asyncio.run(run())
 
 
 def test_setup_clients_assigns_renderer_and_dp_rank_headers():

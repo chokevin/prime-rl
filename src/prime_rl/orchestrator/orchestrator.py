@@ -261,7 +261,10 @@ async def orchestrate(config: OrchestratorConfig):
     # Start inference metrics collector (requires W&B)
     inference_metrics_collector = None
     if config.wandb is not None and config.collect_inference_metrics:
-        inference_metrics_collector = InferenceMetricsCollector(inference_pool.admin_clients)
+        inference_metrics_collector = InferenceMetricsCollector(
+            inference_pool.admin_clients,
+            metric_sink=inference_pool.update_client_metrics,
+        )
         await inference_metrics_collector.start()
 
     # Check health of teacher inference server if configured

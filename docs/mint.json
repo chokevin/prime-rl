@@ -13,6 +13,7 @@
                 "multi_run_manager",
                 "checkpointing",
                 "benchmarking",
+                "h200-rollout-tail-investigation",
                 "deployment",
                 "kubernetes",
                 "testing-moe-at-small-scale",

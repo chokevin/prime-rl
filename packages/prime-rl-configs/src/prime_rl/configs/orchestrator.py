@@ -857,6 +857,25 @@ class NCCLWeightBroadcastConfig(BaseModel):
     host: Annotated[str, Field(description="The host to use for the NCCL broadcast.")] = "localhost"
     port: Annotated[int, Field(description="The port to use for the NCCL broadcast.")] = 29501
     timeout: Annotated[int, Field(description="The timeout in seconds to use for the NCCL broadcast.")] = 1200
+    allow_async_level_gt_1: Annotated[
+        bool,
+        Field(
+            description=(
+                "Allow NCCL broadcast with max_async_level > 1. This is experimental and intended for finite "
+                "runs where the last async-level broadcasts can be safely skipped."
+            )
+        ),
+    ] = False
+    final_step_async_level: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Use this async level only for the finite-run final step drain. "
+                "When greater than max_async_level, the orchestrator stops chasing newer checkpoints in that drain window."
+            ),
+        ),
+    ] = None
     quantize_in_weight_transfer: Annotated[
         bool,
         Field(description="Use kernel-format FP8 quantized NCCL transfer for weight updates."),
@@ -876,8 +895,278 @@ WeightBroadcastConfig: TypeAlias = Annotated[
 ]
 
 
+class DirectRequestPickerConfig(BaseConfig):
+    """Default direct Prime scheduler selection with no routing seam behavior change."""
+
+    type: Literal["direct"] = "direct"
+
+
+class LeastLoadedRequestPickerConfig(BaseConfig):
+    """No-op in-process picker that reproduces Prime's direct least-loaded selection."""
+
+    type: Literal["least_loaded"] = "least_loaded"
+
+
+class PrimeAwareRequestPickerConfig(BaseConfig):
+    """In-process picker that scores Prime/vLLM straggler signals without an HTTP adapter boundary."""
+
+    type: Literal["prime_aware"] = "prime_aware"
+
+    inflight_slack: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Maximum in-flight rollout skew allowed above the least-loaded candidate before applying "
+                "Prime-aware history scoring."
+            ),
+        ),
+    ] = 2
+
+    inflight_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for Prime-tracked in-flight rollout requests on the candidate client."),
+    ] = 1.0
+
+    waiting_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for vLLM num_requests_waiting on the candidate endpoint."),
+    ] = 1.0
+
+    running_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for vLLM num_requests_running on the candidate endpoint."),
+    ] = 0.25
+
+    request_wall_weight: Annotated[
+        float,
+        Field(
+            ge=0,
+            description="Weight for normalized excess Prime rollout request wall time on the candidate client.",
+        ),
+    ] = 1.0
+
+    group_wall_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for normalized excess rollout group wall time on the candidate client."),
+    ] = 3.0
+
+    group_tail_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for normalized excess rollout group tail time on the candidate client."),
+    ] = 1.0
+
+    off_policy_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for recent off-policy completion level on the candidate client."),
+    ] = 0.25
+
+    cancelled_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for recent cancelled/off-policy rollouts on the candidate client."),
+    ] = 0.25
+
+    decode_deficit_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for normalized decode-throughput deficit versus the fastest candidate."),
+    ] = 2.0
+
+    completed_rps_deficit_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for normalized completed-request-rate deficit versus the fastest candidate."),
+    ] = 0.0
+
+    cache_usage_weight: Annotated[
+        float,
+        Field(ge=0, description="Weight for vLLM GPU cache usage percentage on the candidate endpoint."),
+    ] = 0.25
+
+    history_penalty_cap: Annotated[
+        float,
+        Field(
+            ge=0,
+            description="Maximum in-flight-equivalent score penalty contributed by request/group history.",
+        ),
+    ] = 4.0
+
+    group_tail_pressure_weight: Annotated[
+        float,
+        Field(
+            ge=0,
+            description=(
+                "Additional weight for avoiding clients with rollout-group tail history when older in-flight groups "
+                "make barrier closure more important."
+            ),
+        ),
+    ] = 0.0
+
+    group_tail_pressure_threshold_seconds: Annotated[
+        float,
+        Field(
+            ge=0,
+            description=(
+                "Oldest in-flight group age where group-tail pressure starts amplifying tail-history penalties."
+            ),
+        ),
+    ] = 60.0
+
+    waiting_backpressure_threshold: Annotated[
+        float | None,
+        Field(
+            ge=0,
+            description=(
+                "Optional vLLM waiting-request threshold above which the picker adds an explicit backpressure penalty."
+            ),
+        ),
+    ] = None
+
+    waiting_backpressure_penalty: Annotated[
+        float,
+        Field(ge=0, description="Penalty weight for candidates above waiting_backpressure_threshold."),
+    ] = 0.0
+
+    decode_guardrail_ratio: Annotated[
+        float,
+        Field(
+            ge=0,
+            le=1,
+            description=(
+                "Allowed decode-throughput regression versus the fastest candidate before applying the decode "
+                "guardrail penalty."
+            ),
+        ),
+    ] = 0.0
+
+    decode_guardrail_penalty: Annotated[
+        float,
+        Field(ge=0, description="Penalty weight for candidates that violate decode_guardrail_ratio."),
+    ] = 0.0
+
+    long_output_weight: Annotated[
+        float,
+        Field(
+            ge=0,
+            description=(
+                "Penalty weight for placing a predicted-long rollout group on clients that already have "
+                "predicted-long in-flight work or recent long completions."
+            ),
+        ),
+    ] = 0.0
+
+    long_output_threshold_tokens: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Completion-token prediction threshold for long-output placement. If unset, the picker uses "
+                "80% of the env's max_completion_tokens when that limit is known."
+            ),
+        ),
+    ] = None
+
+    long_output_cold_start_ratio: Annotated[
+        float,
+        Field(
+            ge=0,
+            description=(
+                "Fallback completion-token prediction as a ratio of max_completion_tokens when no exact "
+                "fingerprint or env-level completion history exists. Only affects long-output placement when "
+                "long_output_weight is non-zero."
+            ),
+        ),
+    ] = 0.0
+
+    wave_minimax_size: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "When >1, schedule refill requests in waves of this size and assign each wave to minimize "
+                "projected per-client predicted completion-token load. This is a soft placement policy, not "
+                "an admission cap."
+            ),
+        ),
+    ] = 0
+
+    wave_overhang_limit: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "When >0 with wave_minimax_size enabled, reduce or stop refill waves after the current step has "
+                "dispatched this many more requests than have completed. This is an adaptive late-drain guard, "
+                "not a replacement for max_inflight_rollouts."
+            ),
+        ),
+    ] = 0
+
+    wave_overhang_start_progress: Annotated[
+        float,
+        Field(
+            ge=0,
+            le=1,
+            description=(
+                "Batch progress fraction at which wave_overhang_limit starts applying. Use values below 1.0 to "
+                "cap late-step overhang while leaving the initial fill unchanged."
+            ),
+        ),
+    ] = 1.0
+
+
+class ExternalRequestPickerConfig(BaseConfig):
+    """HTTP adapter for Prime-aware request picking outside the generation data path."""
+
+    type: Literal["external"] = "external"
+
+    adapter_url: Annotated[
+        str,
+        Field(
+            description=(
+                "HTTP endpoint that accepts Prime's logical rollout-client candidates and returns one selected "
+                "candidate. This is an adapter boundary, not an llm-d/Envoy ext-proc endpoint."
+            )
+        ),
+    ]
+
+    timeout: Annotated[
+        float,
+        Field(gt=0, description="Timeout in seconds for request-picker adapter calls."),
+    ] = 1.0
+
+    max_attempts: Annotated[
+        int,
+        Field(ge=1, description="Maximum attempts for retryable request-picker adapter failures."),
+    ] = 3
+
+    retry_backoff: Annotated[
+        float,
+        Field(ge=0, description="Initial exponential backoff in seconds between retryable adapter failures."),
+    ] = 0.05
+
+
+RequestPickerConfig: TypeAlias = Annotated[
+    DirectRequestPickerConfig
+    | LeastLoadedRequestPickerConfig
+    | PrimeAwareRequestPickerConfig
+    | ExternalRequestPickerConfig,
+    Field(discriminator="type"),
+]
+
+
 class OrchestratorExperimentalConfig(BaseConfig):
     """Experimental features for the orchestrator."""
+
+    request_picker: Annotated[
+        RequestPickerConfig,
+        Field(
+            description=(
+                "Experimental rollout request picker. The default direct mode preserves Prime's existing "
+                "least-loaded scheduler path; least_loaded runs the same policy through the picker seam; "
+                "prime_aware is an in-process straggler-aware scorer; external calls an adapter while keeping "
+                "generation/admin traffic direct."
+            )
+        ),
+    ] = DirectRequestPickerConfig()
 
 
 class TeacherModelConfig(BaseConfig):
@@ -1207,6 +1496,30 @@ class OrchestratorConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
+    def validate_throughput_wave_metrics(self):
+        picker = self.experimental.request_picker
+        if picker.type != "prime_aware":
+            return self
+        if not self.collect_inference_metrics:
+            return self
+        uses_throughput_guarded_wave = picker.wave_minimax_size > 1 and (
+            picker.decode_guardrail_penalty > 0
+            or picker.completed_rps_deficit_weight > 0
+            or picker.waiting_backpressure_penalty > 0
+        )
+        if not uses_throughput_guarded_wave:
+            return self
+        if self.client.dp_rank_count <= 1:
+            return self
+        if self.client.admin_base_url:
+            return self
+        raise ValueError(
+            "Throughput-guarded wave_minimax with client.dp_rank_count > 1 requires client.admin_base_url "
+            "when collect_inference_metrics is true. Otherwise the collector polls the shared rollout "
+            "base_url/router and scheduler candidates receive no backend vLLM throughput metrics."
+        )
+
+    @model_validator(mode="after")
     def validate_renderer_vs_vlm(self):
         """The renderer client takes plain message dicts and tokenizes
         them client-side. VLMs need server-side image preprocessing and
@@ -1290,8 +1603,22 @@ class OrchestratorConfig(BaseConfig):
     @model_validator(mode="after")
     def nccl_max_async_level(self):
         if self.weight_broadcast.type == "nccl":
-            if not self.max_async_level == 1:
-                raise ValueError("max_async_level must be 1 for NCCL broadcast")
+            final_step_async_level = self.weight_broadcast.final_step_async_level or self.max_async_level
+            if (
+                self.max_async_level != 1 or final_step_async_level > self.max_async_level
+            ) and not self.weight_broadcast.allow_async_level_gt_1:
+                raise ValueError(
+                    "max_async_level must be 1 for NCCL broadcast unless "
+                    "weight_broadcast.allow_async_level_gt_1 is enabled"
+                )
+            if final_step_async_level > self.max_async_level and self.max_steps is None:
+                raise ValueError("weight_broadcast.final_step_async_level requires max_steps")
+            if final_step_async_level > self.max_async_level and final_step_async_level >= self.max_steps:
+                raise ValueError("weight_broadcast.final_step_async_level must be < max_steps")
+            if final_step_async_level > 1 and self.strict_async_level:
+                raise ValueError("NCCL broadcast async levels above 1 require strict_async_level=false")
+            if final_step_async_level > 1 and final_step_async_level > self.max_off_policy_steps:
+                raise ValueError("max_async_level must be <= max_off_policy_steps")
         return self
 
     @model_validator(mode="after")

@@ -227,6 +227,33 @@ Do not use `deployment.type = "multi_node"` for Ray. That remains the SLURM temp
 
 The accepted Ray-native weight update path reuses Prime-RL's HF-compatible filesystem broadcast by default; do not add `weight_broadcast.type = "ray"` unless a separate design proves a better full-model live update path.
 
+### NCCL async slack
+
+NCCL broadcast defaults to `max_async_level = 1`. Raising it requires an explicit opt-in because the trainer skips the final `max_async_level` NCCL broadcasts in finite runs; this can reduce final-step checkpoint/update exposure, but it makes the last rollouts more off-policy.
+
+```toml
+max_async_level = 2
+
+[weight_broadcast]
+type = "nccl"
+allow_async_level_gt_1 = true
+```
+
+The orchestrator requires `strict_async_level = false` and `max_async_level <= max_off_policy_steps` for this mode.
+
+If an external launcher still hard-validates NCCL `max_async_level = 1`, keep the shared `max_async_level` at 1 and use the finite-run final-step drain knob instead:
+
+```toml
+max_async_level = 1
+
+[weight_broadcast]
+type = "nccl"
+allow_async_level_gt_1 = true
+final_step_async_level = 2
+```
+
+This skips the last two trainer NCCL broadcasts and makes the orchestrator stop chasing newer checkpoints during the matching final drain window. It still requires `strict_async_level = false` and `final_step_async_level <= max_off_policy_steps`.
+
 ### SFT hard distill override
 
 For hosted multi-tenant runs where the trainer image's `trainer.loss.type` is fixed, the orchestrator exposes a per-run override that forces SFT loss on every micro-batch without rebuilding the trainer. Set `orchestrator.use_sft_loss = true` alongside `orchestrator.teacher_rollout_model`; both must be configured together (the orchestrator validator enforces this). The orchestrator stamps each `TrainingSample.sft_loss = True`, which the trainer's `compute_loss` honors by dispatching to `sft_loss_fn` per batch — independent of the trainer's configured default loss.
@@ -234,6 +261,60 @@ For hosted multi-tenant runs where the trainer image's `trainer.loss.type` is fi
 ### RL rollout client defaults
 
 For text-only RL rollouts, the orchestrator defaults to renderer-backed TITO (`use_renderer = true`). VLM configs must explicitly fall back to MITO (`use_renderer = false`) so image preprocessing and chat templating stay server-side. External teacher rollouts must also set `use_renderer = false`.
+
+### Experimental request picker
+
+The rollout request picker lives under `[orchestrator.experimental.request_picker]` and is a discriminated union:
+
+```toml
+# Default: direct Prime scheduler path, no behavior change.
+[orchestrator.experimental.request_picker]
+type = "direct"
+
+# No-op seam overhead test: same least-loaded policy through the picker interface.
+[orchestrator.experimental.request_picker]
+type = "least_loaded"
+
+# In-process straggler-aware scorer: no HTTP boundary, generation/admin stay direct.
+[orchestrator.experimental.request_picker]
+type = "prime_aware"
+inflight_slack = 2
+inflight_weight = 1.0
+waiting_weight = 1.0
+running_weight = 0.25
+request_wall_weight = 1.0
+group_wall_weight = 3.0
+group_tail_weight = 1.0
+off_policy_weight = 0.25
+cancelled_weight = 0.25
+decode_deficit_weight = 2.0
+completed_rps_deficit_weight = 0.0
+cache_usage_weight = 0.25
+history_penalty_cap = 4.0
+group_tail_pressure_weight = 0.0
+group_tail_pressure_threshold_seconds = 60.0
+waiting_backpressure_threshold = "None"
+waiting_backpressure_penalty = 0.0
+decode_guardrail_ratio = 0.0
+decode_guardrail_penalty = 0.0
+long_output_weight = 0.0
+long_output_threshold_tokens = "None"
+long_output_cold_start_ratio = 0.0
+wave_minimax_size = 0
+wave_overhang_limit = 0
+wave_overhang_start_progress = 1.0
+
+# External adapter: generation/admin traffic still goes directly to Prime-vLLM.
+[orchestrator.experimental.request_picker]
+type = "external"
+adapter_url = "http://picker.ray.svc.cluster.local/pick"
+timeout = 1.0
+max_attempts = 3
+retry_backoff = 0.05
+```
+
+Do not use this as an llm-d/Envoy data-path switch. The external picker receives Prime's logical rollout clients, in-flight counts, group/off-policy context, and recent per-endpoint metrics, then returns one candidate for Prime to use directly.
+The `prime_aware` picker uses the same Prime/vLLM signals in-process, so it is the preferred hill-climb variant when per-request external HTTP latency dominates. It first filters to candidates near the least-loaded in-flight count, then applies capped normalized request/group history penalties. This keeps DP-rank selection balanced when vLLM metrics are endpoint-level and identical across ranks. The optional tail/backpressure/guardrail knobs default off where they add new behavior; use them for H200 rollout-tail experiments that need to avoid clients with prior group-tail history, penalize high vLLM waiting queues, preserve decode throughput when raw completed-rps improves, or spread predicted-long completions away from clients with existing long-output load. Long-output placement uses exact example completion history first, then env-level completion history, then the opt-in `long_output_cold_start_ratio` fallback when no history exists. `wave_minimax_size > 1` enables soft refill-wave assignment that minimizes projected per-client predicted completion-token load; it does not hard-cap total in-flight requests. `wave_overhang_limit` can reduce the effective refill wave after `wave_overhang_start_progress` once step dispatches exceed completions by too much, limiting late terminal overhang without changing the global max-inflight cap.
 
 ### Model fields
 

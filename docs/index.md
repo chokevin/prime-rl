@@ -11,6 +11,7 @@ This directory maintains the documentation for PRIME-RL. It is organized into th
 - [**MultiRunManager**](multi_run_manager.md) - Multi-run training with the MultiRunManager object for concurrent LoRA adapters
 - [**Checkpointing**](checkpointing.md) - Saving and resuming training from checkpoints
 - [**Benchmarking**](benchmarking.md) - Performance benchmarking and throughput measurement
+- [**H200 rollout-tail investigation**](h200-rollout-tail-investigation.md) - Summary of Prime-RL / Prime-vLLM rollout-tail H200 findings and next steps
 - [**Deployment**](deployment.md) - Training deployment on single-GPU, multi-GPU, and multi-node clusters
 - [**Kubernetes**](kubernetes.md) - Deploying PRIME-RL on Kubernetes with Helm
 - [**Troubleshooting**](troubleshooting.md) - Common issues and their solutions

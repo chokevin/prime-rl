@@ -53,6 +53,288 @@ def test_load_configs(config_file: Path):
     assert any(could_parse), f"No config class could be parsed from {config_file}"
 
 
+def test_orchestrator_request_picker_config_defaults_to_direct():
+    config = OrchestratorConfig.model_validate({"use_renderer": False})
+    assert config.experimental.request_picker.type == "direct"
+
+
+def test_orchestrator_external_request_picker_config():
+    config = OrchestratorConfig.model_validate(
+        {
+            "use_renderer": False,
+            "experimental": {
+                "request_picker": {
+                    "type": "external",
+                    "adapter_url": "http://picker.local/pick",
+                    "timeout": 0.25,
+                }
+            },
+        }
+    )
+    assert config.experimental.request_picker.type == "external"
+    assert config.experimental.request_picker.adapter_url == "http://picker.local/pick"
+    assert config.experimental.request_picker.timeout == 0.25
+
+
+def test_orchestrator_prime_aware_request_picker_config():
+    config = OrchestratorConfig.model_validate(
+        {
+            "use_renderer": False,
+            "experimental": {
+                "request_picker": {
+                    "type": "prime_aware",
+                    "inflight_slack": 1,
+                    "waiting_weight": 2.0,
+                    "decode_deficit_weight": 0.5,
+                    "history_penalty_cap": 2.0,
+                    "wave_minimax_size": 16,
+                    "wave_overhang_limit": 8,
+                    "wave_overhang_start_progress": 0.75,
+                }
+            },
+        }
+    )
+    assert config.experimental.request_picker.type == "prime_aware"
+    assert config.experimental.request_picker.inflight_slack == 1
+    assert config.experimental.request_picker.waiting_weight == 2.0
+    assert config.experimental.request_picker.decode_deficit_weight == 0.5
+    assert config.experimental.request_picker.history_penalty_cap == 2.0
+    assert config.experimental.request_picker.wave_minimax_size == 16
+    assert config.experimental.request_picker.wave_overhang_limit == 8
+    assert config.experimental.request_picker.wave_overhang_start_progress == 0.75
+
+
+def test_throughput_guarded_wave_requires_admin_base_url_for_dp_router_metrics():
+    with pytest.raises(ValidationError, match="requires client.admin_base_url"):
+        OrchestratorConfig.model_validate(
+            {
+                "use_renderer": False,
+                "collect_inference_metrics": True,
+                "client": {
+                    "base_url": ["http://router:8000/v1"],
+                    "dp_rank_count": 4,
+                },
+                "experimental": {
+                    "request_picker": {
+                        "type": "prime_aware",
+                        "wave_minimax_size": 32,
+                        "decode_guardrail_penalty": 8.0,
+                        "completed_rps_deficit_weight": 8.0,
+                    }
+                },
+            }
+        )
+
+    config = OrchestratorConfig.model_validate(
+        {
+            "use_renderer": False,
+            "collect_inference_metrics": True,
+            "client": {
+                "base_url": ["http://router:8000/v1"],
+                "admin_base_url": ["http://worker-a:8100", "http://worker-b:8100"],
+                "dp_rank_count": 4,
+            },
+            "experimental": {
+                "request_picker": {
+                    "type": "prime_aware",
+                    "wave_minimax_size": 32,
+                    "decode_guardrail_penalty": 8.0,
+                    "completed_rps_deficit_weight": 8.0,
+                }
+            },
+        }
+    )
+    assert config.client.admin_base_url == ["http://worker-a:8100", "http://worker-b:8100"]
+
+
+def test_nccl_async_level_above_one_requires_explicit_opt_in():
+    with pytest.raises(ValidationError, match="allow_async_level_gt_1"):
+        TrainerConfig.model_validate(
+            {
+                "max_async_level": 2,
+                "weight_broadcast": {"type": "nccl"},
+            }
+        )
+
+    with pytest.raises(ValidationError, match="allow_async_level_gt_1"):
+        OrchestratorConfig.model_validate(
+            {
+                "use_renderer": False,
+                "max_async_level": 2,
+                "weight_broadcast": {"type": "nccl"},
+            }
+        )
+
+
+def test_nccl_async_level_above_one_opt_in_requires_non_strict_and_off_policy_capacity():
+    trainer = TrainerConfig.model_validate(
+        {
+            "max_async_level": 2,
+            "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
+        }
+    )
+    assert trainer.weight_broadcast.type == "nccl"
+    assert trainer.weight_broadcast.allow_async_level_gt_1
+
+    orchestrator = OrchestratorConfig.model_validate(
+        {
+            "use_renderer": False,
+            "max_async_level": 2,
+            "max_off_policy_steps": 2,
+            "strict_async_level": False,
+            "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
+        }
+    )
+    assert orchestrator.weight_broadcast.type == "nccl"
+    assert orchestrator.weight_broadcast.allow_async_level_gt_1
+
+    with pytest.raises(ValidationError, match="strict_async_level=false"):
+        OrchestratorConfig.model_validate(
+            {
+                "use_renderer": False,
+                "max_async_level": 2,
+                "strict_async_level": True,
+                "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
+            }
+        )
+
+    with pytest.raises(ValidationError, match="max_async_level must be <= max_off_policy_steps"):
+        OrchestratorConfig.model_validate(
+            {
+                "use_renderer": False,
+                "max_async_level": 5,
+                "max_off_policy_steps": 4,
+                "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
+            }
+        )
+
+
+def test_shared_nccl_async_level_above_one_propagates_opt_in_and_guards_orchestrator():
+    config = RLConfig.model_validate(
+        {
+            "max_async_level": 2,
+            "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
+            "trainer": {},
+            "orchestrator": {
+                "use_renderer": False,
+                "max_off_policy_steps": 2,
+                "strict_async_level": False,
+            },
+        }
+    )
+    assert config.trainer.max_async_level == 2
+    assert config.trainer.weight_broadcast.type == "nccl"
+    assert config.trainer.weight_broadcast.allow_async_level_gt_1
+    assert config.orchestrator.max_async_level == 2
+    assert config.orchestrator.weight_broadcast.type == "nccl"
+    assert config.orchestrator.weight_broadcast.allow_async_level_gt_1
+
+    with pytest.raises(ValidationError, match="allow_async_level_gt_1"):
+        RLConfig.model_validate(
+            {
+                "max_async_level": 2,
+                "weight_broadcast": {"type": "nccl"},
+                "trainer": {},
+                "orchestrator": {
+                    "use_renderer": False,
+                    "max_off_policy_steps": 2,
+                    "strict_async_level": False,
+                },
+            }
+        )
+
+    with pytest.raises(ValidationError, match="strict_async_level=false"):
+        RLConfig.model_validate(
+            {
+                "max_async_level": 2,
+                "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
+                "trainer": {},
+                "orchestrator": {
+                    "use_renderer": False,
+                    "max_off_policy_steps": 2,
+                    "strict_async_level": True,
+                },
+            }
+        )
+
+
+def test_nccl_final_step_async_level_uses_opt_in_with_default_max_async_level():
+    config = RLConfig.model_validate(
+        {
+            "max_steps": 10,
+            "max_async_level": 1,
+            "weight_broadcast": {
+                "type": "nccl",
+                "allow_async_level_gt_1": True,
+                "final_step_async_level": 2,
+            },
+            "trainer": {},
+            "orchestrator": {
+                "use_renderer": False,
+                "max_off_policy_steps": 4,
+                "strict_async_level": False,
+            },
+        }
+    )
+    assert config.trainer.max_async_level == 1
+    assert config.trainer.weight_broadcast.final_step_async_level == 2
+    assert config.orchestrator.max_async_level == 1
+    assert config.orchestrator.weight_broadcast.final_step_async_level == 2
+
+    with pytest.raises(ValidationError, match="allow_async_level_gt_1"):
+        RLConfig.model_validate(
+            {
+                "max_steps": 10,
+                "max_async_level": 1,
+                "weight_broadcast": {"type": "nccl", "final_step_async_level": 2},
+                "trainer": {},
+                "orchestrator": {
+                    "use_renderer": False,
+                    "max_off_policy_steps": 4,
+                    "strict_async_level": False,
+                },
+            }
+        )
+
+    with pytest.raises(ValidationError, match="strict_async_level=false"):
+        RLConfig.model_validate(
+            {
+                "max_steps": 10,
+                "max_async_level": 1,
+                "weight_broadcast": {
+                    "type": "nccl",
+                    "allow_async_level_gt_1": True,
+                    "final_step_async_level": 2,
+                },
+                "trainer": {},
+                "orchestrator": {
+                    "use_renderer": False,
+                    "max_off_policy_steps": 4,
+                    "strict_async_level": True,
+                },
+            }
+        )
+
+    with pytest.raises(ValidationError, match="max_async_level must be <= max_off_policy_steps"):
+        RLConfig.model_validate(
+            {
+                "max_steps": 10,
+                "max_async_level": 1,
+                "weight_broadcast": {
+                    "type": "nccl",
+                    "allow_async_level_gt_1": True,
+                    "final_step_async_level": 5,
+                },
+                "trainer": {},
+                "orchestrator": {
+                    "use_renderer": False,
+                    "max_off_policy_steps": 4,
+                    "strict_async_level": False,
+                },
+            }
+        )
+
+
 class NestedConfig(BaseConfig):
     lr: float = 1e-4
     weight_decay: float = 0.01
