@@ -38,7 +38,10 @@ COUNTER_RATE_NAMES = {
 
 # Histogram metrics: converted to average latency per interval
 HISTOGRAM_METRICS = {
+    "vllm:e2e_request_latency_seconds",
+    "vllm:inter_token_latency_seconds",
     "vllm:nixl_xfer_time_seconds",
+    "vllm:time_to_first_token_seconds",
 }
 
 _COUNTER_TOTAL_TO_NAME = {f"{name}_total": name for name in COUNTER_METRICS}
@@ -112,6 +115,7 @@ class InferenceMetricsCollector:
         self._prev_counters: dict[str, tuple[float, float]] = {}
         self._prev_server_counters: dict[tuple[str, str], tuple[float, float]] = {}
         self._prev_histograms: dict[str, tuple[float, float, float]] = {}
+        self._prev_server_histograms: dict[tuple[str, str], tuple[float, float, float]] = {}
         self._task: asyncio.Task | None = None
         self._last_unavailable_warning_at = 0.0
 
@@ -192,6 +196,23 @@ class InferenceMetricsCollector:
             for name, (h_sum, h_count) in histograms.items():
                 prev = agg_histograms.get(name, (0.0, 0.0))
                 agg_histograms[name] = (prev[0] + h_sum, prev[1] + h_count)
+                prev_server = self._prev_server_histograms.get((label, name))
+                self._prev_server_histograms[(label, name)] = (now, h_sum, h_count)
+                if prev_server is None:
+                    continue
+                prev_time, prev_sum, prev_count = prev_server
+                if now <= prev_time:
+                    continue
+                d_sum = h_sum - prev_sum
+                d_count = h_count - prev_count
+                if d_count < 0 or d_sum < 0:
+                    continue
+                if d_count > 0:
+                    short = name.removeprefix("vllm:")
+                    avg_name = f"{short}_avg_ms"
+                    avg_ms = (d_sum / d_count) * 1000.0
+                    endpoint_metrics[label][avg_name] = avg_ms
+                    skew_values.setdefault(avg_name, []).append(avg_ms)
 
         if n_servers == 0:
             self._warn_metrics_unavailable("no inference /metrics endpoints responded")
