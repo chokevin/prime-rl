@@ -123,6 +123,20 @@ Then run a dry-run/preflight that proves:
   non-null for at least one candidate after warmup
 - W&B/logs include `inference/server/<endpoint>/*` metrics
 
+The H200 harness owns this proof. The `h200-rl-lab` preflight branch adds the
+concrete gate script:
+
+```bash
+CONFIG="${CONFIG:-configs/prime-rl/phi4-reasoning-plus-math-16h200.toml}"
+export PRIME_RL_ADMIN_BASE_URLS="http://<backend-0>:8100 http://<backend-1>:8100"
+
+# Endpoint/config preflight.
+./scripts/preflight-vllm-metrics.py --config "$CONFIG"
+
+# Warmup output preflight.
+./scripts/preflight-vllm-metrics.py --output-dir "$OUTPUT_DIR" --warmup-step 1
+```
+
 Only after those gates pass should H200 spend another throughput-guarded
 wave/minimax row.
 
