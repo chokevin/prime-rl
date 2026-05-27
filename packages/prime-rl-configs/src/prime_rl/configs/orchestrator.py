@@ -3,7 +3,9 @@ import warnings
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, Field, model_serializer, model_validator
+from pydantic_core.core_schema import SerializerFunctionWrapHandler
+from renderers import AutoRendererConfig, RendererConfig
 
 from prime_rl.configs.shared import (
     BaseModelConfig,
@@ -12,7 +14,6 @@ from prime_rl.configs.shared import (
     HeartbeatConfig,
     LogConfig,
     PrimeMonitorConfig,
-    RendererConfig,
     TransportConfig,
     WandbWithExtrasConfig,
 )
@@ -21,105 +22,48 @@ from prime_rl.utils.config import BaseConfig
 
 
 class OptimizerConfig(BaseConfig):
-    """Per-run optimizer configuration for multi-run training."""
-
-    lr: Annotated[
-        float,
-        Field(
-            ge=0,
-            description="Learning rate for this run.",
-        ),
-    ] = 1e-4
+    lr: float = Field(1e-4, ge=0)
+    """Learning rate for this run (per-run override for multi-run training)."""
 
 
 class LoRAConfig(BaseConfig):
-    """Per-run LoRA configuration for multi-run training."""
+    name: str | None = None
+    """LoRA adapter name. If None, auto-generated from rank and alpha."""
 
-    name: Annotated[
-        str | None,
-        Field(
-            description="Name of the LoRA adapter. If None, auto-generated from rank and alpha.",
-        ),
-    ] = None
+    rank: int | None = Field(None, ge=1)
+    """LoRA rank for this run. Must be ≤ trainer's max rank. If None, uses the trainer's rank."""
 
-    rank: Annotated[
-        int | None,
-        Field(
-            ge=1,
-            description="LoRA rank for this run. Must be <= trainer's max rank. If None, uses trainer's rank.",
-        ),
-    ] = None
-
-    alpha: Annotated[
-        float | None,
-        Field(
-            ge=0,
-            description="LoRA alpha for this run. If None, uses trainer's alpha.",
-        ),
-    ] = None
+    alpha: float | None = Field(None, ge=0)
+    """LoRA alpha for this run. If None, uses the trainer's alpha."""
 
 
 class ModelConfig(BaseModelConfig):
-    """Extended model configuration with per-run LoRA settings."""
-
-    lora: Annotated[
-        LoRAConfig | None,
-        Field(
-            description="LoRA configuration. If None, LoRA is not used.",
-        ),
-    ] = None
+    lora: LoRAConfig | None = None
+    """Per-run LoRA configuration. If None, LoRA is disabled."""
 
 
 class TrainSamplingConfig(BaseConfig):
-    """Configures how tokens are sampled from the model for training. Largely follows the vLLM sampling parameters."""
+    temperature: float = Field(1.0, ge=0)
+    """Sampling temperature."""
 
-    temperature: Annotated[
-        float,
-        Field(
-            ge=0,
-            description="Temperature for sampling.",
-        ),
-    ] = 1.0
+    repetition_penalty: float = Field(1.0, ge=0)
+    """Repetition penalty. Values > 1.0 discourage repetition, < 1.0 encourage it, 1.0 disables."""
 
-    repetition_penalty: Annotated[
-        float,
-        Field(
-            ge=0,
-            description="Penalty for repeating tokens. Values > 1.0 discourage repetition, values < 1.0 encourage repetition, and 1.0 means no penalty.",
-        ),
-    ] = 1.0
+    max_completion_tokens: int | None = Field(
+        None, validation_alias=AliasChoices("max_completion_tokens", "max_tokens")
+    )
+    """Maximum output tokens per turn. If None, generates until max context length or EOS."""
 
-    max_completion_tokens: Annotated[
-        int | None,
-        Field(
-            validation_alias=AliasChoices("max_completion_tokens", "max_tokens"),
-            description="Maximum number of output tokens to generate per turn. If None, will generate until maximum context length or EOS token is hit.",
-        ),
-    ] = None
+    min_tokens: int = Field(0, ge=0)
+    """Minimum output tokens per sequence."""
 
-    min_tokens: Annotated[
-        int,
-        Field(
-            ge=0,
-            description="Minimum number of output tokens to generate per sequence.",
-        ),
-    ] = 0
-
-    seed: Annotated[
-        int | None,
-        Field(
-            description="Random seed to use for sampling. If None, no seeding is used.",
-        ),
-    ] = None
+    seed: int | None = None
+    """Random seed for sampling. If None, no seeding is used."""
 
     # Strictly speaking, extra_body is not a sampling parameter, but it is the
     # easiest way to pass arbitrary extra parameters to the server via verifiers
-    extra_body: Annotated[
-        dict[str, Any],
-        Field(
-            description="Extra body to pass with each request to the inference server. By default, it is set to an empty dictionary.",
-        ),
-    ] = {}
+    extra_body: dict[str, Any] = {}
+    """Extra body forwarded with each request to the inference server."""
 
     def to_sampling_args(self) -> dict[str, Any]:
         """Convert to OAI-compatible sampling args dict, omitting None values."""
@@ -159,64 +103,37 @@ class TrainSamplingConfig(BaseConfig):
 
 
 class EvalSamplingConfig(BaseConfig):
-    """Configures how tokens are sampled from the model for evaluation.
+    temperature: float | None = Field(None, ge=0)
+    """Sampling temperature. None defers to the inference server default."""
 
-    All sampling fields default to None, meaning the inference server's own
-    default is used. Only explicitly set fields are forwarded.
-    """
+    repetition_penalty: float | None = Field(None, ge=0)
+    """Repetition penalty. None defers to the inference server default."""
 
-    temperature: Annotated[
-        float | None,
-        Field(ge=0, description="Sampling temperature. None defers to the inference server default."),
-    ] = None
+    top_p: float | None = None
+    """Nucleus sampling threshold. None defers to the inference server default."""
 
-    repetition_penalty: Annotated[
-        float | None,
-        Field(ge=0, description="Repetition penalty. None defers to the inference server default."),
-    ] = None
+    top_k: int | None = None
+    """Top-k sampling. None defers to the inference server default."""
 
-    top_p: Annotated[
-        float | None,
-        Field(description="Nucleus sampling threshold. None defers to the inference server default."),
-    ] = None
+    min_p: float | None = Field(None, ge=0)
+    """Min-p sampling threshold. None defers to the inference server default."""
 
-    top_k: Annotated[
-        int | None,
-        Field(description="Top-k sampling. None defers to the inference server default."),
-    ] = None
+    max_completion_tokens: int | None = Field(
+        None, validation_alias=AliasChoices("max_completion_tokens", "max_tokens")
+    )
+    """Maximum output tokens per turn. None defers to the inference server default."""
 
-    min_p: Annotated[
-        float | None,
-        Field(ge=0, description="Min-p sampling threshold. None defers to the inference server default."),
-    ] = None
+    min_tokens: int | None = Field(None, ge=0)
+    """Minimum output tokens per sequence. None defers to the inference server default."""
 
-    max_completion_tokens: Annotated[
-        int | None,
-        Field(
-            validation_alias=AliasChoices("max_completion_tokens", "max_tokens"),
-            description="Maximum output tokens per turn. None defers to the inference server default.",
-        ),
-    ] = None
+    reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = None
+    """Reasoning effort constraint for reasoning models."""
 
-    min_tokens: Annotated[
-        int | None,
-        Field(ge=0, description="Minimum output tokens per sequence. None defers to the inference server default."),
-    ] = None
+    seed: int | None = None
+    """Random seed for sampling. None means no seeding."""
 
-    reasoning_effort: Annotated[
-        Literal["minimal", "low", "medium", "high"] | None,
-        Field(description="Reasoning effort constraint for reasoning models."),
-    ] = None
-
-    seed: Annotated[
-        int | None,
-        Field(description="Random seed for sampling. None means no seeding."),
-    ] = None
-
-    extra_body: Annotated[
-        dict[str, Any],
-        Field(description="Extra body parameters forwarded to the inference server."),
-    ] = {}
+    extra_body: dict[str, Any] = {}
+    """Extra body parameters forwarded to the inference server."""
 
     def to_sampling_args(self) -> dict[str, Any]:
         """Convert to OAI-compatible sampling args dict. Only includes non-None fields."""
@@ -260,82 +177,38 @@ class EvalSamplingConfig(BaseConfig):
 
 
 class EnvConfig(BaseConfig):
-    """Base environment configuration."""
+    id: str = "reverse-text"
+    """Registered verifiers environment ID (e.g. ``math-env``, ``primeintellect/math-env``). May include an ``@version`` suffix for installation."""
 
-    id: Annotated[
-        str,
-        Field(
-            description="Registered verifiers environment ID (e.g. 'math-env', 'primeintellect/math-env'). May include an @version suffix for installation."
-        ),
-    ] = "reverse-text"
+    name: str | None = None
+    """Display name for this environment in logs, metrics, and buffer keys. Defaults to the ``id`` without ``@version``. Must be unique across all envs in the same group."""
 
-    name: Annotated[
-        str | None,
-        Field(
-            description="Display name for this environment in logs, metrics, and buffer keys. Defaults to the id (without @version). Must be unique across all envs in the same group."
-        ),
-    ] = None
+    args: dict = {}
+    """Keyword arguments forwarded to ``vf.load_environment``. See the environment's docstring for accepted args."""
 
-    args: Annotated[
-        dict,
-        Field(
-            description="Keyword arguments forwarded to vf.load_environment. See the environment's docstring for accepted args."
-        ),
-    ] = {}
+    extra_env_kwargs: dict[str, Any] = {}
+    """Extra kwargs passed to the env (e.g. ``seq_len``, ``max_total_completion_tokens``). Auto-populated by the orchestrator; user overrides are generally discouraged. The main use case is matching ``extra_env_kwargs`` when running an env in an isolated environment server."""
 
-    extra_env_kwargs: Annotated[
-        dict[str, Any],
-        Field(
-            description=(
-                "Extra kwargs passed to an env (e.g. seq_len, max_total_completion_tokens). This field is auto-populated on the orchestrator for all envs. It is generally NOT recommended for this field to be overriden by the user. It's main use case is to match the extra_env_kwargs when running an env in an isolated environment server."
-            ),
-        ),
-    ] = {}
+    address: str | None = None
+    """ZMQ address of an external env server (e.g. ``tcp://host:5000``). When set, the orchestrator connects to this server instead of spawning one; when None, a subprocess env server is spawned automatically."""
 
-    address: Annotated[
-        str | None,
-        Field(
-            description="ZMQ address of an external env server (e.g. 'tcp://host:5000'). When set, the orchestrator connects to this server instead of spawning one. When None (default), a subprocess env server is spawned automatically."
-        ),
-    ] = None
+    num_workers: int | Literal["auto"] = "auto"
+    """Worker processes for the spawned env server. ``auto`` scales to 1 worker per 256 concurrent rollouts. Ignored when ``address`` is set."""
 
-    num_workers: Annotated[
-        int | Literal["auto"],
-        Field(
-            description="Number of worker processes for the spawned env server. 'auto' scales to 1 worker per 256 concurrent rollouts. Ignored when address is set (external server)."
-        ),
-    ] = "auto"
+    ratio: float | None = Field(None, gt=0)
+    """Sampling weight for this environment in the buffer. When None for all envs, samples uniformly across all available problems. When set, must be set on all envs — values are relative weights normalized to probabilities (e.g. [1, 1] and [0.5, 0.5] are equivalent)."""
 
-    ratio: Annotated[
-        float | None,
-        Field(
-            gt=0,
-            description="Sampling weight for this environment in the buffer. When None for all envs, samples uniformly across all available problems. When set, must be set on all envs — values are relative weights normalized to probabilities (e.g. [1, 1] and [0.5, 0.5] are equivalent).",
-        ),
-    ] = None
+    max_retries: int = Field(3, ge=0)
+    """Times the env server retries a failed rollout before returning an error."""
 
-    max_retries: Annotated[
-        int,
-        Field(ge=0, description="Number of times the env server retries a failed rollout before returning an error."),
-    ] = 0
+    max_total_completion_tokens: int = -1
+    """Maximum total completion tokens across all turns in a multi-turn rollout. ``-1`` disables. Auto-populated into ``extra_env_kwargs``."""
 
-    max_total_completion_tokens: Annotated[
-        int,
-        Field(
-            description=(
-                "Maximum total completion tokens across all turns in a multi-turn rollout. "
-                "Set to -1 (default) to disable. Auto-populated into extra_env_kwargs."
-            ),
-        ),
-    ] = -1
+    timeout: float | None = Field(None, validation_alias=AliasChoices("timeout", "timeout_seconds"))
+    """Per-rollout wall-clock timeout in seconds. None disables."""
 
-    timeout: Annotated[
-        float | None,
-        Field(
-            validation_alias=AliasChoices("timeout", "timeout_seconds"),
-            description="Per-rollout wall-clock timeout in seconds. Set to None (default) to disable.",
-        ),
-    ] = None
+    state_columns: list[str] = []
+    """Extra ``State`` fields to persist into the saved rollout records (in addition to the always-saved ``trajectory`` and ``sampling_args``). Values must be JSON-serializable."""
 
     @property
     def stripped_id(self) -> str:
@@ -367,68 +240,36 @@ class EnvConfig(BaseConfig):
 
 
 class TrainEnvConfig(EnvConfig):
-    """Configures a training environment."""
-
-    sampling: Annotated[
-        TrainSamplingConfig,
-        Field(
-            description="Per-env sampling overrides. Unset fields inherit from the group-level train sampling config.",
-        ),
-    ] = TrainSamplingConfig()
+    sampling: TrainSamplingConfig = TrainSamplingConfig()
+    """Per-env sampling overrides. Unset fields inherit from the group-level train sampling config."""
 
 
 class EvalEnvConfig(EnvConfig):
-    """Configures an evaluation environment."""
+    sampling: EvalSamplingConfig = EvalSamplingConfig()
+    """Per-env sampling overrides. Unset fields inherit from the group-level eval sampling config."""
 
-    sampling: Annotated[
-        EvalSamplingConfig,
-        Field(
-            description="Per-env sampling overrides. Unset fields inherit from the group-level eval sampling config.",
-        ),
-    ] = EvalSamplingConfig()
+    num_examples: int = -1
+    """Eval examples to sample from the dataset. ``-1`` uses all available examples."""
 
-    num_examples: Annotated[
-        int,
-        Field(
-            description="Number of eval examples to sample from the dataset. Set to -1 to use all available examples."
-        ),
-    ] = -1
+    group_size: int = Field(1, ge=1, validation_alias=AliasChoices("group_size", "rollouts_per_example"))
+    """Rollouts generated per example. Used for pass@k estimation (e.g. ``group_size=8`` enables pass@1 through pass@8)."""
 
-    rollouts_per_example: Annotated[
-        int,
-        Field(
-            ge=1,
-            description="Number of rollouts generated per example. Used for pass@k estimation (e.g. rollouts_per_example=8 enables pass@1 through pass@8).",
-        ),
-    ] = 1
-
-    interval: Annotated[
-        int,
-        Field(
-            ge=1,
-            description="Per-env eval interval. If unset, inherits from the group-level eval interval.",
-        ),
-    ] = 100
+    interval: int = Field(100, ge=1)
+    """Per-env eval interval. If unset, inherits from the group-level eval interval."""
 
 
 class TrainConfig(BaseConfig):
-    """Configures training environments and their shared sampling settings."""
-
     env: list[TrainEnvConfig] = [TrainEnvConfig()]
+    """Training environments."""
 
     sampling: TrainSamplingConfig = TrainSamplingConfig()
+    """Shared training sampling configuration."""
 
-    num_workers: Annotated[
-        int | Literal["auto"],
-        Field(
-            description="Default number of worker processes for env servers. Can be overridden per env.",
-        ),
-    ] = "auto"
+    num_workers: int | Literal["auto"] = "auto"
+    """Default worker processes for env servers. Can be overridden per env."""
 
-    max_retries: Annotated[
-        int,
-        Field(ge=0, description="Default number of retries for failed rollouts. Can be overridden per env."),
-    ] = 0
+    max_retries: int = Field(3, ge=0)
+    """Default retries for failed rollouts. Can be overridden per env."""
 
     @model_validator(mode="after")
     def resolve_env_defaults(self):
@@ -467,50 +308,30 @@ class TrainConfig(BaseConfig):
 
 
 class EvalConfig(BaseConfig):
-    """Configures evaluation using verifiers environments."""
-
     env: list[EvalEnvConfig] = [EvalEnvConfig()]
+    """Evaluation environments."""
 
-    sampling: EvalSamplingConfig = Field(
-        default_factory=EvalSamplingConfig,
-        description="Shared sampling configuration for evals; can differ from training sampling.",
-    )
+    sampling: EvalSamplingConfig = Field(default_factory=EvalSamplingConfig)
+    """Shared eval sampling configuration; can differ from training sampling."""
 
-    num_examples: Annotated[
-        int,
-        Field(
-            description="Default number of eval examples per environment. Set to -1 to use all. Can be overridden per env."
-        ),
-    ] = -1
+    num_examples: int = -1
+    """Default eval examples per environment. ``-1`` uses all. Can be overridden per env."""
 
-    rollouts_per_example: Annotated[
-        int,
-        Field(ge=1, description="Default number of rollouts per example. Can be overridden per env."),
-    ] = 1
+    group_size: int = Field(1, ge=1, validation_alias=AliasChoices("group_size", "rollouts_per_example"))
+    """Default rollouts per example. Can be overridden per env."""
 
-    num_workers: Annotated[
-        int | Literal["auto"],
-        Field(
-            description="Default number of worker processes for env servers. Can be overridden per env.",
-        ),
-    ] = "auto"
+    num_workers: int | Literal["auto"] = "auto"
+    """Default worker processes for env servers. Can be overridden per env."""
 
-    max_retries: Annotated[
-        int,
-        Field(ge=0, description="Default number of retries for failed rollouts. Can be overridden per env."),
-    ] = 0
+    max_retries: int = Field(3, ge=0)
+    """Default retries for failed rollouts. Can be overridden per env."""
 
-    interval: Annotated[
-        int,
-        Field(
-            ge=1,
-            description="Interval at which to evaluate the model.",
-        ),
-    ] = 100
+    interval: int = Field(100, ge=1)
+    """Step interval at which to evaluate the model."""
 
     @model_validator(mode="after")
     def resolve_env_defaults(self):
-        """Resolve per-env overrides: inherit group-level sampling, num_workers, max_retries, num_examples, rollouts_per_example, and interval. Then resolve auto num_workers."""
+        """Resolve per-env overrides: inherit group-level sampling, num_workers, max_retries, num_examples, group_size, and interval. Then resolve auto num_workers."""
         group_sampling = self.sampling.model_dump()
         for env in self.env:
             if "sampling" not in env.model_fields_set:
@@ -520,20 +341,20 @@ class EvalConfig(BaseConfig):
                 env.sampling = EvalSamplingConfig(**merged)
             if "num_examples" not in env.model_fields_set:
                 env.num_examples = self.num_examples
-            if "rollouts_per_example" not in env.model_fields_set:
-                env.rollouts_per_example = self.rollouts_per_example
+            if "group_size" not in env.model_fields_set:
+                env.group_size = self.group_size
             if "interval" not in env.model_fields_set:
                 env.interval = self.interval
             if "num_workers" not in env.model_fields_set:
                 env.num_workers = self.num_workers
             if "max_retries" not in env.model_fields_set:
                 env.max_retries = self.max_retries
-            # Resolve auto num_workers now that num_examples and rollouts_per_example are set
+            # Resolve auto num_workers now that num_examples and group_size are set
             if env.num_workers == "auto":
                 if env.num_examples == -1:
                     env.num_workers = 4
                 else:
-                    max_concurrent = env.num_examples * env.rollouts_per_example
+                    max_concurrent = env.num_examples * env.group_size
                     env.num_workers = max(1, math.ceil(max_concurrent / 256))
         return self
 
@@ -547,140 +368,62 @@ class EvalConfig(BaseConfig):
             )
         return self
 
-    eval_base_model: Annotated[
-        bool,
-        Field(
-            description="Whether to evaluate the base model we are training on.",
-        ),
-    ] = True
+    eval_base_model: bool = True
+    """Evaluate the base model we are training on."""
 
-    skip_eval_on_resume: Annotated[
-        bool,
-        Field(
-            validation_alias=AliasChoices("skip_eval_on_resume", "skip_eval_on_restart"),
-            description=(
-                "If True and resuming the orchestrator from a checkpoint, skip the (potentially redundant) "
-                "online eval that would otherwise run immediately at the resumed checkpoint step."
-            ),
-        ),
-    ] = True
+    skip_eval_on_resume: bool = Field(
+        True, validation_alias=AliasChoices("skip_eval_on_resume", "skip_eval_on_restart")
+    )
+    """When resuming the orchestrator from a checkpoint, skip the (potentially redundant) online eval that would otherwise run immediately at the resumed step."""
 
-    cancel_inflight_rollouts_on_eval: Annotated[
-        bool,
-        Field(
-            description="Whether to cancel in-flight training rollouts before starting online evals. This is useful to avoid congestion (e.g. do not have training + eval rollouts happening at the same time) but leads to slower training steps as rollouts get cancelled and the pipeline has to fill up after each eval",
-        ),
-    ] = False
+    cancel_inflight_rollouts_on_eval: bool = False
+    """Cancel in-flight training rollouts before starting online evals. Avoids congestion (no training + eval rollouts at the same time) at the cost of slower training steps as the pipeline has to refill after each eval."""
 
 
 class CheckpointConfig(BaseConfig):
-    """Configures checkpointing the orchestrator."""
+    interval: int | None = Field(None, ge=1)
+    """Step interval at which to save the orchestrator checkpoint."""
 
-    interval: Annotated[int | None, Field(ge=1, description="Interval at which to save the checkpoint.")] = None
+    resume_step: int | None = Field(None, ge=-1)
+    """Step to resume the orchestrator from. None starts from scratch; ``-1`` resumes from the latest checkpoint available."""
 
-    resume_step: Annotated[
-        int | None,
-        Field(
-            ge=-1,
-            description="Step to resume orchestrator from. If None, will start from scratch. If -1, will restart from latest checkpoint available.",
-        ),
-    ] = None
+    wait_for_weights_timeout: int | None = Field(None, ge=1)
+    """When resuming, wait up to this many seconds for the weight directory to appear. Useful when the orchestrator restarts while the trainer is still saving weights. If None, fail immediately when weights are not found."""
 
-    wait_for_weights_timeout: Annotated[
-        int | None,
-        Field(
-            ge=1,
-            description="When resuming, wait up to this many seconds for the weight directory to appear. Useful when the orchestrator restarts while the trainer is still saving weights. If None (default), fail immediately if weights are not found.",
-        ),
-    ] = None
+    keep_last: int | None = Field(None, ge=1)
+    """Keep at most this many recent step checkpoints on disk. If None, never clean old checkpoints based on recency."""
 
-    keep_last: Annotated[
-        int | None,
-        Field(
-            ge=1,
-            description="Keep at most this many recent step checkpoints on disk. If None, never clean old checkpoints based on recency.",
-        ),
-    ] = None
+    keep_interval: int | None = Field(None, ge=1)
+    """Keep checkpoints at every N steps permanently (e.g. ``keep_interval=100`` keeps step 100, 200, ...). If None, no interval-based keeping."""
 
-    keep_interval: Annotated[
-        int | None,
-        Field(
-            ge=1,
-            description="Keep checkpoints at every N steps permanently (e.g., keep_interval=100 keeps step 100, 200, ...). If None, no interval-based keeping.",
-        ),
-    ] = None
+    skip_progress: bool = False
+    """Skip loading the progress from checkpoint."""
 
-    skip_progress: Annotated[
-        bool,
-        Field(
-            description="Whether to skip loading the progress from checkpoint.",
-        ),
-    ] = False
-
-    skip_buffer: Annotated[
-        bool,
-        Field(
-            description="Whether to skip loading the buffer from checkpoint.",
-        ),
-    ] = False
+    skip_buffer: bool = False
+    """Skip loading the buffer from checkpoint."""
 
 
 class BufferConfig(BaseConfig):
-    """Configures the buffer for the orchestrator."""
+    seed: int | None = None
+    """Random seed for the buffer. When set, sampling from the buffer is deterministic."""
 
-    seed: Annotated[
-        int | None,
-        Field(
-            description="Random seed to use for the buffer. If set, the sampling from the buffer will be deterministic.",
-        ),
-    ] = None
+    easy_threshold: float | None = None
+    """Average-reward threshold above which a problem is classified ``easy``."""
 
-    easy_threshold: Annotated[
-        float | None,
-        Field(
-            description="Threshold for easy difficulty classification. If average reward >= this threshold, mark as easy.",
-        ),
-    ] = None
+    hard_threshold: float | None = None
+    """Average-reward threshold below which a problem is classified ``hard``."""
 
-    hard_threshold: Annotated[
-        float | None,
-        Field(
-            description="Threshold for hard difficulty classification. If average reward <= this threshold, mark as hard.",
-        ),
-    ] = None
+    easy_fraction: float = Field(0.0, ge=0, le=1)
+    """Fraction of easy problems to convert to ``normal`` when resuming or starting training. Only problems with difficulty ``normal`` are sampled."""
 
-    easy_fraction: Annotated[
-        float,
-        Field(
-            ge=0,
-            le=1,
-            description="Fraction of easy problems to convert to normal when resuming or starting training. Only problems with difficulty 'normal' are sampled.",
-        ),
-    ] = 0.0
+    hard_fraction: float = Field(0.0, ge=0, le=1)
+    """Fraction of hard problems to convert to ``normal`` when resuming or starting training. Only problems with difficulty ``normal`` are sampled."""
 
-    hard_fraction: Annotated[
-        float,
-        Field(
-            ge=0,
-            le=1,
-            description="Fraction of hard problems to convert to normal when resuming or starting training. Only problems with difficulty 'normal' are sampled.",
-        ),
-    ] = 0.0
+    online_difficulty_filtering: bool = False
+    """Filter rollouts based on difficulty. When True, rollouts with average reward 0.0 or 1.0 are not added to the buffer."""
 
-    online_difficulty_filtering: Annotated[
-        bool,
-        Field(
-            description="Whether to filter rollouts based on difficulty. If True, rollouts with average reward 0.0 or 1.0 are not added to the buffer.",
-        ),
-    ] = False
-
-    hash_keys: Annotated[
-        list[str],
-        Field(
-            min_length=1,
-            description="Keys to use for computing example hashes. Will be used to match examples from buffer checkpoints and determine buffer resume behavior.",
-        ),
-    ] = ["env_name", "prompt"]
+    hash_keys: list[str] = Field(["env_name", "prompt"], min_length=1)
+    """Keys used to compute example hashes. Used to match examples from buffer checkpoints and determine buffer resume behavior."""
 
     @model_validator(mode="after")
     def validate_thresholds(self):
@@ -689,43 +432,17 @@ class BufferConfig(BaseConfig):
         return self
 
 
-class TokensLengthPenaltyConfig(BaseModel):
-    """Length penalty by weighted token cost.
-
-    Effective cost = completion_weight * model_completion_tokens
-                   + tool_response_weight * tool_response_tokens.
-
-    Tool-response tokens are read from the rollout's harness metric
-    `*_total_tool_response_tokens` (e.g. `rlm_total_tool_response_tokens`); 0 if absent —
-    so for envs without tool accounting, only the completion term contributes regardless of weight.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
+class TokensLengthPenaltyConfig(BaseConfig):
     type: Literal["tokens"] = "tokens"
-    completion_weight: Annotated[
-        float,
-        Field(
-            ge=0,
-            allow_inf_nan=False,
-            description="Weight on model completion tokens. Finite and non-negative.",
-        ),
-    ] = 1.0
-    tool_response_weight: Annotated[
-        float,
-        Field(
-            ge=0,
-            allow_inf_nan=False,
-            description="Weight on tool-response tokens. Finite and non-negative.",
-        ),
-    ] = 1.0
+
+    completion_weight: float = Field(1.0, ge=0, allow_inf_nan=False)
+    """Weight on model completion tokens. Finite and non-negative."""
+
+    tool_response_weight: float = Field(1.0, ge=0, allow_inf_nan=False)
+    """Weight on tool-response tokens (read from the rollout's ``*_total_tool_response_tokens`` harness metric; 0 if absent). Finite and non-negative."""
 
 
-class TurnsLengthPenaltyConfig(BaseModel):
-    """Length penalty by trajectory turn count."""
-
-    model_config = ConfigDict(extra="forbid")
-
+class TurnsLengthPenaltyConfig(BaseConfig):
     type: Literal["turns"] = "turns"
 
 
@@ -735,36 +452,21 @@ LengthPenaltyConfig: TypeAlias = Annotated[
 ]
 
 
-class DefaultAdvantageConfig(BaseModel):
-    """Config for the default advantage."""
-
-    model_config = ConfigDict(extra="forbid")
-
+class DefaultAdvantageConfig(BaseConfig):
     type: Literal["default"] = "default"
-    length_penalty: Annotated[
-        LengthPenaltyConfig | None,
-        Field(
-            description=(
-                "Correctness-gated length penalty. `tokens` shapes by weighted token cost, "
-                "`turns` shapes by trajectory turn count, `None` disables shaping. In mixed "
-                "groups, lower-cost correct rollouts get amplified advantage (up to 2x), higher-cost correct "
-                "rollouts are unchanged, incorrect untouched. In all-correct groups, below-average-cost "
-                "rollouts get advantage in [0, 1], others get 0."
-            )
-        ),
-    ] = None
+
+    length_penalty: LengthPenaltyConfig | None = None
+    """Correctness-gated length penalty. ``tokens`` shapes by weighted token cost; ``turns`` shapes by trajectory turn count; None disables shaping. In mixed groups, lower-cost correct rollouts get amplified advantage (up to 2x), higher-cost correct rollouts are unchanged, incorrect untouched. In all-correct groups, below-average-cost rollouts get advantage in [0, 1], others get 0."""
 
 
-class CustomAdvantageConfig(BaseModel):
-    """Config for a custom external advantage function."""
-
+class CustomAdvantageConfig(BaseConfig):
     type: Literal["custom"] = "custom"
-    import_path: Annotated[
-        str, Field(description="Import path to the advantage function (e.g., 'my_module.my_advantage')")
-    ]
-    kwargs: Annotated[
-        dict[str, Any], Field(default_factory=dict, description="Kwargs to pass to the advantage function")
-    ]
+
+    import_path: str
+    """Import path to the advantage function (e.g. ``my_module.my_advantage``)."""
+
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+    """Kwargs forwarded to the advantage function."""
 
 
 AdvantageConfig: TypeAlias = Annotated[
@@ -773,68 +475,42 @@ AdvantageConfig: TypeAlias = Annotated[
 ]
 
 
-class GibberishFilterConfig(BaseModel):
-    """Flags rare tokens generated at high entropy (Section 5.2, https://arxiv.org/abs/2510.02387)."""
-
-    model_config = ConfigDict(extra="forbid")
-
+# Flags rare tokens generated at high entropy (Section 5.2, https://arxiv.org/abs/2510.02387).
+class GibberishFilterConfig(BaseConfig):
     type: Literal["gibberish"] = "gibberish"
-    enforce: Annotated[
-        bool,
-        Field(
-            description="If True, skip detected rollouts entirely so they are not sent to the trainer. If False, only track detection metrics."
-        ),
-    ] = False
-    token_id_threshold: Annotated[
-        int,
-        Field(description="Token IDs above this are candidates for gibberish. BPE tokens are sorted by merge order."),
-    ] = 100_000
-    logprob_offset: Annotated[
-        float,
-        Field(description="Offset from uniform distribution logprob. Threshold = -log(vocab_size) - logprob_offset."),
-    ] = 2.0
+
+    enforce: bool = False
+    """When True, skip detected rollouts entirely so they are not sent to the trainer. When False, only track detection metrics."""
+
+    token_id_threshold: int = 100_000
+    """Token IDs above this are candidates for gibberish. BPE tokens are sorted by merge order."""
+
+    logprob_offset: float = 2.0
+    """Offset from uniform-distribution logprob. Threshold = ``-log(vocab_size) - logprob_offset``."""
 
 
-class RepetitionFilterConfig(BaseModel):
-    """Flags rollouts where the model gets stuck in a repetition loop, emitting high-confidence tokens
-    for an extended stretch. A rollout is flagged when `window` consecutive tokens are each sampled
-    with probability above `prob_threshold`. (Section 3.2, https://arxiv.org/abs/2506.13585)"""
-
-    model_config = ConfigDict(extra="forbid")
-
+# Flags rollouts stuck in a repetition loop: emits high-confidence tokens for an extended stretch.
+# Flagged when `window` consecutive tokens are each sampled with probability above `prob_threshold`.
+# (Section 3.2, https://arxiv.org/abs/2506.13585)
+class RepetitionFilterConfig(BaseConfig):
     type: Literal["repetition"] = "repetition"
-    enforce: Annotated[
-        bool,
-        Field(
-            description="If True, skip detected rollouts entirely so they are not sent to the trainer. If False, only track detection metrics."
-        ),
-    ] = False
-    window: Annotated[
-        int,
-        Field(ge=1, description="Number of consecutive high-probability steps before flagging."),
-    ] = 3_000
-    prob_threshold: Annotated[
-        float,
-        Field(
-            gt=0,
-            le=1,
-            description="Tokens sampled with probability above this are considered repetitive. Consecutive such tokens count toward the window.",
-        ),
-    ] = 0.99
+
+    enforce: bool = False
+    """When True, skip detected rollouts entirely so they are not sent to the trainer. When False, only track detection metrics."""
+
+    window: int = Field(3_000, ge=1)
+    """Consecutive high-probability steps required to flag the rollout."""
+
+    prob_threshold: float = Field(0.99, gt=0, le=1)
+    """Tokens sampled with probability above this are considered repetitive. Consecutive such tokens count toward the window."""
 
 
-class ZeroAdvantageFilterConfig(BaseModel):
-    """Flags rollouts with zero advantage."""
-
-    model_config = ConfigDict(extra="forbid")
-
+# Flags rollouts with zero advantage.
+class ZeroAdvantageFilterConfig(BaseConfig):
     type: Literal["zero_advantage"] = "zero_advantage"
-    enforce: Annotated[
-        bool,
-        Field(
-            description="If True, skip detected rollouts entirely so they are not sent to the trainer. If False, only track detection metrics."
-        ),
-    ] = True
+
+    enforce: bool = True
+    """When True, skip detected rollouts entirely so they are not sent to the trainer. When False, only track detection metrics."""
 
 
 FilterConfig: TypeAlias = Annotated[
@@ -843,51 +519,33 @@ FilterConfig: TypeAlias = Annotated[
 ]
 
 
-class FileSystemWeightBroadcastConfig(BaseModel):
-    """Configures the filesystem weight broadcast."""
-
+class FileSystemWeightBroadcastConfig(BaseConfig):
     type: Literal["filesystem"] = "filesystem"
 
 
-class NCCLWeightBroadcastConfig(BaseModel):
-    """Configures the NCCL weight broadcast."""
-
+class NCCLWeightBroadcastConfig(BaseConfig):
     type: Literal["nccl"] = "nccl"
 
-    host: Annotated[str, Field(description="The host to use for the NCCL broadcast.")] = "localhost"
-    port: Annotated[int, Field(description="The port to use for the NCCL broadcast.")] = 29501
-    timeout: Annotated[int, Field(description="The timeout in seconds to use for the NCCL broadcast.")] = 1200
-    allow_async_level_gt_1: Annotated[
-        bool,
-        Field(
-            description=(
-                "Allow NCCL broadcast with max_async_level > 1. This is experimental and intended for finite "
-                "runs where the last async-level broadcasts can be safely skipped."
-            )
-        ),
-    ] = False
-    final_step_async_level: Annotated[
-        int | None,
-        Field(
-            ge=1,
-            description=(
-                "Use this async level only for the finite-run final step drain. "
-                "When greater than max_async_level, the orchestrator stops chasing newer checkpoints in that drain window."
-            ),
-        ),
-    ] = None
-    quantize_in_weight_transfer: Annotated[
-        bool,
-        Field(description="Use kernel-format FP8 quantized NCCL transfer for weight updates."),
-    ] = False
+    host: str = "localhost"
+    """Host for the NCCL broadcast rendezvous."""
 
-    inference_world_size: Annotated[
-        int,
-        Field(
-            ge=1,
-            description="Total number of inference GPUs across all servers. Used by init_nccl_broadcast to compute per-server rank offsets.",
-        ),
-    ] = 1
+    port: int = 29501
+    """Port for the NCCL broadcast rendezvous."""
+
+    timeout: int = 1200
+    """Timeout in seconds for the NCCL broadcast."""
+
+    allow_async_level_gt_1: bool = False
+    """Allow NCCL broadcast with max_async_level > 1 for finite async-slack runs."""
+
+    final_step_async_level: int | None = Field(None, ge=1)
+    """Use this async level for finite-run final-step drain."""
+
+    quantize_in_weight_transfer: bool = False
+    """Use kernel-format FP8 quantized NCCL transfer for weight updates."""
+
+    inference_world_size: int = Field(1, ge=1)
+    """Total inference GPUs across all servers. Used by ``init_nccl_broadcast`` to compute per-server rank offsets."""
 
 
 WeightBroadcastConfig: TypeAlias = Annotated[
@@ -896,540 +554,236 @@ WeightBroadcastConfig: TypeAlias = Annotated[
 
 
 class DirectRequestPickerConfig(BaseConfig):
-    """Default direct Prime scheduler selection with no routing seam behavior change."""
-
     type: Literal["direct"] = "direct"
 
 
-class LeastLoadedRequestPickerConfig(BaseConfig):
-    """No-op in-process picker that reproduces Prime's direct least-loaded selection."""
-
-    type: Literal["least_loaded"] = "least_loaded"
-
-
 class PrimeAwareRequestPickerConfig(BaseConfig):
-    """In-process picker that scores Prime/vLLM straggler signals without an HTTP adapter boundary."""
-
     type: Literal["prime_aware"] = "prime_aware"
 
-    inflight_slack: Annotated[
-        int,
-        Field(
-            ge=0,
-            description=(
-                "Maximum in-flight rollout skew allowed above the least-loaded candidate before applying "
-                "Prime-aware history scoring."
-            ),
-        ),
-    ] = 2
+    external_url: str | None = None
+    """External Prime scheduler URL. If unset, use the in-process picker."""
 
-    inflight_weight: Annotated[
-        float,
-        Field(ge=0, description="Weight for Prime-tracked in-flight rollout requests on the candidate client."),
-    ] = 1.0
-
-    waiting_weight: Annotated[
-        float,
-        Field(ge=0, description="Weight for vLLM num_requests_waiting on the candidate endpoint."),
-    ] = 1.0
-
-    running_weight: Annotated[
-        float,
-        Field(ge=0, description="Weight for vLLM num_requests_running on the candidate endpoint."),
-    ] = 0.25
-
-    request_wall_weight: Annotated[
-        float,
-        Field(
-            ge=0,
-            description="Weight for normalized excess Prime rollout request wall time on the candidate client.",
-        ),
-    ] = 1.0
-
-    group_wall_weight: Annotated[
-        float,
-        Field(ge=0, description="Weight for normalized excess rollout group wall time on the candidate client."),
-    ] = 3.0
-
-    group_tail_weight: Annotated[
-        float,
-        Field(ge=0, description="Weight for normalized excess rollout group tail time on the candidate client."),
-    ] = 1.0
-
-    off_policy_weight: Annotated[
-        float,
-        Field(ge=0, description="Weight for recent off-policy completion level on the candidate client."),
-    ] = 0.25
-
-    cancelled_weight: Annotated[
-        float,
-        Field(ge=0, description="Weight for recent cancelled/off-policy rollouts on the candidate client."),
-    ] = 0.25
-
-    decode_deficit_weight: Annotated[
-        float,
-        Field(ge=0, description="Weight for normalized decode-throughput deficit versus the fastest candidate."),
-    ] = 2.0
-
-    completed_rps_deficit_weight: Annotated[
-        float,
-        Field(ge=0, description="Weight for normalized completed-request-rate deficit versus the fastest candidate."),
-    ] = 0.0
-
-    cache_usage_weight: Annotated[
-        float,
-        Field(ge=0, description="Weight for vLLM GPU cache usage percentage on the candidate endpoint."),
-    ] = 0.25
-
-    history_penalty_cap: Annotated[
-        float,
-        Field(
-            ge=0,
-            description="Maximum in-flight-equivalent score penalty contributed by request/group history.",
-        ),
-    ] = 4.0
-
-    group_tail_pressure_weight: Annotated[
-        float,
-        Field(
-            ge=0,
-            description=(
-                "Additional weight for avoiding clients with rollout-group tail history when older in-flight groups "
-                "make barrier closure more important."
-            ),
-        ),
-    ] = 0.0
-
-    group_tail_pressure_threshold_seconds: Annotated[
-        float,
-        Field(
-            ge=0,
-            description=(
-                "Oldest in-flight group age where group-tail pressure starts amplifying tail-history penalties."
-            ),
-        ),
-    ] = 60.0
-
-    waiting_backpressure_threshold: Annotated[
-        float | None,
-        Field(
-            ge=0,
-            description=(
-                "Optional vLLM waiting-request threshold above which the picker adds an explicit backpressure penalty."
-            ),
-        ),
-    ] = None
-
-    waiting_backpressure_penalty: Annotated[
-        float,
-        Field(ge=0, description="Penalty weight for candidates above waiting_backpressure_threshold."),
-    ] = 0.0
-
-    decode_guardrail_ratio: Annotated[
-        float,
-        Field(
-            ge=0,
-            le=1,
-            description=(
-                "Allowed decode-throughput regression versus the fastest candidate before applying the decode "
-                "guardrail penalty."
-            ),
-        ),
-    ] = 0.0
-
-    decode_guardrail_penalty: Annotated[
-        float,
-        Field(ge=0, description="Penalty weight for candidates that violate decode_guardrail_ratio."),
-    ] = 0.0
-
-    long_output_weight: Annotated[
-        float,
-        Field(
-            ge=0,
-            description=(
-                "Penalty weight for placing a predicted-long rollout group on clients that already have "
-                "predicted-long in-flight work or recent long completions."
-            ),
-        ),
-    ] = 0.0
-
-    long_output_threshold_tokens: Annotated[
-        int | None,
-        Field(
-            ge=1,
-            description=(
-                "Completion-token prediction threshold for long-output placement. If unset, the picker uses "
-                "80% of the env's max_completion_tokens when that limit is known."
-            ),
-        ),
-    ] = None
-
-    long_output_cold_start_ratio: Annotated[
-        float,
-        Field(
-            ge=0,
-            description=(
-                "Fallback completion-token prediction as a ratio of max_completion_tokens when no exact "
-                "fingerprint or env-level completion history exists. Only affects long-output placement when "
-                "long_output_weight is non-zero."
-            ),
-        ),
-    ] = 0.0
-
-    wave_minimax_size: Annotated[
-        int,
-        Field(
-            ge=0,
-            description=(
-                "When >1, schedule refill requests in waves of this size and assign each wave to minimize "
-                "projected per-client predicted completion-token load. This is a soft placement policy, not "
-                "an admission cap."
-            ),
-        ),
-    ] = 0
-
-    wave_overhang_limit: Annotated[
-        int,
-        Field(
-            ge=0,
-            description=(
-                "When >0 with wave_minimax_size enabled, reduce or stop refill waves after the current step has "
-                "dispatched this many more requests than have completed. This is an adaptive late-drain guard, "
-                "not a replacement for max_inflight_rollouts."
-            ),
-        ),
-    ] = 0
-
-    wave_overhang_start_progress: Annotated[
-        float,
-        Field(
-            ge=0,
-            le=1,
-            description=(
-                "Batch progress fraction at which wave_overhang_limit starts applying. Use values below 1.0 to "
-                "cap late-step overhang while leaving the initial fill unchanged."
-            ),
-        ),
-    ] = 1.0
-
-
-class ExternalRequestPickerConfig(BaseConfig):
-    """HTTP adapter for Prime-aware request picking outside the generation data path."""
-
-    type: Literal["external"] = "external"
-
-    adapter_url: Annotated[
-        str,
-        Field(
-            description=(
-                "HTTP endpoint that accepts Prime's logical rollout-client candidates and returns one selected "
-                "candidate. This is an adapter boundary, not an llm-d/Envoy ext-proc endpoint."
-            )
-        ),
-    ]
-
-    timeout: Annotated[
-        float,
-        Field(gt=0, description="Timeout in seconds for request-picker adapter calls."),
-    ] = 1.0
-
-    max_attempts: Annotated[
-        int,
-        Field(ge=1, description="Maximum attempts for retryable request-picker adapter failures."),
-    ] = 3
-
-    retry_backoff: Annotated[
-        float,
-        Field(ge=0, description="Initial exponential backoff in seconds between retryable adapter failures."),
-    ] = 0.05
+    group_tail_weight: float = Field(0.0, ge=0)
+    oldest_group_tail_weight: float = Field(0.0, ge=0)
+    queue_penalty_weight: float = Field(0.0, ge=0)
+    completed_rps_deficit_weight: float = Field(0.0, ge=0)
+    waiting_backpressure_threshold: int = Field(0, ge=0)
+    waiting_backpressure_penalty: float = Field(0.0, ge=0)
+    decode_guardrail_ratio: float = Field(0.0, ge=0)
+    decode_guardrail_penalty: float = Field(0.0, ge=0)
+    long_output_cold_start_ratio: float = Field(0.0, ge=0)
+    long_output_cold_start_min_samples: int = Field(0, ge=0)
+    wave_minimax_size: int = Field(0, ge=0)
+    wave_overhang_limit: int = Field(0, ge=0)
+    wave_overhang_start_progress: float = Field(0.0, ge=0, le=1)
 
 
 RequestPickerConfig: TypeAlias = Annotated[
-    DirectRequestPickerConfig
-    | LeastLoadedRequestPickerConfig
-    | PrimeAwareRequestPickerConfig
-    | ExternalRequestPickerConfig,
-    Field(discriminator="type"),
+    DirectRequestPickerConfig | PrimeAwareRequestPickerConfig, Field(discriminator="type")
 ]
 
 
 class OrchestratorExperimentalConfig(BaseConfig):
-    """Experimental features for the orchestrator."""
-
-    request_picker: Annotated[
-        RequestPickerConfig,
-        Field(
-            description=(
-                "Experimental rollout request picker. The default direct mode preserves Prime's existing "
-                "least-loaded scheduler path; least_loaded runs the same policy through the picker seam; "
-                "prime_aware is an in-process straggler-aware scorer; external calls an adapter while keeping "
-                "generation/admin traffic direct."
-            )
-        ),
-    ] = DirectRequestPickerConfig()
+    request_picker: RequestPickerConfig = DirectRequestPickerConfig()
+    """Experimental request picker used to assign rollout requests to inference clients."""
 
 
-class TeacherModelConfig(BaseConfig):
-    """Configures the teacher model for computing teacher logprobs (e.g. for distillation)."""
+class RolloutModelConfig(BaseConfig):
+    model: ModelConfig = ModelConfig()
 
-    client: Annotated[
-        ClientConfig,
-        Field(description="The OAI client configuration for the teacher model."),
-    ] = ClientConfig()
-
-    model: Annotated[
-        ModelConfig,
-        Field(description="The model configuration for the teacher model."),
-    ] = ModelConfig()
-
-
-class TeacherRolloutModelConfig(BaseConfig):
-    """Configures an external teacher model used to generate rollout text."""
-
-    client: Annotated[
-        ClientConfig,
-        Field(description="The OAI client configuration for rollout generation."),
-    ] = ClientConfig()
-
-    model: Annotated[
-        ModelConfig,
-        Field(description="The model configuration for rollout generation."),
-    ] = ModelConfig()
+    client: ClientConfig = ClientConfig()
 
 
 class OrchestratorConfig(BaseConfig):
-    """Configures the orchestrator for RL training."""
+    training_mode: Literal["rl", "opd", "sft"] = "rl"
+    """Training mode. ``rl``: student generates rollouts, no teacher. ``opd``: student generates rollouts, teacher computes logprobs (teacher_tau > 0). ``sft``: teacher generates rollouts, student inference pool used for evals and weight sync."""
 
-    # Training environments and sampling
+    student: RolloutModelConfig = Field(RolloutModelConfig(), validation_alias=AliasChoices("student", "model"))
+    """Student rollout participant (model + client) — the model being trained."""
+
+    teacher: RolloutModelConfig | None = Field(None, validation_alias=AliasChoices("teacher", "teacher_model"))
+    """Teacher rollout participant (model + client). Role depends on ``training_mode``: ``opd`` — teacher computes logprobs; ``sft`` — teacher generates rollouts."""
+
     train: TrainConfig = TrainConfig()
 
-    # The OAI client configuration
-    client: ClientConfig = ClientConfig()
-
-    # The model configuration
-    model: ModelConfig = ModelConfig()
-
-    # The tokenizer configuration
     tokenizer: TokenizerConfig = TokenizerConfig()
 
-    # The renderer configuration (only used when use_renderer=True)
-    renderer: RendererConfig = RendererConfig()
+    renderer: RendererConfig | None = AutoRendererConfig()
+    """Typed renderer config (``renderers.RendererConfig`` discriminated
+    union). Defaults to ``"auto"``, which resolves from
+    ``tokenizer.name_or_path`` via ``MODEL_RENDERER_MAP``. ``None``
+    opts into MITO (``openai_chat_completions``); SFT mode forces this."""
 
-    # The optimizer configuration (per-run LR for multi-run training)
+    pool_size: int | None = Field(None, ge=1)
+    """Number of renderer slots shared across concurrent rollouts. Bump
+    for long multi-turn prompts where client-side jinja tokenization
+    serializes. Only meaningful when ``renderer`` is not ``None``."""
+
+    @model_serializer(mode="wrap")
+    def _preserve_mito_renderer(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Emit ``renderer = "None"`` (string) when MITO so
+        ``model_dump(exclude_none=True)`` round-trips: dumped TOML has
+        ``renderer = "None"``, and on reload
+        ``BaseConfig._none_str_to_none`` coerces it back to ``None``.
+        Without this, a MITO orchestrator config saved to
+        ``control/orch.toml`` would lose the renderer key entirely and
+        reload as the default ``AutoRendererConfig()`` (TITO)."""
+        result = handler(self)
+        if self.renderer is None:
+            result["renderer"] = "None"
+        return result
+
     optim: OptimizerConfig = OptimizerConfig()
+    """Per-run optimizer configuration for multi-run training."""
 
-    # The teacher model configuration (optional)
-    teacher_model: Annotated[
-        TeacherModelConfig | None,
-        Field(
-            description="The teacher model configuration for computing teacher logprobs (e.g. for distillation). "
-            "If provided, teacher logprobs will be computed using the specified model. "
-            "If None, no teacher model will be used."
-        ),
-    ] = None
-
-    # External teacher rollout model configuration (optional)
-    teacher_rollout_model: Annotated[
-        TeacherRolloutModelConfig | None,
-        Field(
-            description=(
-                "Optional external teacher model used for rollout generation. "
-                "When set, rollouts are generated from this endpoint/model instead of the student inference server."
-            ),
-        ),
-    ] = None
-
-    # When True, trainer uses SFT loss instead of RL loss (per-run override for hosted multi-tenant training)
-    use_sft_loss: Annotated[
-        bool,
-        Field(
-            description=(
-                "When True, use SFT masked NLL loss instead of the trainer's configured RL loss. "
-                "Requires a teacher_rollout_model to be configured."
-            ),
-        ),
-    ] = False
-
-    # The evaluation configuration
     eval: EvalConfig | None = None
+    """Evaluation configuration."""
 
-    # Data buffer configuration
     buffer: BufferConfig = BufferConfig()
 
-    # The advantage configuration
     advantage: AdvantageConfig | None = DefaultAdvantageConfig()
 
-    # Rollout filters (monitor by default, enforce optionally)
     filters: list[FilterConfig] = [GibberishFilterConfig(), RepetitionFilterConfig(), ZeroAdvantageFilterConfig()]
+    """Rollout filters. Each filter can ``monitor`` (default) or ``enforce`` (skip rollouts)."""
 
-    # The logging configuration
     log: LogConfig = LogConfig()
 
-    # The wandb configuration
     wandb: WandbWithExtrasConfig | None = None
 
-    # The prime monitor configuration
     prime_monitor: PrimeMonitorConfig | None = None
 
-    # Whether to collect inference server metrics (requires wandb)
     collect_inference_metrics: bool = True
+    """Collect inference-server metrics (requires wandb)."""
 
-    # The checkpoint configuration
+    inference_metrics_roles: list[Literal["prefill", "decode"]] | None = None
+    """Role for each student admin client when collecting P/D inference metrics."""
+
     ckpt: CheckpointConfig | None = None
+    """Checkpoint configuration."""
 
     weight_broadcast: WeightBroadcastConfig = FileSystemWeightBroadcastConfig()
+    """Transport used to receive updated weights from the trainer."""
 
     rollout_transport: TransportConfig = FileSystemTransportConfig()
+    """Transport used to ship rollouts from orchestrator to trainer."""
 
-    output_dir: Annotated[
-        Path,
-        Field(
-            description="Directory to write outputs to. Will be populated with checkpoints, weights, rollouts and logs as subdirectories. Should be set to a persistent directory with enough disk space. This value should be distinct across experiments running on a single node. See the README for more details."
-        ),
-    ] = Path("outputs/run_default")
+    output_dir: Path = Path("outputs/run_default")
+    """Directory to write outputs to — checkpoints, weights, rollouts, and logs are written as subdirectories. Should be a persistent directory with enough disk space and unique per experiment running on a single node."""
 
-    tasks_per_minute: Annotated[
-        int | None,
-        Field(
-            ge=1,
-            description="Rate limit for tasks per environment worker, in tasks per minute. Recommended for sandbox-backed environments to prevent sandbox-not-ready errors during autoscaling. When set to None, no rate limiting is applied. Note: with multiple workers, the effective total rate equals workers × this value.",
-        ),
-    ] = None
+    tasks_per_minute: int | None = Field(None, ge=1)
+    """Rate limit per environment worker, in tasks per minute. Recommended for sandbox-backed environments to prevent sandbox-not-ready errors during autoscaling. With multiple workers, the effective total rate is ``workers × this value``. None disables rate limiting."""
 
-    batch_size: Annotated[
-        int | None,
-        Field(
-            ge=1,
-            description="Number of samples to train on per step (rollout-based batching). Set this OR token_batch_size.",
-        ),
-    ] = None
+    batch_size: int | None = Field(None, ge=1)
+    """Samples to train on per step (rollout-based batching). Set this OR ``token_batch_size``."""
 
-    token_batch_size: Annotated[
-        int | None,
-        Field(
-            ge=1,
-            description="Number of tokens to train on per step (token-based batching). Set this OR batch_size.",
-        ),
-    ] = None
+    token_batch_size: int | None = Field(None, ge=1)
+    """Tokens to train on per step (token-based batching). Set this OR ``batch_size``."""
 
-    oversampling_factor: Annotated[
-        float | None,
-        Field(
-            gt=0,
-            description=(
-                "Rollout-mode batching only. Multiplier used to derive max_inflight_rollouts from batch_size "
-                "when max_inflight_rollouts is unset. Values below 1.0 intentionally cap in-flight rollout "
-                "capacity below batch_size."
-            ),
-        ),
-    ] = None
+    oversampling_factor: float | None = Field(None, gt=0)
+    """Rollout-mode batching only. Multiplier used to derive ``max_inflight_rollouts`` from ``batch_size`` when ``max_inflight_rollouts`` is unset. Values below 1.0 intentionally cap in-flight rollout capacity below ``batch_size``."""
 
-    max_inflight_rollouts: Annotated[
-        int | None,
-        Field(
-            ge=1,
-            description=(
-                "Maximum number of rollouts to keep in-flight. Required for token-based batching. "
-                "If batch_size is set and this is unset, defaults to batch_size * oversampling_factor "
-                "(or batch_size when oversampling_factor is unset)."
-            ),
-        ),
-    ] = None
+    max_inflight_rollouts: int | None = Field(None, ge=1)
+    """Maximum number of rollouts kept in-flight. Required for token-based batching. With ``batch_size`` set, defaults to ``batch_size * oversampling_factor`` (or ``batch_size`` when ``oversampling_factor`` is unset)."""
 
-    rollouts_per_example: Annotated[
-        int,
-        Field(
-            ge=1,
-            description="Number of output sequences to return per example during training.",
-        ),
-    ] = 1
+    group_size: int = Field(1, ge=1, validation_alias=AliasChoices("group_size", "rollouts_per_example"))
+    """Output sequences returned per example during training."""
 
-    seq_len: Annotated[
-        int,
-        Field(
-            description="Sequence length to use for training. If a sample is shorter than this, it will be padded. If a sequence is longer than this, it will be truncated.",
-        ),
-    ] = 2048
+    seq_len: int = 2048
+    """Training sequence length. Shorter samples are padded; longer samples are truncated."""
 
     # TODO(Mika): This should be automatic from the number of ZMQ connections
-    num_train_workers: Annotated[
-        int,
-        Field(default=1, ge=1, description="Number of training workers to use for training."),
-    ] = 1
+    num_train_workers: int = Field(1, ge=1)
+    """Training workers to use."""
 
-    max_steps: Annotated[
-        int | None,
-        Field(
-            description="Maximum number of training steps to run. If None, will run indefinitely.",
-        ),
-    ] = None
+    max_steps: int | None = None
+    """Maximum training steps. If None, runs indefinitely."""
 
-    max_off_policy_steps: Annotated[
-        int,
-        Field(
-            ge=0,
-            description="Maximum number of policies that are allowed to generate a single rollout. Rollouts that are generated from more than `max_off_policy_steps` steps ahead of training will be discarded. Higher values yield better throughput, but lead to more off-policyness in training.",
-        ),
-    ] = 8
+    max_off_policy_steps: int = Field(8, ge=0)
+    """Maximum policies allowed to generate a single rollout. Rollouts generated more than ``max_off_policy_steps`` ahead of training are discarded. Higher values yield better throughput at the cost of off-policy noise."""
 
-    max_error_reschedule_attempts: Annotated[
-        int | None,
-        Field(
-            ge=1,
-            description="The group is dropped from the current step's batch once this many of its dispatch rounds have returned errored or empty rollouts (the trainer proceeds with the rollouts from other groups). Counts rounds, not individual rollouts: a non-group-scoring env that dispatches `rollouts_per_example` rollouts at once still only counts one round per failed batch. `None` means retry indefinitely (legacy behavior). Useful for unblocking single-example hangs in agent envs.",
-        ),
-    ] = 3
+    max_error_reschedule_attempts: int | None = Field(3, ge=1)
+    """Dispatch rounds with failed/empty rollouts before dropping a stuck group. None retries indefinitely."""
 
-    max_async_level: Annotated[
-        int,
-        Field(
-            ge=0,
-            description="Maximum number of steps the inference can be ahead of training. If 0, will degenerate to synchronous on-policy RL. If >=1, training and inference will be overlapped.",
-        ),
-    ] = 1
+    max_async_level: int = Field(1, ge=1)
+    """Maximum number of trainer steps the orchestrator may run ahead."""
 
-    strict_async_level: Annotated[
-        bool,
-        Field(
-            description="Whether to strictly enforce the max async level. If True, will always ensure that the policy used for generating rollouts is exactly `max_async_level` steps ahead of training. If False, any policy that is at most `max_async_level` steps ahead of training is allowed, i.e. we always use the latest available policy.",
-        ),
-    ] = False
+    strict_async_level: bool = False
+    """When true, require exactly max_async_level lag; otherwise use the newest compatible checkpoint."""
 
-    bench: Annotated[
-        bool,
-        Field(
-            description="Whether to run in benchmark mode. It will automatically set the maximum number of steps to run to 5, max async level to ~infinity and disable W&B.",
-        ),
-    ] = False
+    bench: bool = False
+    """Benchmark mode. Sets ``max_steps`` to 5 and disables W&B."""
 
-    seed: Annotated[int | None, Field(description="Random seed for the orchestrator.")] = 42
+    seed: int | None = 42
+    """Random seed for the orchestrator."""
 
-    heartbeat: Annotated[
-        HeartbeatConfig | None, Field(description="The heartbeat config for monitoring training progress.")
-    ] = None
+    heartbeat: HeartbeatConfig | None = None
+    """BetterStack heartbeat configuration for monitoring training progress."""
 
-    use_renderer: Annotated[
-        bool,
-        Field(
-            description="Whether to use the renderer-backed TITO client (client-side tokenization via the ``renderers`` package, "
-            "served by ``/v1/generate``). When True, the ``[orchestrator.renderer]`` block "
-            "(name / tool_parser / reasoning_parser / pool_size) applies. This is the default for text-only "
-            "rollouts. Set to False to fall back to MITO (``openai_chat_completions``); VLMs and external "
-            "teacher rollouts require MITO."
-        ),
-    ] = True
+    env_install_prerelease: bool = False
+    """Allow pre-release versions when installing environments (e.g. ``verifiers>=0.1.12.dev5``). Passes ``--prerelease`` to ``prime env install``."""
 
-    env_install_prerelease: Annotated[
-        bool,
-        Field(
-            description="Allow pre-release versions when installing environments (e.g. verifiers>=0.1.12.dev5). Passes --prerelease to prime env install."
-        ),
-    ] = False
+    experimental: OrchestratorExperimentalConfig = OrchestratorExperimentalConfig()
 
-    experimental: Annotated[
-        OrchestratorExperimentalConfig,
-        Field(description="Experimental features for the orchestrator."),
-    ] = OrchestratorExperimentalConfig()
+    @model_validator(mode="before")
+    @classmethod
+    def fold_student_shortcuts(cls, data: Any) -> Any:
+        """Accept top-level ``[orchestrator.model]`` / ``[orchestrator.client]``
+        as shorthand for the student sub-config. Useful for ergonomic rl configs
+        where ``[orchestrator.student.*]`` is overkill, and required for
+        pre-refactor configs that used the flat layout to keep parsing:
+
+        - [orchestrator.client.*]     -> [orchestrator.student.client.*]
+        - [orchestrator.model.<k>]    -> [orchestrator.student.model.<k>]
+          (where <k> is any ModelConfig field)
+
+        Teacher must always be configured under [orchestrator.teacher.*]
+        (no equivalent shortcut), because rl mode forbids a teacher and we
+        don't want the same shortcut to silently route to two different roles.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        def deep_merge(dst: dict, src: dict) -> None:
+            """In-place recursive merge of ``src`` into ``dst``. ``src`` wins at the leaf."""
+            for k, v in src.items():
+                if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                    deep_merge(dst[k], v)
+                else:
+                    dst[k] = v
+
+        # 1. Re-nest top-level [orchestrator.client] under student.client.
+        legacy_client = data.pop("client", None)
+        if isinstance(legacy_client, dict):
+            student = data.setdefault("student", {})
+            if isinstance(student, dict):
+                deep_merge(student.setdefault("client", {}), legacy_client)
+            else:
+                # Mismatched types - put it back and let pydantic surface the error.
+                data["client"] = legacy_client
+
+        # 2. Consolidate the legacy `model` alias into `student` so the
+        # flat-layout fix-up below sees a single target. Deep-merge with the
+        # legacy keys winning so a CLI `--model.<k>` overrides TOML `student.model.<k>`.
+        legacy_model = data.pop("model", None)
+        if legacy_model is not None:
+            existing = data.get("student")
+            if existing is None:
+                data["student"] = legacy_model
+            elif isinstance(existing, dict) and isinstance(legacy_model, dict):
+                deep_merge(existing, legacy_model)
+            else:
+                # Mismatched types - put it back and let pydantic surface the error.
+                data["model"] = legacy_model
+
+        # 3. Re-nest flat ModelConfig keys under student.model.
+        model_only_keys = set(ModelConfig.model_fields)
+        student = data.get("student")
+        if isinstance(student, dict):
+            flat = {k: student.pop(k) for k in list(student) if k in model_only_keys}
+            if flat:
+                student.setdefault("model", {}).update(flat)
+
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -1461,9 +815,25 @@ class OrchestratorConfig(BaseConfig):
     @model_validator(mode="after")
     def auto_setup_tokenizer(self):
         if self.tokenizer.name is None:
-            self.tokenizer.name = self.model.name
+            self.tokenizer.name = self.student.model.name
         if self.tokenizer.trust_remote_code is None:
-            self.tokenizer.trust_remote_code = self.model.trust_remote_code
+            self.tokenizer.trust_remote_code = self.student.model.trust_remote_code
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_session_headers(self):
+        """Ensure X-Session-ID header is always set for sticky DP-aware routing at the inference router."""
+        self.student.client.extra_headers_from_state.setdefault("X-Session-ID", "trajectory_id")
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_prime_monitor_run_name(self):
+        """Default ``prime_monitor.run_name`` to the W&B run name when monitoring
+        is enabled and the user hasn't named the prime-monitor run explicitly."""
+        if self.prime_monitor is None or self.prime_monitor.run_name is not None:
+            return self
+        if self.wandb is not None and self.wandb.name:
+            self.prime_monitor.run_name = self.wandb.name
         return self
 
     @model_validator(mode="after")
@@ -1474,93 +844,50 @@ class OrchestratorConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
-    def validate_sft_distill_mode(self):
-        """Enforce the SFT hard distill invariants that involve only orchestrator fields.
+    def _force_no_renderer_for_sft(self):
+        """SFT rolls out via the teacher's plain chat-completions endpoint; the
+        renderer client doesn't apply. Force ``renderer=None`` so the user
+        doesn't have to remember to set it. Declared before the renderer
+        validators below so they see the corrected value."""
+        if self.training_mode == "sft":
+            self.renderer = None
+        return self
 
-        Runs at ``OrchestratorConfig`` level so hosted deployments (which load this
-        config standalone via the ``orchestrator`` entrypoint) get the same guarantees
-        as the combined ``rl`` entrypoint.
+    @model_validator(mode="after")
+    def validate_training_mode(self):
+        """Enforce training mode invariants that involve only orchestrator fields."""
+        has_teacher = self.teacher is not None
+        if self.training_mode == "rl" and has_teacher:
+            raise ValueError("orchestrator.teacher must not be set when training_mode = 'rl'.")
+        if self.training_mode in ("opd", "sft") and not has_teacher:
+            raise ValueError(f"orchestrator.teacher must be configured when training_mode = '{self.training_mode}'.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_pool_size(self):
+        """``pool_size`` is only meaningful when the renderer is enabled
+        (``renderer is not None``). Reject otherwise so callers don't
+        silently pass it and wonder why it's ignored."""
+        if self.renderer is None and self.pool_size is not None:
+            raise ValueError(
+                f"orchestrator.pool_size={self.pool_size!r} is set but "
+                "orchestrator.renderer is None (MITO mode). Either configure a renderer "
+                "or remove pool_size."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def vlm_requires_renderer(self):
+        """VLMs (``[model.vlm]`` block set) must go through the renderer.
+
+        The renderer owns the processor per-slot, produces byte-identical
+        tokens, and ships generic ``mm_kwargs`` keyed by whatever the
+        model's forward signature expects.
         """
-        has_teacher = self.teacher_rollout_model is not None
-        if self.use_sft_loss and not has_teacher:
+        if self.student.model.vlm is not None and self.renderer is None:
             raise ValueError(
-                "orchestrator.use_sft_loss = true requires orchestrator.teacher_rollout_model to be configured."
-            )
-        if has_teacher and not self.use_sft_loss:
-            raise ValueError("orchestrator.teacher_rollout_model requires orchestrator.use_sft_loss = true.")
-        if has_teacher and self.use_renderer:
-            raise ValueError(
-                "orchestrator.use_renderer must be false when orchestrator.teacher_rollout_model is configured "
-                "(external rollout uses MITO)."
-            )
-        return self
-
-    @model_validator(mode="after")
-    def validate_throughput_wave_metrics(self):
-        picker = self.experimental.request_picker
-        if picker.type != "prime_aware":
-            return self
-        if not self.collect_inference_metrics:
-            return self
-        uses_throughput_guarded_wave = picker.wave_minimax_size > 1 and (
-            picker.decode_guardrail_penalty > 0
-            or picker.completed_rps_deficit_weight > 0
-            or picker.waiting_backpressure_penalty > 0
-        )
-        if not uses_throughput_guarded_wave:
-            return self
-        if self.client.dp_rank_count <= 1:
-            return self
-        if self.client.admin_base_url:
-            return self
-        raise ValueError(
-            "Throughput-guarded wave_minimax with client.dp_rank_count > 1 requires client.admin_base_url "
-            "when collect_inference_metrics is true. Otherwise the collector polls the shared rollout "
-            "base_url/router and scheduler candidates receive no backend vLLM throughput metrics."
-        )
-
-    @model_validator(mode="after")
-    def validate_renderer_vs_vlm(self):
-        """The renderer client takes plain message dicts and tokenizes
-        them client-side. VLMs need server-side image preprocessing and
-        chat templating, so they must use MITO — fail
-        loudly when both are set."""
-        if self.use_renderer and self.model.vlm is not None:
-            raise ValueError(
-                "orchestrator.use_renderer is not supported for VLMs. Use MITO "
-                "(``use_renderer=false``) so image preprocessing and chat templating stay on the "
-                "inference server."
-            )
-        return self
-
-    @model_validator(mode="after")
-    def validate_renderer_args(self):
-        """``[orchestrator.renderer]`` knobs are only meaningful when
-        ``use_renderer=True``. Reject otherwise so callers don't silently
-        pass them and wonder why they're ignored."""
-        if self.use_renderer:
-            return self
-
-        renderer_args_set = []
-        if self.renderer.name != "auto":
-            renderer_args_set.append(f"renderer.name={self.renderer.name!r}")
-        if self.renderer.tool_parser is not None:
-            renderer_args_set.append(f"renderer.tool_parser={self.renderer.tool_parser!r}")
-        if self.renderer.reasoning_parser is not None:
-            renderer_args_set.append(f"renderer.reasoning_parser={self.renderer.reasoning_parser!r}")
-        if self.renderer.pool_size is not None:
-            renderer_args_set.append(f"renderer.pool_size={self.renderer.pool_size!r}")
-        if self.renderer.preserve_all_thinking:
-            renderer_args_set.append(f"renderer.preserve_all_thinking={self.renderer.preserve_all_thinking!r}")
-        if self.renderer.preserve_thinking_between_tool_calls:
-            renderer_args_set.append(
-                f"renderer.preserve_thinking_between_tool_calls={self.renderer.preserve_thinking_between_tool_calls!r}"
-            )
-
-        if renderer_args_set:
-            raise ValueError(
-                "Renderer-specific args set without orchestrator.use_renderer=True: "
-                f"{', '.join(renderer_args_set)}. Either enable the renderer client or remove these knobs."
+                "orchestrator.renderer must be set when model.vlm is set. "
+                "VLMs must go through a renderer (e.g. Qwen3VLRenderer) that owns the processor."
             )
         return self
 
@@ -1568,58 +895,37 @@ class OrchestratorConfig(BaseConfig):
     def validate_renderer_auto_resolves(self):
         """Reject the silent DefaultRenderer fallback at config time.
 
-        When ``use_renderer=True`` with ``renderer.name='auto'`` and the
-        model isn't in ``MODEL_RENDERER_MAP``, ``create_renderer`` would
-        fall back to ``DefaultRenderer``. That fallback doesn't fix the
-        position-dependent chat-template bug the renderer client exists to
-        solve, and rejects envs that pass tools (the rollout dies with
-        "RendererPool does not support tools") unless
-        ``renderer.tool_parser`` is configured. Surface at config time so
-        ``--dry-run`` reports the error.
+        When ``renderer.name='auto'`` and the model isn't in
+        ``MODEL_RENDERER_MAP``, ``create_renderer`` would fall back to
+        ``DefaultRenderer``. That fallback doesn't fix the
+        position-dependent chat-template bug the renderer client exists
+        to solve, and rejects envs that pass tools (the rollout dies
+        with "RendererPool does not support tools") unless
+        ``DefaultRendererConfig.tool_parser`` is configured. Surface at
+        config time so ``--dry-run`` reports the error.
         """
-        if not self.use_renderer or self.renderer.name != "auto":
+        if self.renderer is None or self.renderer.name != "auto":
             return self
         from renderers.base import MODEL_RENDERER_MAP
 
-        model_id = self.tokenizer.name or self.model.name
+        model_id = self.tokenizer.name or self.student.model.name
         if model_id in MODEL_RENDERER_MAP:
             return self
         raise ValueError(
-            f"orchestrator.use_renderer=True with renderer.name='auto' but "
+            f"orchestrator.renderer.name='auto' but "
             f"{model_id!r} is not in renderers.base.MODEL_RENDERER_MAP, so it "
             f"would silently fall back to DefaultRenderer. Pick one: "
             f"(a) [orchestrator.renderer] name='default' — for fine-tunes / "
             f"vendored mirrors with custom chat templates (DefaultRenderer "
-            f"calls apply_chat_template); pair with tool_parser=<name> if "
-            f"the env uses tools. "
+            f"calls apply_chat_template); set tool_parser=<name> if the env "
+            f"uses tools. "
             f"(b) [orchestrator.renderer] name=<model-specific renderer> — "
             f"if {model_id!r} is template-identical to a mapped family "
             f"(and ideally also add it upstream to "
             f"renderers.base.MODEL_RENDERER_MAP). "
-            f"(c) orchestrator.use_renderer=false — opt out of the renderer "
-            f"client entirely."
+            f"(c) orchestrator.renderer='none' — opt out of the renderer "
+            f"client entirely (MITO)."
         )
-
-    @model_validator(mode="after")
-    def nccl_max_async_level(self):
-        if self.weight_broadcast.type == "nccl":
-            final_step_async_level = self.weight_broadcast.final_step_async_level or self.max_async_level
-            if (
-                self.max_async_level != 1 or final_step_async_level > self.max_async_level
-            ) and not self.weight_broadcast.allow_async_level_gt_1:
-                raise ValueError(
-                    "max_async_level must be 1 for NCCL broadcast unless "
-                    "weight_broadcast.allow_async_level_gt_1 is enabled"
-                )
-            if final_step_async_level > self.max_async_level and self.max_steps is None:
-                raise ValueError("weight_broadcast.final_step_async_level requires max_steps")
-            if final_step_async_level > self.max_async_level and final_step_async_level >= self.max_steps:
-                raise ValueError("weight_broadcast.final_step_async_level must be < max_steps")
-            if final_step_async_level > 1 and self.strict_async_level:
-                raise ValueError("NCCL broadcast async levels above 1 require strict_async_level=false")
-            if final_step_async_level > 1 and final_step_async_level > self.max_off_policy_steps:
-                raise ValueError("max_async_level must be <= max_off_policy_steps")
-        return self
 
     @model_validator(mode="after")
     def resolve_batching(self):
@@ -1639,11 +945,11 @@ class OrchestratorConfig(BaseConfig):
                 raise ValueError("max_inflight_rollouts must be set when token_batch_size is set")
         else:
             assert self.batch_size is not None
-            if self.batch_size % self.rollouts_per_example != 0:
+            if self.batch_size % self.group_size != 0:
                 raise ValueError("Batch size must be divisible by the number of samples per problem")
             oversampling_factor = self.oversampling_factor if self.oversampling_factor is not None else 1.0
             resolved_max_inflight_rollouts = max(
-                self.rollouts_per_example,
+                self.group_size,
                 int(self.batch_size * oversampling_factor),
             )
             if self.max_inflight_rollouts is not None and self.oversampling_factor is not None:
@@ -1653,7 +959,7 @@ class OrchestratorConfig(BaseConfig):
             if self.max_inflight_rollouts is None:
                 self.max_inflight_rollouts = resolved_max_inflight_rollouts
 
-        if self.max_inflight_rollouts is not None and self.max_inflight_rollouts < self.rollouts_per_example:
+        if self.max_inflight_rollouts is not None and self.max_inflight_rollouts < self.group_size:
             raise ValueError("max_inflight_rollouts must be at least the number of rollouts per example")
 
         # Resolve train env num_workers from max_inflight_rollouts
@@ -1668,7 +974,6 @@ class OrchestratorConfig(BaseConfig):
     def auto_setup_bench(self):
         if self.bench:
             self.max_steps = 4  # Run for 1 warmup step + 3 evaluation steps
-            self.max_async_level = int(1e9)  # Never wait for RL weight checkpoints
 
             # Disable evaluation
             self.eval = None
@@ -1682,7 +987,7 @@ class OrchestratorConfig(BaseConfig):
     @model_validator(mode="after")
     def resolve_env_config(self):
         """Populate extra_env_kwargs and vLLM sampling defaults from top-level fields."""
-        is_vllm = self.teacher_rollout_model is None
+        is_vllm = self.training_mode != "sft"
         for env in self.train.env:
             env.extra_env_kwargs.update(max_seq_len=self.seq_len)
             if is_vllm:

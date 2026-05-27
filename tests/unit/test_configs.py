@@ -1,24 +1,18 @@
+import tomllib
 from pathlib import Path
 from typing import Annotated, Literal
 
 import pytest
 import tomli_w
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from pydantic_config import ConfigFileError
 
 from prime_rl.configs.inference import InferenceConfig
-from prime_rl.configs.orchestrator import OrchestratorConfig, TeacherModelConfig
+from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
-from prime_rl.configs.shared import TransportConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
-from prime_rl.ray.native import (
-    _monitor_roles,
-    _orchestrator_with_ray_inference_endpoint,
-    _orchestrator_with_ray_teacher_endpoint,
-)
-from prime_rl.transport.ray import _RayTransportStore
 from prime_rl.utils.config import BaseConfig, cli
 
 # All config config classes
@@ -40,9 +34,19 @@ def get_config_files() -> list[Path]:
     return config_files + example_files
 
 
+def is_eval_config(path: Path) -> bool:
+    """vf-eval TOMLs live under configs but are not prime-rl entrypoint configs."""
+    with path.open("rb") as f:
+        data = tomllib.load(f)
+    return isinstance(data.get("eval"), list)
+
+
 @pytest.mark.parametrize("config_file", get_config_files(), ids=lambda x: x.as_posix())
 def test_load_configs(config_file: Path):
     """Tests that all config files can be loaded by at least one config class."""
+    if is_eval_config(config_file):
+        pytest.skip("vf-eval TOML files are not prime-rl entrypoint configs")
+
     could_parse = []
     for config_cls in CONFIG_CLASSES:
         try:
@@ -51,288 +55,6 @@ def test_load_configs(config_file: Path):
         except (ValidationError, ConfigFileError, SystemExit):
             could_parse.append(False)
     assert any(could_parse), f"No config class could be parsed from {config_file}"
-
-
-def test_orchestrator_request_picker_config_defaults_to_direct():
-    config = OrchestratorConfig.model_validate({"use_renderer": False})
-    assert config.experimental.request_picker.type == "direct"
-
-
-def test_orchestrator_external_request_picker_config():
-    config = OrchestratorConfig.model_validate(
-        {
-            "use_renderer": False,
-            "experimental": {
-                "request_picker": {
-                    "type": "external",
-                    "adapter_url": "http://picker.local/pick",
-                    "timeout": 0.25,
-                }
-            },
-        }
-    )
-    assert config.experimental.request_picker.type == "external"
-    assert config.experimental.request_picker.adapter_url == "http://picker.local/pick"
-    assert config.experimental.request_picker.timeout == 0.25
-
-
-def test_orchestrator_prime_aware_request_picker_config():
-    config = OrchestratorConfig.model_validate(
-        {
-            "use_renderer": False,
-            "experimental": {
-                "request_picker": {
-                    "type": "prime_aware",
-                    "inflight_slack": 1,
-                    "waiting_weight": 2.0,
-                    "decode_deficit_weight": 0.5,
-                    "history_penalty_cap": 2.0,
-                    "wave_minimax_size": 16,
-                    "wave_overhang_limit": 8,
-                    "wave_overhang_start_progress": 0.75,
-                }
-            },
-        }
-    )
-    assert config.experimental.request_picker.type == "prime_aware"
-    assert config.experimental.request_picker.inflight_slack == 1
-    assert config.experimental.request_picker.waiting_weight == 2.0
-    assert config.experimental.request_picker.decode_deficit_weight == 0.5
-    assert config.experimental.request_picker.history_penalty_cap == 2.0
-    assert config.experimental.request_picker.wave_minimax_size == 16
-    assert config.experimental.request_picker.wave_overhang_limit == 8
-    assert config.experimental.request_picker.wave_overhang_start_progress == 0.75
-
-
-def test_throughput_guarded_wave_requires_admin_base_url_for_dp_router_metrics():
-    with pytest.raises(ValidationError, match="requires client.admin_base_url"):
-        OrchestratorConfig.model_validate(
-            {
-                "use_renderer": False,
-                "collect_inference_metrics": True,
-                "client": {
-                    "base_url": ["http://router:8000/v1"],
-                    "dp_rank_count": 4,
-                },
-                "experimental": {
-                    "request_picker": {
-                        "type": "prime_aware",
-                        "wave_minimax_size": 32,
-                        "decode_guardrail_penalty": 8.0,
-                        "completed_rps_deficit_weight": 8.0,
-                    }
-                },
-            }
-        )
-
-    config = OrchestratorConfig.model_validate(
-        {
-            "use_renderer": False,
-            "collect_inference_metrics": True,
-            "client": {
-                "base_url": ["http://router:8000/v1"],
-                "admin_base_url": ["http://worker-a:8100", "http://worker-b:8100"],
-                "dp_rank_count": 4,
-            },
-            "experimental": {
-                "request_picker": {
-                    "type": "prime_aware",
-                    "wave_minimax_size": 32,
-                    "decode_guardrail_penalty": 8.0,
-                    "completed_rps_deficit_weight": 8.0,
-                }
-            },
-        }
-    )
-    assert config.client.admin_base_url == ["http://worker-a:8100", "http://worker-b:8100"]
-
-
-def test_nccl_async_level_above_one_requires_explicit_opt_in():
-    with pytest.raises(ValidationError, match="allow_async_level_gt_1"):
-        TrainerConfig.model_validate(
-            {
-                "max_async_level": 2,
-                "weight_broadcast": {"type": "nccl"},
-            }
-        )
-
-    with pytest.raises(ValidationError, match="allow_async_level_gt_1"):
-        OrchestratorConfig.model_validate(
-            {
-                "use_renderer": False,
-                "max_async_level": 2,
-                "weight_broadcast": {"type": "nccl"},
-            }
-        )
-
-
-def test_nccl_async_level_above_one_opt_in_requires_non_strict_and_off_policy_capacity():
-    trainer = TrainerConfig.model_validate(
-        {
-            "max_async_level": 2,
-            "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
-        }
-    )
-    assert trainer.weight_broadcast.type == "nccl"
-    assert trainer.weight_broadcast.allow_async_level_gt_1
-
-    orchestrator = OrchestratorConfig.model_validate(
-        {
-            "use_renderer": False,
-            "max_async_level": 2,
-            "max_off_policy_steps": 2,
-            "strict_async_level": False,
-            "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
-        }
-    )
-    assert orchestrator.weight_broadcast.type == "nccl"
-    assert orchestrator.weight_broadcast.allow_async_level_gt_1
-
-    with pytest.raises(ValidationError, match="strict_async_level=false"):
-        OrchestratorConfig.model_validate(
-            {
-                "use_renderer": False,
-                "max_async_level": 2,
-                "strict_async_level": True,
-                "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
-            }
-        )
-
-    with pytest.raises(ValidationError, match="max_async_level must be <= max_off_policy_steps"):
-        OrchestratorConfig.model_validate(
-            {
-                "use_renderer": False,
-                "max_async_level": 5,
-                "max_off_policy_steps": 4,
-                "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
-            }
-        )
-
-
-def test_shared_nccl_async_level_above_one_propagates_opt_in_and_guards_orchestrator():
-    config = RLConfig.model_validate(
-        {
-            "max_async_level": 2,
-            "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
-            "trainer": {},
-            "orchestrator": {
-                "use_renderer": False,
-                "max_off_policy_steps": 2,
-                "strict_async_level": False,
-            },
-        }
-    )
-    assert config.trainer.max_async_level == 2
-    assert config.trainer.weight_broadcast.type == "nccl"
-    assert config.trainer.weight_broadcast.allow_async_level_gt_1
-    assert config.orchestrator.max_async_level == 2
-    assert config.orchestrator.weight_broadcast.type == "nccl"
-    assert config.orchestrator.weight_broadcast.allow_async_level_gt_1
-
-    with pytest.raises(ValidationError, match="allow_async_level_gt_1"):
-        RLConfig.model_validate(
-            {
-                "max_async_level": 2,
-                "weight_broadcast": {"type": "nccl"},
-                "trainer": {},
-                "orchestrator": {
-                    "use_renderer": False,
-                    "max_off_policy_steps": 2,
-                    "strict_async_level": False,
-                },
-            }
-        )
-
-    with pytest.raises(ValidationError, match="strict_async_level=false"):
-        RLConfig.model_validate(
-            {
-                "max_async_level": 2,
-                "weight_broadcast": {"type": "nccl", "allow_async_level_gt_1": True},
-                "trainer": {},
-                "orchestrator": {
-                    "use_renderer": False,
-                    "max_off_policy_steps": 2,
-                    "strict_async_level": True,
-                },
-            }
-        )
-
-
-def test_nccl_final_step_async_level_uses_opt_in_with_default_max_async_level():
-    config = RLConfig.model_validate(
-        {
-            "max_steps": 10,
-            "max_async_level": 1,
-            "weight_broadcast": {
-                "type": "nccl",
-                "allow_async_level_gt_1": True,
-                "final_step_async_level": 2,
-            },
-            "trainer": {},
-            "orchestrator": {
-                "use_renderer": False,
-                "max_off_policy_steps": 4,
-                "strict_async_level": False,
-            },
-        }
-    )
-    assert config.trainer.max_async_level == 1
-    assert config.trainer.weight_broadcast.final_step_async_level == 2
-    assert config.orchestrator.max_async_level == 1
-    assert config.orchestrator.weight_broadcast.final_step_async_level == 2
-
-    with pytest.raises(ValidationError, match="allow_async_level_gt_1"):
-        RLConfig.model_validate(
-            {
-                "max_steps": 10,
-                "max_async_level": 1,
-                "weight_broadcast": {"type": "nccl", "final_step_async_level": 2},
-                "trainer": {},
-                "orchestrator": {
-                    "use_renderer": False,
-                    "max_off_policy_steps": 4,
-                    "strict_async_level": False,
-                },
-            }
-        )
-
-    with pytest.raises(ValidationError, match="strict_async_level=false"):
-        RLConfig.model_validate(
-            {
-                "max_steps": 10,
-                "max_async_level": 1,
-                "weight_broadcast": {
-                    "type": "nccl",
-                    "allow_async_level_gt_1": True,
-                    "final_step_async_level": 2,
-                },
-                "trainer": {},
-                "orchestrator": {
-                    "use_renderer": False,
-                    "max_off_policy_steps": 4,
-                    "strict_async_level": True,
-                },
-            }
-        )
-
-    with pytest.raises(ValidationError, match="max_async_level must be <= max_off_policy_steps"):
-        RLConfig.model_validate(
-            {
-                "max_steps": 10,
-                "max_async_level": 1,
-                "weight_broadcast": {
-                    "type": "nccl",
-                    "allow_async_level_gt_1": True,
-                    "final_step_async_level": 5,
-                },
-                "trainer": {},
-                "orchestrator": {
-                    "use_renderer": False,
-                    "max_off_policy_steps": 4,
-                    "strict_async_level": False,
-                },
-            }
-        )
 
 
 class NestedConfig(BaseConfig):
@@ -446,32 +168,38 @@ def test_removed_fused_lm_head_chunk_size_field_is_rejected():
         TrainerModelConfig.model_validate({"fused_lm_head_chunk_size": "auto"})
 
 
-def test_orchestrator_vlm_configs_must_disable_renderer():
-    with pytest.raises(ValidationError, match="orchestrator.use_renderer is not supported for VLMs"):
+def test_orchestrator_vlm_requires_renderer():
+    with pytest.raises(ValidationError, match="orchestrator.renderer must be set when model.vlm is set"):
         OrchestratorConfig.model_validate(
             {
-                "model": {
-                    "vlm": {
-                        "vision_encoder_attr": "model.visual",
-                        "language_model_attr": "model.language_model",
+                "student": {
+                    "model": {
+                        "name": "Qwen/Qwen3-VL-4B-Instruct",
+                        "vlm": {
+                            "vision_encoder_attr": "model.visual",
+                            "language_model_attr": "model.language_model",
+                        },
                     }
-                }
+                },
+                "renderer": None,
             }
         )
 
     config = OrchestratorConfig.model_validate(
         {
-            "model": {
-                "vlm": {
-                    "vision_encoder_attr": "model.visual",
-                    "language_model_attr": "model.language_model",
+            "student": {
+                "model": {
+                    "name": "Qwen/Qwen3-VL-4B-Instruct",
+                    "vlm": {
+                        "vision_encoder_attr": "model.visual",
+                        "language_model_attr": "model.language_model",
+                    },
                 }
             },
-            "use_renderer": False,
         }
     )
 
-    assert config.use_renderer is False
+    assert config.renderer is not None
 
 
 def test_selective_activation_checkpointing_requires_custom_impl():
@@ -479,664 +207,257 @@ def test_selective_activation_checkpointing_requires_custom_impl():
         TrainerModelConfig.model_validate({"impl": "hf", "ac": {"mode": "selective"}})
 
 
-def test_ray_runtime_config_requires_ray_transport():
-    with pytest.raises(ValidationError, match="rollout_transport.type = 'ray'"):
-        cli(
-            RLConfig,
-            args=[
-                "@",
-                "examples/reverse_text/rl.toml",
-                "--experimental.ray.enabled",
-            ],
+def test_shared_model_name_propagates_to_subconfigs():
+    model_name = "PrimeIntellect/test-model"
+    config = RLConfig.model_validate(
+        {
+            "model": {"name": model_name},
+            "trainer": {},
+            "orchestrator": {"renderer": None},
+            "inference": {},
+        }
+    )
+    assert config.trainer.model.name == model_name
+    assert config.orchestrator.student.model.name == model_name
+    assert config.inference is not None and config.inference.model.name == model_name
+    assert config.trainer.tokenizer.name == model_name
+    assert config.orchestrator.tokenizer.name == model_name
+
+
+def test_shared_tokenizer_propagates_when_subconfigs_unset():
+    config = RLConfig.model_validate(
+        {
+            "model": {"name": "my-model"},
+            "tokenizer": {"name": "my-tokenizer"},
+            "trainer": {},
+            "orchestrator": {"renderer": None},
+        }
+    )
+    assert config.trainer.tokenizer.name == "my-tokenizer"
+    assert config.orchestrator.tokenizer.name == "my-tokenizer"
+
+
+def test_shared_and_sub_tokenizer_name_conflict_raises():
+    """Setting tokenizer.name in both [tokenizer] and [trainer.tokenizer]
+    is a config conflict — the sub-config would silently win, and any later
+    CLI override of [tokenizer].name would silently no-op for the trainer."""
+    with pytest.raises(ValidationError, match=r"tokenizer.name.*trainer.tokenizer.name"):
+        RLConfig.model_validate(
+            {
+                "model": {"name": "my-model"},
+                "tokenizer": {"name": "shared-tok"},
+                "trainer": {"tokenizer": {"name": "trainer-tok"}},
+                "orchestrator": {"renderer": None},
+            }
         )
 
 
-def test_ray_runtime_config_parses_with_ray_transport():
-    config = cli(
-        RLConfig,
-        args=[
-            "@",
-            "examples/reverse_text/rl.toml",
-            "--experimental.ray.enabled",
-            "--experimental.ray.namespace",
-            "test",
-            "--trainer.rollout-transport.type",
-            "ray",
-            "--orchestrator.rollout-transport.type",
-            "ray",
-        ],
-    )
-    assert config.experimental.ray.enabled
-    assert config.experimental.ray.namespace == "test"
-    assert config.experimental.ray.placement_strategy == "STRICT_PACK"
-    assert config.experimental.ray.trainer_backend == "tasks"
-    assert config.experimental.ray.inference_backend == "prime_vllm"
-    assert config.trainer.rollout_transport.type == "ray"
-    assert config.orchestrator.rollout_transport.type == "ray"
-
-
-def test_ray_runtime_config_parses_prime_vllm_inference_backend():
-    config = cli(
-        RLConfig,
-        args=[
-            "@",
-            "examples/reverse_text/rl.toml",
-            "--experimental.ray.enabled",
-            "--experimental.ray.inference-backend",
-            "prime_vllm",
-            "--trainer.rollout-transport.type",
-            "ray",
-            "--orchestrator.rollout-transport.type",
-            "ray",
-        ],
-    )
-    assert config.experimental.ray.inference_backend == "prime_vllm"
-
-
-def test_ray_runtime_config_parses_ray_train_backend():
-    config = cli(
-        RLConfig,
-        args=[
-            "@",
-            "examples/reverse_text/rl.toml",
-            "--experimental.ray.enabled",
-            "--experimental.ray.trainer-backend",
-            "ray_train",
-            "--experimental.ray.train-run-name",
-            "test-run",
-            "--experimental.ray.train-storage-path",
-            "/tmp/ray-train",
-            "--trainer.rollout-transport.type",
-            "ray",
-            "--orchestrator.rollout-transport.type",
-            "ray",
-        ],
-    )
-    assert config.experimental.ray.trainer_backend == "ray_train"
-    assert config.experimental.ray.train_run_name == "test-run"
-    assert config.experimental.ray.train_storage_path == "/tmp/ray-train"
-
-
-def test_ray_runtime_config_parses_ray_cluster_deployment(tmp_path):
-    write_toml(
-        tmp_path / "ray_cluster.toml",
+def test_tokenizer_name_falls_back_to_model_name_when_unset():
+    config = RLConfig.model_validate(
         {
-            "deployment": {
-                "type": "ray_cluster",
-                "gpus_per_node": 1,
-                "num_train_gpus": 1,
-                "num_infer_gpus": 1,
-            },
-            "experimental": {
-                "ray": {
-                    "enabled": True,
-                    "address": "auto",
-                    "namespace": "test",
-                    "placement_strategy": "SPREAD",
-                    "trainer_backend": "ray_train",
-                    "inference_backend": "prime_vllm",
-                }
-            },
-            "trainer": {"rollout_transport": {"type": "ray", "address": "auto", "namespace": "test"}},
-            "orchestrator": {"rollout_transport": {"type": "ray", "address": "auto", "namespace": "test"}},
-        },
+            "model": {"name": "my-model"},
+            "tokenizer": {"trust_remote_code": True},
+            "trainer": {},
+            "orchestrator": {"renderer": None},
+        }
     )
-
-    config = cli(
-        RLConfig,
-        args=[
-            "@",
-            "examples/reverse_text/rl.toml",
-            "@",
-            str(tmp_path / "ray_cluster.toml"),
-        ],
-    )
-
-    assert config.deployment.type == "ray_cluster"
-    assert config.deployment.num_train_gpus == 1
-    assert config.deployment.num_infer_gpus == 1
-    assert config.experimental.ray.enabled
-    assert config.experimental.ray.placement_strategy == "SPREAD"
-    assert config.experimental.ray.trainer_backend == "ray_train"
+    assert config.trainer.tokenizer.name == "my-model"
+    assert config.orchestrator.tokenizer.name == "my-model"
+    assert config.trainer.tokenizer.trust_remote_code is True
+    assert config.orchestrator.tokenizer.trust_remote_code is True
 
 
-def test_ray_cluster_deployment_can_be_selected_before_ray_cli_flags(tmp_path):
-    write_toml(
-        tmp_path / "ray_cluster.toml",
+def test_explicit_subconfig_tokenizer_name_survives_shared_model_propagation():
+    """Regression: shared ``[model] name = "M"`` must propagate model names but
+    must NOT clobber an explicit ``[orchestrator.tokenizer] name = "T"``.
+
+    This is the case that the old RL-level ``auto_setup_tokenizer`` fix-up got
+    wrong: it unconditionally re-derived ``orchestrator.tokenizer.name`` from
+    ``orchestrator.student.model.name`` after propagation, silently overriding
+    the user's explicit value. The ``mode="before"`` ``auto_setup_shared_configs``
+    propagator fixes this because it propagates the model name into the raw
+    dict before sub-configs are built, so ``OrchestratorConfig``'s own
+    ``auto_setup_tokenizer`` (mode=after) sees the resolved name *and* the
+    explicit user-set tokenizer name, and the ``fill``-if-absent semantic
+    leaves the explicit value alone.
+    """
+    config = RLConfig.model_validate(
         {
-            "deployment": {
-                "type": "ray_cluster",
-                "num_train_gpus": 1,
-                "num_infer_gpus": 1,
+            "model": {"name": "M"},
+            "trainer": {},
+            "orchestrator": {
+                "renderer": None,
+                "tokenizer": {"name": "explicit-orch-tok"},
             },
-            "trainer": {"rollout_transport": {"type": "ray"}},
-            "orchestrator": {"rollout_transport": {"type": "ray"}},
-        },
+        }
     )
-
-    config = cli(
-        RLConfig,
-        args=[
-            "@",
-            "examples/reverse_text/rl.toml",
-            "@",
-            str(tmp_path / "ray_cluster.toml"),
-            "--experimental.ray.enabled",
-        ],
-    )
-    assert config.deployment.type == "ray_cluster"
-    assert config.experimental.ray.enabled
+    # Shared model.name reached every sub-config that didn't override it.
+    assert config.trainer.model.name == "M"
+    assert config.orchestrator.student.model.name == "M"
+    # Trainer didn't specify a tokenizer, so it falls back to the propagated model name.
+    assert config.trainer.tokenizer.name == "M"
+    # Orchestrator's explicit tokenizer name survived.
+    assert config.orchestrator.tokenizer.name == "explicit-orch-tok"
 
 
-def test_ray_runtime_rejects_slurm_multinode_deployment(tmp_path):
-    write_toml(
-        tmp_path / "ray_multinode.toml",
-        {
-            "deployment": {
-                "type": "multi_node",
-                "num_train_nodes": 1,
-                "num_infer_nodes": 1,
-            },
-            "experimental": {"ray": {"enabled": True}},
-            "trainer": {"rollout_transport": {"type": "ray"}},
-            "orchestrator": {"rollout_transport": {"type": "ray"}},
-        },
-    )
-
-    with pytest.raises(ConfigFileError, match="Use deployment.type = 'ray_cluster'"):
-        cli(
-            RLConfig,
-            args=[
-                "@",
-                "examples/reverse_text/rl.toml",
-                "@",
-                str(tmp_path / "ray_multinode.toml"),
-            ],
+def test_tokenizer_chat_template_mismatch_raises():
+    with pytest.raises(ValidationError, match="chat_template"):
+        RLConfig.model_validate(
+            {
+                "trainer": {"tokenizer": {"chat_template": "A"}},
+                "orchestrator": {"renderer": None, "tokenizer": {"chat_template": "B"}},
+            }
         )
 
 
-def test_ray_cluster_inference_bundle_must_fit_one_node(tmp_path):
-    write_toml(
-        tmp_path / "ray_cluster.toml",
+def test_shared_seq_len_propagates_to_subconfigs():
+    config = RLConfig.model_validate(
         {
-            "deployment": {
-                "type": "ray_cluster",
-                "gpus_per_node": 1,
-                "num_train_gpus": 1,
-                "num_infer_gpus": 2,
-            },
-            "experimental": {"ray": {"enabled": True}},
-            "trainer": {"rollout_transport": {"type": "ray"}},
-            "orchestrator": {"rollout_transport": {"type": "ray"}},
-        },
+            "seq_len": 4096,
+            "trainer": {},
+            "orchestrator": {"renderer": None},
+        }
     )
+    assert config.trainer.model.seq_len == 4096
+    assert config.orchestrator.seq_len == 4096
 
-    with pytest.raises(ConfigFileError, match="Prime-vLLM inference is scheduled as one Ray task"):
-        cli(
-            RLConfig,
-            args=[
-                "@",
-                "examples/reverse_text/rl.toml",
-                "@",
-                str(tmp_path / "ray_cluster.toml"),
-            ],
+
+def test_shared_and_sub_seq_len_conflict_raises():
+    """Setting seq_len at the shared level and on a sub-config is a conflict —
+    forces the user to pick one place to express the value rather than
+    relying on the silent 'sub wins' rule."""
+    with pytest.raises(ValidationError, match=r"seq_len.*trainer.model.seq_len"):
+        RLConfig.model_validate(
+            {
+                "seq_len": 4096,
+                "trainer": {"model": {"seq_len": 8192}},
+                "orchestrator": {"renderer": None},
+            }
         )
 
 
-def test_ray_cluster_num_teacher_gpus_auto_configures_teacher_model(tmp_path):
-    write_toml(
-        tmp_path / "ray_cluster_teacher.toml",
+def test_shared_and_sub_model_name_conflict_raises():
+    """Setting model.name at the shared level and on a sub-config is a conflict."""
+    with pytest.raises(ValidationError, match=r"model.name.*trainer.model.name"):
+        RLConfig.model_validate(
+            {
+                "model": {"name": "X"},
+                "trainer": {"model": {"name": "Y"}},
+                "orchestrator": {"renderer": None},
+            }
+        )
+
+
+def test_shared_and_sub_max_steps_conflict_raises():
+    """Top-level scalar shared fields also participate in the mutex check."""
+    with pytest.raises(ValidationError, match=r"max_steps.*orchestrator.max_steps"):
+        RLConfig.model_validate(
+            {
+                "max_steps": 100,
+                "trainer": {},
+                "orchestrator": {"renderer": None, "max_steps": 200},
+            }
+        )
+
+
+def test_trainer_chat_template_cascades_to_inference():
+    """``[trainer.tokenizer] chat_template`` set directly (no shared
+    ``[tokenizer] chat_template``) must still reach
+    ``inference.model.chat_template`` so vLLM's ``--chat-template`` is wired
+    up. Regression: the original ``auto_setup_tokenizer`` cascaded this; the
+    refactored propagator must keep doing it."""
+    config = RLConfig.model_validate(
         {
-            "deployment": {
-                "type": "ray_cluster",
-                "num_train_gpus": 1,
-                "num_infer_gpus": 1,
-                "num_teacher_gpus": 1,
-            },
-            "experimental": {"ray": {"enabled": True}},
-            "trainer": {
-                "rollout_transport": {"type": "ray"},
-                "loss": {"teacher_tau": 1.0},
-            },
-            "orchestrator": {"rollout_transport": {"type": "ray"}},
-        },
+            "model": {"name": "Qwen/Qwen3-0.6B"},
+            "trainer": {"tokenizer": {"chat_template": "TPL"}},
+            "orchestrator": {"renderer": None, "tokenizer": {"chat_template": "TPL"}},
+            "inference": {},
+        }
     )
-
-    config = cli(
-        RLConfig,
-        args=[
-            "@",
-            "examples/reverse_text/rl.toml",
-            "@",
-            str(tmp_path / "ray_cluster_teacher.toml"),
-        ],
-    )
-
-    assert config.deployment.type == "ray_cluster"
-    assert config.teacher_inference is not None
-    assert config.teacher_inference.server.port == config.inference.server.port + 1
-    assert config.orchestrator.teacher_model is not None
-    assert config.orchestrator.teacher_model.client.base_url == ["http://localhost:8001/v1"]
-    assert config.orchestrator.teacher_model.model.name == config.teacher_inference.model.name
-
-
-def test_ray_cluster_auto_setup_orchestrator_num_train_workers(tmp_path):
-    """Multi-GPU trainer in ray_cluster auto-sets orchestrator.num_train_workers."""
-    write_toml(
-        tmp_path / "ray_cluster.toml",
-        {
-            "deployment": {
-                "type": "ray_cluster",
-                "gpus_per_node": 8,
-                "num_train_gpus": 8,
-                "num_infer_gpus": 1,
-            },
-            "experimental": {"ray": {"enabled": True}},
-            "trainer": {"rollout_transport": {"type": "ray"}},
-            "orchestrator": {"rollout_transport": {"type": "ray"}},
-        },
-    )
-
-    config = cli(
-        RLConfig,
-        args=[
-            "@",
-            "examples/reverse_text/rl.toml",
-            "@",
-            str(tmp_path / "ray_cluster.toml"),
-        ],
-    )
-
-    assert config.deployment.type == "ray_cluster"
-    assert config.orchestrator.num_train_workers == 8
-
-
-def test_ray_cluster_auto_setup_inference_dp_from_num_infer_gpus(tmp_path):
-    """num_infer_gpus / tp drives inference.parallel.dp and api_server_count."""
-    write_toml(
-        tmp_path / "ray_cluster.toml",
-        {
-            "deployment": {
-                "type": "ray_cluster",
-                "gpus_per_node": 8,
-                "num_train_gpus": 1,
-                "num_infer_gpus": 4,
-            },
-            "experimental": {"ray": {"enabled": True}},
-            "trainer": {"rollout_transport": {"type": "ray"}},
-            "orchestrator": {"rollout_transport": {"type": "ray"}},
-            "inference": {"parallel": {"tp": 2}},
-        },
-    )
-
-    config = cli(
-        RLConfig,
-        args=[
-            "@",
-            "examples/reverse_text/rl.toml",
-            "@",
-            str(tmp_path / "ray_cluster.toml"),
-        ],
-    )
-
-    assert config.deployment.type == "ray_cluster"
-    assert config.inference.parallel.tp == 2
-    assert config.inference.parallel.dp == 2  # 4 / 2
-    assert config.inference.api_server_count >= 2
-
-
-def test_ray_cluster_auto_setup_dp_replicate_for_multi_node_trainer(tmp_path):
-    """num_train_gpus > gpus_per_node defaults trainer.model.dp_replicate to HSDP."""
-    write_toml(
-        tmp_path / "ray_cluster.toml",
-        {
-            "deployment": {
-                "type": "ray_cluster",
-                "gpus_per_node": 8,
-                "num_train_gpus": 16,
-                "num_infer_gpus": 8,
-            },
-            "experimental": {"ray": {"enabled": True}},
-            "trainer": {"rollout_transport": {"type": "ray"}},
-            "orchestrator": {"rollout_transport": {"type": "ray"}},
-            "inference": {"parallel": {"tp": 8}},
-        },
-    )
-
-    config = cli(
-        RLConfig,
-        args=[
-            "@",
-            "examples/reverse_text/rl.toml",
-            "@",
-            str(tmp_path / "ray_cluster.toml"),
-        ],
-    )
-
-    assert config.deployment.type == "ray_cluster"
-    assert config.trainer.model.dp_replicate == 2  # 16 / 8
-
-
-def test_ray_cluster_user_dp_replicate_is_preserved(tmp_path):
-    """Explicit trainer.model.dp_replicate is not clobbered by ray_cluster auto-setup."""
-    write_toml(
-        tmp_path / "ray_cluster.toml",
-        {
-            "deployment": {
-                "type": "ray_cluster",
-                "gpus_per_node": 8,
-                "num_train_gpus": 16,
-                "num_infer_gpus": 8,
-            },
-            "experimental": {"ray": {"enabled": True}},
-            "trainer": {
-                "rollout_transport": {"type": "ray"},
-                "model": {"dp_replicate": 4},
-            },
-            "orchestrator": {"rollout_transport": {"type": "ray"}},
-            "inference": {"parallel": {"tp": 8}},
-        },
-    )
-
-    config = cli(
-        RLConfig,
-        args=[
-            "@",
-            "examples/reverse_text/rl.toml",
-            "@",
-            str(tmp_path / "ray_cluster.toml"),
-        ],
-    )
-
-    assert config.trainer.model.dp_replicate == 4
-
-
-def test_ray_cluster_auto_setup_dp_replicate_skipped_for_single_node_trainer(tmp_path):
-    """num_train_gpus <= gpus_per_node leaves trainer.model.dp_replicate at the default."""
-    write_toml(
-        tmp_path / "ray_cluster.toml",
-        {
-            "deployment": {
-                "type": "ray_cluster",
-                "gpus_per_node": 8,
-                "num_train_gpus": 8,
-                "num_infer_gpus": 1,
-            },
-            "experimental": {"ray": {"enabled": True}},
-            "trainer": {"rollout_transport": {"type": "ray"}},
-            "orchestrator": {"rollout_transport": {"type": "ray"}},
-        },
-    )
-
-    config = cli(
-        RLConfig,
-        args=[
-            "@",
-            "examples/reverse_text/rl.toml",
-            "@",
-            str(tmp_path / "ray_cluster.toml"),
-        ],
-    )
-
-    assert config.trainer.model.dp_replicate == 1
-
-
-def test_ray_cluster_16gpu_example_config_parses():
-    """The shipped 16-GPU example config parses and auto-setup runs end to end."""
-    config = cli(
-        RLConfig,
-        args=[
-            "@",
-            "examples/reverse_text/rl.toml",
-            "@",
-            "k8s/raycluster/rl-16gpu-example.toml",
-        ],
-    )
-
-    assert config.deployment.type == "ray_cluster"
-    assert config.deployment.num_train_gpus == 8
-    assert config.deployment.num_infer_gpus == 8
-    assert config.deployment.gpus_per_node == 8
-    assert config.experimental.ray.enabled
+    assert config.trainer.tokenizer.chat_template == "TPL"
+    assert config.orchestrator.tokenizer.chat_template == "TPL"
     assert config.inference is not None
-    assert config.inference.parallel.tp == 8
-    assert config.inference.parallel.dp == 1
-    assert config.orchestrator.num_train_workers == 8
-    assert config.trainer.model.dp_replicate == 1
+    assert config.inference.model.chat_template == "TPL"
 
 
-def test_ray_runtime_config_parses_runtime_env(tmp_path):
-    config = cli(
-        RLConfig,
-        args=[
-            "@",
-            "examples/reverse_text/rl.toml",
-            "--experimental.ray.enabled",
-            "--experimental.ray.address",
-            "ray-head.ray.svc.cluster.local:6379",
-            "--experimental.ray.runtime-env.working-dir",
-            tmp_path.as_posix(),
-            "--experimental.ray.runtime-env.env-vars",
-            '{"PYTHONPATH": "/repo/src:/repo/packages/prime-rl-configs/src"}',
-            "--trainer.rollout-transport.type",
-            "ray",
-            "--trainer.rollout-transport.address",
-            "ray-head.ray.svc.cluster.local:6379",
-            "--orchestrator.rollout-transport.type",
-            "ray",
-            "--orchestrator.rollout-transport.address",
-            "ray-head.ray.svc.cluster.local:6379",
-        ],
+def test_shared_wandb_fields_propagate_to_subconfigs():
+    """Every ``SharedWandbConfig`` leaf (project, entity, group, tags, offline)
+    propagates to both trainer.wandb and orchestrator.wandb, not just project
+    and offline. Regression for a miss in the inline propagator."""
+    config = RLConfig.model_validate(
+        {
+            "model": {"name": "Qwen/Qwen3-0.6B"},
+            "wandb": {
+                "project": "shared-proj",
+                "entity": "shared-entity",
+                "group": "shared-group",
+                "tags": ["a", "b"],
+                "shared": False,
+                "offline": True,
+            },
+            "trainer": {},
+            "orchestrator": {"renderer": None},
+        }
     )
-    assert config.experimental.ray.address == "ray-head.ray.svc.cluster.local:6379"
-    assert config.experimental.ray.runtime_env.working_dir == tmp_path.as_posix()
-    assert config.experimental.ray.runtime_env.env_vars["PYTHONPATH"] == "/repo/src:/repo/packages/prime-rl-configs/src"
-    assert config.trainer.rollout_transport.address == "ray-head.ray.svc.cluster.local:6379"
-    assert config.orchestrator.rollout_transport.address == "ray-head.ray.svc.cluster.local:6379"
+    for component in (config.trainer.wandb, config.orchestrator.wandb):
+        assert component is not None
+        assert component.project == "shared-proj"
+        assert component.entity == "shared-entity"
+        assert component.group == "shared-group"
+        assert component.tags == ["a", "b"]
+        assert component.offline is True
 
 
-def test_ray_runtime_config_requires_matching_actor_name():
-    with pytest.raises(ValidationError, match="same actor_name"):
-        cli(
-            RLConfig,
-            args=[
-                "@",
-                "examples/reverse_text/rl.toml",
-                "--experimental.ray.enabled",
-                "--trainer.rollout-transport.type",
-                "ray",
-                "--trainer.rollout-transport.actor-name",
-                "trainer-transport",
-                "--orchestrator.rollout-transport.type",
-                "ray",
-                "--orchestrator.rollout-transport.actor-name",
-                "orchestrator-transport",
-            ],
-        )
-
-
-def test_ray_runtime_config_requires_matching_namespace():
-    with pytest.raises(ValidationError, match="same namespace"):
-        cli(
-            RLConfig,
-            args=[
-                "@",
-                "examples/reverse_text/rl.toml",
-                "--experimental.ray.enabled",
-                "--trainer.rollout-transport.type",
-                "ray",
-                "--trainer.rollout-transport.namespace",
-                "trainer",
-                "--orchestrator.rollout-transport.type",
-                "ray",
-                "--orchestrator.rollout-transport.namespace",
-                "orchestrator",
-            ],
-        )
-
-
-def test_ray_transport_config_parses():
-    transport = TypeAdapter(TransportConfig).validate_python(
-        {"type": "ray", "address": "auto", "namespace": "test", "actor_name": "transport"}
+def test_empty_shared_ckpt_block_does_not_conflict_with_subconfig_ckpt():
+    """An empty shared [ckpt] block is a presence-only signal, not a field
+    setting — it should not conflict with a non-empty [trainer.ckpt]."""
+    config = RLConfig.model_validate(
+        {
+            "ckpt": {},  # empty block, no field set
+            "trainer": {"ckpt": {"interval": 50}},
+            "orchestrator": {"renderer": None, "ckpt": {"interval": 50}},
+        }
     )
-    assert transport.type == "ray"
-    assert transport.address == "auto"
-    assert transport.namespace == "test"
-    assert transport.actor_name == "transport"
+    assert config.trainer.ckpt is not None
+    assert config.trainer.ckpt.interval == 50
 
 
-def test_ray_native_rewrites_local_inference_client_urls():
-    orchestrator = OrchestratorConfig()
-    inference = InferenceConfig()
-    inference.server.port = 8123
-    orchestrator.client.admin_base_url = ["http://127.0.0.1:8000/v1"]
-
-    rewritten = _orchestrator_with_ray_inference_endpoint(orchestrator, inference, "10.0.4.184")
-
-    assert rewritten.client.base_url == ["http://10.0.4.184:8123/v1"]
-    assert rewritten.client.admin_base_url == ["http://10.0.4.184:8123/v1"]
-    assert orchestrator.client.base_url == ["http://localhost:8000/v1"]
-    assert orchestrator.client.admin_base_url == ["http://127.0.0.1:8000/v1"]
-
-
-def test_ray_native_preserves_external_inference_client_urls():
-    orchestrator = OrchestratorConfig()
-    inference = InferenceConfig()
-    orchestrator.client.base_url = ["http://inference.ray.svc.cluster.local:8000/v1"]
-
-    rewritten = _orchestrator_with_ray_inference_endpoint(orchestrator, inference, "10.0.4.184")
-
-    assert rewritten.client.base_url == ["http://inference.ray.svc.cluster.local:8000/v1"]
+def test_shared_and_subconfig_disjoint_fields_coexist():
+    """Per-field mutex only forbids conflicts on the SAME field — disjoint
+    fields in [model] vs [trainer.model] are fine."""
+    config = RLConfig.model_validate(
+        {
+            "model": {"name": "Qwen/Qwen3-0.6B"},
+            "trainer": {"model": {"impl": "custom"}},
+            "orchestrator": {"renderer": None},
+        }
+    )
+    assert config.trainer.model.name == "Qwen/Qwen3-0.6B"
+    assert config.trainer.model.impl == "custom"
 
 
-def test_ray_native_rewrites_local_teacher_inference_client_urls():
-    orchestrator = OrchestratorConfig()
-    orchestrator.teacher_model = TeacherModelConfig()
-    orchestrator.teacher_model.client.base_url = ["http://0.0.0.0:8001/v1"]
-    teacher_inference = InferenceConfig()
-    teacher_inference.server.port = 8124
-
-    rewritten = _orchestrator_with_ray_teacher_endpoint(orchestrator, teacher_inference, "10.0.9.162")
-
-    assert rewritten.teacher_model.client.base_url == ["http://10.0.9.162:8124/v1"]
-    assert orchestrator.teacher_model.client.base_url == ["http://0.0.0.0:8001/v1"]
-
-
-def test_ray_transport_config_reclaim_stale_actor_defaults_false():
-    transport = TypeAdapter(TransportConfig).validate_python({"type": "ray"})
-    assert transport.type == "ray"
-    assert transport.reclaim_stale_actor is False
-
-
-def test_ray_transport_store_per_rank_micro_batch_cap():
-    """Regression: max_queued_items applies per data_rank, not globally."""
-    store = _RayTransportStore(max_queued_items=2)
-
-    store.put_micro_batch(data_rank=0, step=0, payload=b"a")
-    store.put_micro_batch(data_rank=0, step=1, payload=b"b")
-    store.put_micro_batch(data_rank=1, step=0, payload=b"c")
-    store.put_micro_batch(data_rank=1, step=1, payload=b"d")
-
-    with pytest.raises(RuntimeError, match="data_rank=0"):
-        store.put_micro_batch(data_rank=0, step=2, payload=b"e")
-
-    assert store.pop_micro_batch(data_rank=1, step=0) == b"c"
-    store.put_micro_batch(data_rank=1, step=2, payload=b"f")
-
-
-def test_ray_transport_store_per_sender_training_batch_cap():
-    """Regression: training-batch cap is per sender_id, not globally."""
-    store = _RayTransportStore(max_queued_items=2)
-
-    store.put_training_batch("sender-a", b"a0")
-    store.put_training_batch("sender-a", b"a1")
-    store.put_training_batch("sender-b", b"b0")
-    store.put_training_batch("sender-b", b"b1")
-
-    with pytest.raises(RuntimeError, match="sender-a"):
-        store.put_training_batch("sender-a", b"a2")
-
-
-class _FakeRay:
-    """Minimal stub used to drive _monitor_roles without a live Ray cluster."""
-
-    def __init__(self, ready_order: list[object], failure_map: dict[object, BaseException] | None = None) -> None:
-        self._ready_order = list(ready_order)
-        self._failures = failure_map or {}
-        self.cancelled: list[object] = []
-
-    def wait(self, refs, num_returns: int = 1, timeout: float = 0.0):
-        ref_set = set(refs)
-        for ref in list(self._ready_order):
-            if ref in ref_set:
-                self._ready_order.remove(ref)
-                return [ref], [r for r in refs if r is not ref]
-        return [], list(refs)
-
-    def get(self, ref):
-        if ref in self._failures:
-            raise self._failures[ref]
-        return None
-
-    def cancel(self, ref, force: bool = False) -> None:
-        self.cancelled.append(ref)
-
-
-def test_monitor_roles_surfaces_real_exception_from_failed_role():
-    """When a role's Ray task raises, _monitor_roles must chain that exception so
-    operators see the real cause (e.g. vLLM stack trace) and not just a launcher message."""
-    inference_ref = object()
-    orchestrator_ref = object()
-    real_failure = RuntimeError("vLLM engine OOM")
-    refs = {
-        inference_ref: ("inference", Path("/tmp/inference.log")),
-        orchestrator_ref: ("orchestrator", Path("/tmp/orchestrator.log")),
-    }
-    fake = _FakeRay(ready_order=[inference_ref], failure_map={inference_ref: real_failure})
-
-    with pytest.raises(RuntimeError, match="Ray-native role inference failed") as excinfo:
-        _monitor_roles(fake, refs, critical_names={"orchestrator"}, poll_interval_seconds=0.0)
-
-    assert excinfo.value.__cause__ is real_failure
-    assert orchestrator_ref in fake.cancelled
-
-
-def test_monitor_roles_raises_when_long_running_role_returns_cleanly():
-    """When a non-critical role returns cleanly before training finishes (e.g. inference
-    exits 0 unexpectedly), _monitor_roles must raise and cancel remaining roles."""
-    inference_ref = object()
-    orchestrator_ref = object()
-    refs = {
-        inference_ref: ("inference", Path("/tmp/inference.log")),
-        orchestrator_ref: ("orchestrator", Path("/tmp/orchestrator.log")),
-    }
-    fake = _FakeRay(ready_order=[inference_ref])
-
-    with pytest.raises(RuntimeError, match="exited before training finished"):
-        _monitor_roles(fake, refs, critical_names={"orchestrator"}, poll_interval_seconds=0.0)
-
-    assert orchestrator_ref in fake.cancelled
-
-
-def test_monitor_roles_cancels_non_critical_after_critical_completes():
-    """When all critical roles finish, _monitor_roles must cancel remaining non-critical
-    roles instead of waiting on them forever."""
-    orchestrator_ref = object()
-    inference_ref = object()
-    refs = {
-        orchestrator_ref: ("orchestrator", Path("/tmp/orchestrator.log")),
-        inference_ref: ("inference", Path("/tmp/inference.log")),
-    }
-    fake = _FakeRay(ready_order=[orchestrator_ref])
-
-    _monitor_roles(fake, refs, critical_names={"orchestrator"}, poll_interval_seconds=0.0)
-
-    assert inference_ref in fake.cancelled
-    assert orchestrator_ref not in fake.cancelled
+def test_shared_output_dir_propagates_through_cli(tmp_path):
+    """Shared output_dir from CLI reaches sub-configs even when tyro constructs sub-configs before the before-validator."""
+    toml_path = tmp_path / "cfg.toml"
+    write_toml(
+        toml_path,
+        {
+            "max_steps": 1,
+            "seq_len": 128,
+            "model": {"name": "Qwen/Qwen3-0.6B"},
+            "trainer": {},
+            "orchestrator": {"batch_size": 16, "group_size": 1},
+            "inference": {},
+        },
+    )
+    shared_out = tmp_path / "shared"
+    config = cli(RLConfig, args=["@", str(toml_path), "--output-dir", str(shared_out)])
+    assert config.trainer.output_dir == shared_out
+    assert config.orchestrator.output_dir == shared_out / "run_default"
 
 
 def test_orchestrator_renderer_auto_rejects_unmapped_model():
-    """use_renderer=True with renderer.name='auto' must reject models not in MODEL_RENDERER_MAP."""
+    """Default ``renderer`` (AutoRendererConfig) must reject models not in MODEL_RENDERER_MAP."""
     with pytest.raises(ValidationError, match="silently fall back to DefaultRenderer"):
         OrchestratorConfig.model_validate({"model": {"name": "not-a-real-org/not-a-real-model"}})
 
@@ -1144,7 +465,7 @@ def test_orchestrator_renderer_auto_rejects_unmapped_model():
 def test_orchestrator_renderer_auto_accepts_mapped_model():
     """The default Qwen model is in MODEL_RENDERER_MAP and should validate cleanly."""
     config = OrchestratorConfig.model_validate({"model": {"name": "Qwen/Qwen3-0.6B"}})
-    assert config.use_renderer is True
+    assert config.renderer is not None
     assert config.renderer.name == "auto"
 
 
@@ -1156,18 +477,19 @@ def test_orchestrator_explicit_renderer_skips_unmapped_check():
             "renderer": {"name": "qwen3"},
         }
     )
+    assert config.renderer is not None
     assert config.renderer.name == "qwen3"
 
 
-def test_orchestrator_use_renderer_false_skips_unmapped_check():
-    """use_renderer=False means the renderer client isn't used, so MODEL_RENDERER_MAP doesn't apply."""
+def test_orchestrator_renderer_none_skips_unmapped_check():
+    """renderer=None (MITO mode) means the renderer client isn't used, so MODEL_RENDERER_MAP doesn't apply."""
     config = OrchestratorConfig.model_validate(
         {
             "model": {"name": "not-a-real-org/not-a-real-model"},
-            "use_renderer": False,
+            "renderer": None,
         }
     )
-    assert config.use_renderer is False
+    assert config.renderer is None
 
 
 def test_orchestrator_explicit_default_renderer_with_unmapped_model():
@@ -1178,5 +500,39 @@ def test_orchestrator_explicit_default_renderer_with_unmapped_model():
             "renderer": {"name": "default", "tool_parser": "qwen3"},
         }
     )
+    assert config.renderer is not None
     assert config.renderer.name == "default"
     assert config.renderer.tool_parser == "qwen3"
+
+
+def test_shared_model_name_resolves_inference_parsers():
+    """Shared [model] name must reach inference.model BEFORE ModelConfig's after-validator
+    runs auto_resolve_parsers — i.e. the parsers resolve from the propagated name, not
+    from an empty default.
+    """
+    config = RLConfig.model_validate(
+        {
+            "model": {"name": "Qwen/Qwen3-Coder-30B-A3B-Instruct"},
+            "trainer": {},
+            "orchestrator": {"renderer": None},
+            "inference": {},
+        }
+    )
+    assert config.inference is not None
+    assert config.inference.model.name == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+    assert config.inference.model.tool_call_parser == "qwen3_coder"
+
+
+def test_explicit_inference_parser_wins_over_auto():
+    """Explicit inference.model.tool_call_parser is preserved even when the shared model
+    name would otherwise auto-resolve to something else."""
+    config = RLConfig.model_validate(
+        {
+            "model": {"name": "Qwen/Qwen3-Coder-30B-A3B-Instruct"},
+            "trainer": {},
+            "orchestrator": {"renderer": None},
+            "inference": {"model": {"tool_call_parser": "hermes"}},
+        }
+    )
+    assert config.inference is not None
+    assert config.inference.model.tool_call_parser == "hermes"

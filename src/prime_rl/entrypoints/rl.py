@@ -12,23 +12,18 @@ from threading import Event, Thread
 import pynvml
 import tomli_w
 
-import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before transitive import
 from prime_rl.configs.rl import RLConfig
-from prime_rl.trainer.model import pre_download_model
 from prime_rl.utils.config import cli
 from prime_rl.utils.logger import get_logger, setup_logger
 from prime_rl.utils.pathing import (
     clean_future_steps,
     format_log_message,
     get_ckpt_dir,
+    get_log_dir,
     resolve_latest_ckpt_step,
     validate_output_dir,
 )
 from prime_rl.utils.process import cleanup_processes, cleanup_threads, monitor_process, set_proc_title
-from prime_rl.utils.utils import (
-    get_free_port,
-    get_log_dir,
-)
 
 RL_TOML = "rl.toml"
 RL_SBATCH = "rl.sbatch"
@@ -36,7 +31,6 @@ RL_SBATCH = "rl.sbatch"
 TRAINER_TOML = "trainer.toml"
 ORCHESTRATOR_TOML = "orchestrator.toml"
 INFERENCE_TOML = "inference.toml"
-TEACHER_INFERENCE_TOML = "teacher_inference.toml"
 
 
 def get_physical_gpu_ids() -> list[int]:
@@ -72,57 +66,6 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
         with open(output_dir / INFERENCE_TOML, "wb") as f:
             tomli_w.dump(config.inference.model_dump(exclude=exclude_inference, exclude_none=True, mode="json"), f)
 
-    teacher_inference = getattr(config, "teacher_inference", None)
-    if teacher_inference is not None:
-        with open(output_dir / TEACHER_INFERENCE_TOML, "wb") as f:
-            tomli_w.dump(teacher_inference.model_dump(exclude_none=True, mode="json"), f)
-
-
-def check_gpus_available(gpu_ids: list[int]) -> None:
-    """Raise error if there are existing processes on the specified GPUs."""
-    pynvml.nvmlInit()
-
-    occupied = []
-    for gpu_id in gpu_ids:
-        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
-        processes = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
-        if processes:
-            pids = [p.pid for p in processes]
-            occupied.append((gpu_id, pids))
-
-    if occupied:
-        msg = "Existing processes found on GPUs:\n"
-        for gpu_id, pids in occupied:
-            msg += f"  GPU {gpu_id}: PIDs {pids}\n"
-        msg += "Kill these processes or use different GPUs."
-        raise RuntimeError(msg)
-
-
-def build_wandb_shared_env(config: RLConfig) -> dict[str, str]:
-    wandb_shared_env: dict[str, str] = {}
-    if config.wandb and config.wandb.shared:
-        wandb_shared_env["WANDB_SHARED_MODE"] = "1"
-        wandb_shared_env["WANDB_SHARED_RUN_ID"] = os.environ.get("WANDB_SHARED_RUN_ID", uuid.uuid4().hex)
-    return wandb_shared_env
-
-
-def validate_inference_client_port(config: RLConfig) -> None:
-    if config.inference is None or config.orchestrator.client.is_elastic:
-        return
-
-    from urllib.parse import urlparse
-
-    base_url = config.orchestrator.client.base_url[0]
-    parsed = urlparse(base_url)
-    client_port = parsed.port
-    expected_port = config.inference.server.port
-    if client_port != expected_port:
-        raise ValueError(
-            f"orchestrator.client.base_url port ({client_port}) does not match "
-            f"inference.server.port ({expected_port}). "
-            f"Update the base_url to use port {expected_port} to match the inference server."
-        )
-
 
 def rl_local(config: RLConfig):
     assert config.deployment.type == "single_node"
@@ -146,11 +89,8 @@ def rl_local(config: RLConfig):
     infer_local_gpu_ids = list(range(gpu_offset, gpu_offset + num_infer_gpus))
     gpu_offset += num_infer_gpus
     trainer_local_gpu_ids = list(range(gpu_offset, gpu_offset + config.deployment.num_train_gpus))
-    gpu_offset += config.deployment.num_train_gpus
-    num_teacher_gpus = config.deployment.num_teacher_gpus or 0
-    teacher_local_gpu_ids = list(range(gpu_offset, gpu_offset + num_teacher_gpus)) if num_teacher_gpus > 0 else []
 
-    total_requested_gpus = num_infer_gpus + config.deployment.num_train_gpus + num_teacher_gpus
+    total_requested_gpus = num_infer_gpus + config.deployment.num_train_gpus
     physical_gpu_ids = get_physical_gpu_ids()
     if total_requested_gpus > len(physical_gpu_ids):
         raise ValueError(
@@ -162,21 +102,31 @@ def rl_local(config: RLConfig):
 
     infer_gpu_ids = [physical_gpu_mapping[local_gpu_id] for local_gpu_id in infer_local_gpu_ids]
     trainer_gpu_ids = [physical_gpu_mapping[local_gpu_id] for local_gpu_id in trainer_local_gpu_ids]
-    teacher_gpu_ids = [physical_gpu_mapping[local_gpu_id] for local_gpu_id in teacher_local_gpu_ids]
 
     start_command = sys.argv
     logger.info("Starting RL run")
     logger.debug(f"RL start command: {' '.join(start_command)}")
 
     # Build shared W&B env vars for subprocesses
-    wandb_shared_env = build_wandb_shared_env(config)
-
-    # Check for existing processes on GPUs
-    all_gpu_ids = list(set(infer_gpu_ids + trainer_gpu_ids + teacher_gpu_ids))
-    check_gpus_available(all_gpu_ids)
+    wandb_shared_env: dict[str, str] = {}
+    if config.wandb and config.wandb.shared:
+        wandb_shared_env["WANDB_SHARED_MODE"] = "1"
+        wandb_shared_env["WANDB_SHARED_RUN_ID"] = os.environ.get("WANDB_SHARED_RUN_ID", uuid.uuid4().hex)
 
     # Validate client port matches inference server port
-    validate_inference_client_port(config)
+    if config.inference is not None and not config.orchestrator.student.client.is_elastic:
+        from urllib.parse import urlparse
+
+        base_url = config.orchestrator.student.client.base_url[0]
+        parsed = urlparse(base_url)
+        client_port = parsed.port
+        expected_port = config.inference.server.port
+        if client_port != expected_port:
+            raise ValueError(
+                f"orchestrator.student.client.base_url port ({client_port}) does not match "
+                f"inference.server.port ({expected_port}). "
+                f"Update the base_url to use port {expected_port} to match the inference server."
+            )
 
     # Prepare paths to communicate with the trainer
     log_dir = get_log_dir(config.output_dir)
@@ -226,55 +176,20 @@ def rl_local(config: RLConfig):
             monitor_thread.start()
             monitor_threads.append(monitor_thread)
         else:
-            if config.orchestrator.teacher_rollout_model is None:
-                logger.warning(
-                    "No inference config specified, skipping starting inference server. Make sure your inference server is running."
-                )
-            else:
-                logger.info(
-                    "No inference config specified, using orchestrator.teacher_rollout_model for rollout generation."
-                )
-
-        # Optionally, start teacher inference process
-        if config.teacher_inference:
-            if not teacher_gpu_ids:
-                raise ValueError(
-                    "teacher_inference is configured but deployment.num_teacher_gpus is not set. "
-                    "Either set deployment.num_teacher_gpus to start a teacher inference server, "
-                    "or omit teacher_inference and configure orchestrator.teacher_model to use an existing server."
-                )
-
-            teacher_inference_cmd = ["inference", "@", (config_dir / TEACHER_INFERENCE_TOML).as_posix()]
-            logger.info(f"Starting teacher inference process on GPU(s) {' '.join(map(str, teacher_gpu_ids))}")
-            logger.debug(f"Teacher inference start command: {' '.join(teacher_inference_cmd)}")
-            with open(log_dir / "teacher_inference.log", "w") as log_file:
-                teacher_inference_process = Popen(
-                    teacher_inference_cmd,
-                    env={
-                        **os.environ,
-                        "CUDA_VISIBLE_DEVICES": ",".join(map(str, teacher_gpu_ids)),
-                    },
-                    stdout=log_file,
-                    stderr=log_file,
-                )
-            processes.append(teacher_inference_process)
-
-            # Start monitoring thread
-            stop_event = Event()
-            stop_events["teacher_inference"] = stop_event
-            monitor_thread = Thread(
-                target=monitor_process,
-                args=(teacher_inference_process, stop_event, error_queue, "teacher_inference"),
-                daemon=True,
-            )
-            monitor_thread.start()
-            monitor_threads.append(monitor_thread)
-        elif (
-            config.trainer.loss.type == "default" and config.trainer.loss.teacher_tau > 0
-        ) or config.orchestrator.teacher_model:
             logger.warning(
-                "No teacher_inference config specified, skipping starting teacher inference server. "
-                "Is your teacher inference server running? Make sure orchestrator.teacher_model is configured."
+                "No [inference] block configured - the student inference server will not be started here. "
+                "All training modes (rl/opd/sft) require a student inference pool for evals + weight sync; "
+                "make sure one is running at orchestrator.student.client.base_url "
+                f"({', '.join(config.orchestrator.student.client.base_url)}), otherwise the orchestrator "
+                "will hang waiting for it."
+            )
+
+        if config.orchestrator.teacher:
+            logger.info(
+                "orchestrator.teacher is configured - the rl entrypoint does not start teacher inference "
+                "servers. Make sure your teacher endpoint at "
+                f"{', '.join(config.orchestrator.teacher.client.base_url)} is running before the "
+                "orchestrator starts, otherwise rollouts will hang."
             )
 
         # Start orchestrator process
@@ -313,6 +228,8 @@ def rl_local(config: RLConfig):
         monitor_threads.append(monitor_thread)
 
         # Start training process
+        from prime_rl.utils.utils import get_free_port
+
         trainer_cmd = [
             "torchrun",
             "--role=trainer",
@@ -412,66 +329,6 @@ def rl_local(config: RLConfig):
         raise
 
 
-def rl_ray(config: RLConfig):
-    if config.deployment.type not in ("single_node", "ray_cluster"):
-        raise ValueError("Ray-native RL requires deployment.type = 'single_node' or 'ray_cluster'.")
-
-    from prime_rl.ray import run_ray_native
-
-    logger = setup_logger(
-        config.log.level or os.environ.get("PRIME_LOG_LEVEL", "info"),
-        json_logging=config.log.json_logging,
-    )
-
-    config_dir = config.output_dir / "configs"
-    write_subconfigs(config, config_dir)
-    logger.info(f"Wrote subconfigs to {config_dir}")
-
-    if config.dry_run:
-        logger.success("Dry run complete. To start a Ray-native RL run, remove --dry-run from your command.")
-        return
-
-    validate_inference_client_port(config)
-
-    wandb_shared_env = build_wandb_shared_env(config)
-    log_dir = get_log_dir(config.output_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    if config.inference is None and config.orchestrator.teacher_rollout_model is None:
-        logger.warning(
-            "No inference config specified, skipping starting inference server. "
-            "Make sure your inference server is running."
-        )
-    elif config.inference is None:
-        logger.info("No inference config specified, using orchestrator.teacher_rollout_model for rollout generation.")
-
-    if config.teacher_inference:
-        num_teacher_gpus = config.deployment.num_teacher_gpus or 0
-        if num_teacher_gpus == 0:
-            raise ValueError(
-                "teacher_inference is configured but deployment.num_teacher_gpus is not set. "
-                "Either set deployment.num_teacher_gpus to start a teacher inference server, "
-                "or omit teacher_inference and configure orchestrator.teacher_model to use an existing server."
-            )
-    elif (
-        config.trainer.loss.type == "default" and config.trainer.loss.teacher_tau > 0
-    ) or config.orchestrator.teacher_model:
-        logger.warning(
-            "No teacher_inference config specified, skipping starting teacher inference server. "
-            "Is your teacher inference server running? Make sure orchestrator.teacher_model is configured."
-        )
-
-    logger.info("Starting Ray-native RL run")
-    run_ray_native(
-        config,
-        log_dir=log_dir,
-        shared_env=wandb_shared_env,
-        master_port=get_free_port(),
-        start_command=sys.argv,
-    )
-    logger.success("Ray-native RL training finished!")
-
-
 def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) -> None:
     """Write the SLURM script to disk."""
     from jinja2 import Environment, FileSystemLoader
@@ -535,7 +392,6 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
             num_infer_nodes=config.deployment.total_infer_nodes,
             nodes_per_infer_replica=config.deployment.num_infer_nodes,
             num_infer_replicas=config.deployment.num_infer_replicas,
-            num_teacher_nodes=config.deployment.num_teacher_nodes,
             gpus_per_node=config.deployment.gpus_per_node,
             router_port=getattr(config.inference.deployment, "router_port", 8000) if config.inference else 8000,
             backend_port=getattr(config.inference.deployment, "backend_port", 8100) if config.inference else 8100,
@@ -642,14 +498,11 @@ def rl(config: RLConfig):
         clean_future_steps(config.output_dir, -1)
 
     if not config.dry_run:
+        from prime_rl.trainer.model import pre_download_model
+
         pre_download_model(config.trainer.model.name)
 
-    if config.deployment.type == "ray_cluster" and not config.experimental.ray.enabled:
-        raise ValueError("deployment.type = 'ray_cluster' requires experimental.ray.enabled = true.")
-
-    if config.experimental.ray.enabled:
-        rl_ray(config)
-    elif config.slurm is not None:
+    if config.slurm is not None:
         rl_slurm(config)
     else:
         rl_local(config)
