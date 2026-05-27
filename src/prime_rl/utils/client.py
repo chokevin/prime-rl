@@ -12,6 +12,7 @@ import httpx
 import verifiers as vf
 from httpx import AsyncClient
 from openai import NotFoundError
+from renderers import RendererConfig
 from tenacity import retry, retry_if_exception, stop_after_attempt, stop_after_delay, wait_exponential
 
 from prime_rl.configs.shared import ClientConfig
@@ -22,6 +23,11 @@ from prime_rl.utils.pathing import durable_touch
 @runtime_checkable
 class InferencePool(Protocol):
     """Protocol for inference pools (static or elastic)."""
+
+    @property
+    def model_name(self) -> str:
+        """Get current model name for inference requests."""
+        ...
 
     @property
     def train_clients(self) -> list[vf.ClientConfig]:
@@ -77,24 +83,16 @@ class StaticInferencePool:
         model_name: str,
         train_client_type: str = "openai_chat_completions",
         eval_client_type: str = "openai_chat_completions",
-        renderer_name: str = "auto",
-        tool_parser: str | None = None,
-        reasoning_parser: str | None = None,
-        renderer_pool_size: int | None = None,
-        preserve_all_thinking: bool = False,
-        preserve_thinking_between_tool_calls: bool = False,
+        renderer_config: RendererConfig | None = None,
+        pool_size: int | None = None,
     ):
         renderer_model_name = model_name if train_client_type == "renderer" else None
         self._train_clients = setup_clients(
             client_config,
             client_type=train_client_type,
-            renderer_name=renderer_name,
+            renderer_config=renderer_config,
             renderer_model_name=renderer_model_name,
-            tool_parser=tool_parser,
-            reasoning_parser=reasoning_parser,
-            renderer_pool_size=renderer_pool_size,
-            preserve_all_thinking=preserve_all_thinking,
-            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+            pool_size=pool_size,
         )
         self._eval_clients = setup_clients(client_config, client_type=eval_client_type)
         self._admin_clients = setup_admin_clients(client_config)
@@ -151,16 +149,10 @@ async def setup_inference_pool(
     model_name: str,
     train_client_type: str = "openai_chat_completions",
     eval_client_type: str = "openai_chat_completions",
-    renderer_name: str = "auto",
-    tool_parser: str | None = None,
-    reasoning_parser: str | None = None,
-    renderer_pool_size: int | None = None,
-    preserve_all_thinking: bool = False,
-    preserve_thinking_between_tool_calls: bool = False,
+    renderer_config: RendererConfig | None = None,
+    pool_size: int | None = None,
 ) -> InferencePool:
     """Create an inference pool from config (static or elastic)."""
-    logger = get_logger()
-
     if client_config.is_elastic:
         from prime_rl.utils.elastic import ElasticInferencePool
 
@@ -169,69 +161,50 @@ async def setup_inference_pool(
             model_name=model_name,
             train_client_type=train_client_type,
             eval_client_type=eval_client_type,
-            renderer_name=renderer_name,
-            tool_parser=tool_parser,
-            reasoning_parser=reasoning_parser,
-            renderer_pool_size=renderer_pool_size,
-            preserve_all_thinking=preserve_all_thinking,
-            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+            renderer_config=renderer_config,
+            pool_size=pool_size,
         )
 
-    logger.info(
-        f"Initializing static inference pool (base_url={', '.join(client_config.base_url)}, "
-        f"dp_rank_count={client_config.dp_rank_count}, "
-        f"api_key_var={client_config.api_key_var}, headers={client_config.headers})"
-    )
     return StaticInferencePool(
         client_config,
         model_name=model_name,
         train_client_type=train_client_type,
         eval_client_type=eval_client_type,
-        renderer_name=renderer_name,
-        tool_parser=tool_parser,
-        reasoning_parser=reasoning_parser,
-        renderer_pool_size=renderer_pool_size,
-        preserve_all_thinking=preserve_all_thinking,
-        preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+        renderer_config=renderer_config,
+        pool_size=pool_size,
     )
 
 
 def setup_clients(
     client_config: ClientConfig,
     client_type: str = "openai_chat_completions",
-    renderer_name: str = "auto",
+    renderer_config: RendererConfig | None = None,
     renderer_model_name: str | None = None,
-    tool_parser: str | None = None,
-    reasoning_parser: str | None = None,
-    renderer_pool_size: int | None = None,
-    preserve_all_thinking: bool = False,
-    preserve_thinking_between_tool_calls: bool = False,
+    pool_size: int | None = None,
 ) -> list[vf.ClientConfig]:
     clients = []
     client_idx = 0
-    # Only forward preserve flags when the client actually uses a renderer —
-    # MITO/TITO clients ignore them and the verifiers ClientConfig may reject
-    # unknown extras on older versions.
+    # Only forward the renderer config when the client actually uses a
+    # renderer — MITO/TITO clients ignore it.
     renderer_extra: dict = {}
     if client_type == "renderer":
         renderer_extra = {
-            "preserve_all_thinking": preserve_all_thinking,
-            "preserve_thinking_between_tool_calls": preserve_thinking_between_tool_calls,
+            "renderer_config": renderer_config,
+            "renderer_model_name": renderer_model_name,
+            "renderer_pool_size": pool_size,
         }
+    env_headers = {
+        k: v for k, v in ((k, os.getenv(v)) for k, v in client_config.headers_from_env.items()) if v is not None
+    }
     for base_url in client_config.base_url:
         for dp_rank in range(client_config.dp_rank_count):
-            headers = client_config.headers.copy()
+            headers = {**client_config.headers, **env_headers}
             if client_config.dp_rank_count > 1:
                 headers["X-data-parallel-rank"] = str(dp_rank)
             clients.append(
                 vf.ClientConfig(
                     client_idx=client_idx,
                     client_type=client_type,
-                    renderer=renderer_name,
-                    renderer_model_name=renderer_model_name,
-                    renderer_pool_size=renderer_pool_size,
-                    tool_parser=tool_parser,
-                    reasoning_parser=reasoning_parser,
                     api_base_url=base_url,
                     api_key_var=client_config.api_key_var,
                     timeout=client_config.timeout,
@@ -258,7 +231,10 @@ def setup_admin_clients(client_config: ClientConfig) -> list[AsyncClient]:
     urls = client_config.admin_base_url if client_config.admin_base_url else client_config.base_url
 
     def _setup_admin_client(base_url: str) -> httpx.AsyncClient:
-        headers = client_config.headers.copy()  # avoid mutating config
+        env_headers = {
+            k: v for k, v in ((k, os.getenv(v)) for k, v in client_config.headers_from_env.items()) if v is not None
+        }
+        headers = {**client_config.headers, **env_headers}
         api_key = os.getenv(client_config.api_key_var, "EMPTY")
         if api_key and api_key != "EMPTY":
             headers["Authorization"] = f"Bearer {api_key}"

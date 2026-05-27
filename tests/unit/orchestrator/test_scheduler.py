@@ -1,96 +1,35 @@
 import asyncio
-import json
-from collections import Counter, defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import verifiers as vf
 
-from prime_rl.orchestrator.request_picker import DirectRequestPicker, PrimeAwareRequestPicker
 from prime_rl.orchestrator.scheduler import GroupState, InflightRequest, Scheduler
-from prime_rl.utils.async_utils import safe_cancel, safe_cancel_all
+from prime_rl.utils.async_utils import safe_cancel
 
 
 def make_scheduler() -> Scheduler:
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.max_async_level = 1
-    scheduler.strict_async_level = False
     scheduler.step = 9
     scheduler.ckpt_step = 7
-    scheduler.config = SimpleNamespace(
-        output_dir=Path("/tmp/prime-rl-test"),
-        max_steps=10,
-        weight_broadcast=SimpleNamespace(type="nccl", final_step_async_level=None),
-    )
+    scheduler.config = SimpleNamespace(output_dir=Path("/tmp/prime-rl-test"))
     scheduler.logger = MagicMock()
-    scheduler.rate_limiter = None
     scheduler.checkpoint_ready = asyncio.Event()
     scheduler.checkpoint_ready.set()
     scheduler.lora_name = None
     scheduler.model_name = "test-model"
-    scheduler.batch_size = 4
-    scheduler.token_batch_size = None
     scheduler.update_weights_time = 0
     scheduler.wait_for_ckpt_time = 0
-    scheduler.inflight_rollouts_at_pause = 0
-    scheduler.oldest_off_policy_at_pause = 0
     scheduler.inflight_requests = {}
     scheduler.groups = {}
-    scheduler.next_group_id = 0
-    scheduler.next_request_id = 0
-    scheduler.next_dispatch_wave_id = 0
-    scheduler.next_refill_wave_id = 0
-    scheduler.current_refill_wave_id = 0
-    scheduler.step_dispatched_requests = 0
-    scheduler.step_completed_requests = 0
     scheduler.max_off_policy_steps = 1
     scheduler.cancelled_rollouts_count = 0
     scheduler.policy_update_lock = asyncio.Lock()
     scheduler.inflight_policy_update_task = None
     scheduler.update_policy_task = None
-    scheduler.enable_policy_updates = True
-    scheduler.request_picker = DirectRequestPicker()
-    scheduler.metric_values = defaultdict(list)
-    scheduler.metric_counts = Counter()
-    scheduler.last_update_metrics = {}
-    scheduler.total_rollouts_by_env = defaultdict(int)
-    scheduler.empty_rollouts_by_env = defaultdict(int)
-    scheduler.errored_rollouts_by_env = defaultdict(int)
-    scheduler.dropped_groups_by_env = defaultdict(int)
-    scheduler.completed_rollouts_by_client = Counter()
-    scheduler.cancelled_rollouts_by_client = Counter()
-    scheduler.request_wall_seconds_by_client = defaultdict(list)
-    scheduler.last_request_wall_seconds_by_client = {}
-    scheduler.completion_tokens_by_client = defaultdict(list)
-    scheduler.last_completion_tokens_by_client = {}
-    scheduler.completion_tokens_by_fingerprint = defaultdict(list)
-    scheduler.completion_tokens_by_env = defaultdict(list)
-    scheduler.group_wall_seconds_by_client = defaultdict(list)
-    scheduler.last_group_wall_seconds_by_client = {}
-    scheduler.group_tail_seconds_by_client = defaultdict(list)
-    scheduler.last_group_tail_seconds_by_client = {}
-    scheduler.off_policy_steps_by_client = defaultdict(list)
-    scheduler.last_off_policy_steps_by_client = {}
-    scheduler.default_max_completion_tokens = 4096
-    scheduler.max_completion_tokens_by_env = {"math": 4096}
-    scheduler.inference_pool = SimpleNamespace(get_metrics=lambda: {}, get_client_metrics=lambda: {})
+    scheduler.rate_limiter = None
     return scheduler
-
-
-def rollout(prompt_tokens: int, completion_tokens: int):
-    return {
-        "error": None,
-        "trajectory": [
-            {
-                "tokens": {
-                    "prompt_ids": list(range(prompt_tokens)),
-                    "completion_ids": list(range(completion_tokens)),
-                },
-                "response": {},
-            }
-        ],
-    }
 
 
 def test_update_off_policy_does_not_increment_interleaved_on_policy_tasks():
@@ -161,10 +100,11 @@ def test_maybe_update_policy_reuses_inflight_update_after_cancellation():
             started.set()
             await release.wait()
 
-        scheduler.inference_pool = SimpleNamespace(
+        scheduler.student_inference = SimpleNamespace(
             update_weights=update_weights,
             update_model_name=MagicMock(),
         )
+        scheduler.rollout_inference = scheduler.student_inference
         scheduler._update_off_policy = AsyncMock()
 
         with (
@@ -188,23 +128,6 @@ def test_maybe_update_policy_reuses_inflight_update_after_cancellation():
     asyncio.run(run())
 
 
-def test_final_step_async_level_does_not_chase_newer_checkpoint():
-    scheduler = make_scheduler()
-    scheduler.config.weight_broadcast.final_step_async_level = 2
-
-    with patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=8):
-        assert scheduler._compute_next_ckpt_step() == 7
-
-
-def test_final_step_async_level_keeps_normal_checkpoint_before_drain():
-    scheduler = make_scheduler()
-    scheduler.step = 8
-    scheduler.config.weight_broadcast.final_step_async_level = 2
-
-    with patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=7):
-        assert scheduler._compute_next_ckpt_step() == 7
-
-
 def test_stop_cancels_inflight_policy_update_task():
     async def run() -> None:
         scheduler = make_scheduler()
@@ -218,10 +141,11 @@ def test_stop_cancels_inflight_policy_update_task():
             finally:
                 cancelled.set()
 
-        scheduler.inference_pool = SimpleNamespace(
+        scheduler.student_inference = SimpleNamespace(
             update_weights=update_weights,
             update_model_name=MagicMock(),
         )
+        scheduler.rollout_inference = scheduler.student_inference
         scheduler._update_off_policy = AsyncMock()
 
         with (
@@ -239,33 +163,6 @@ def test_stop_cancels_inflight_policy_update_task():
     asyncio.run(run())
 
 
-def test_cancel_inflight_rollouts_records_client_cancellations():
-    async def run() -> None:
-        scheduler = make_scheduler()
-        client = vf.ClientConfig(
-            client_idx=3,
-            api_base_url="http://worker-a:8000/v1",
-            extra_headers={"X-data-parallel-rank": "1"},
-        )
-        task = asyncio.create_task(asyncio.sleep(60))
-        scheduler.inflight_requests[task] = InflightRequest(
-            off_policy_steps=0,
-            client_config=client,
-            env_name="test",
-            group_id=1,
-            rollout_count=2,
-        )
-
-        await scheduler.cancel_inflight_rollouts()
-
-        assert scheduler.cancelled_rollouts_count == 2
-        assert scheduler.cancelled_rollouts_by_client[Scheduler._client_identity(client)] == 2
-        assert scheduler.metric_counts["scheduler/cancelled_rollouts/client_3_worker_a_8000_dp_1"] == 2
-        assert scheduler.inflight_requests == {}
-
-    asyncio.run(run())
-
-
 def test_client_identity_distinguishes_base_url_and_dp_rank():
     client_a = vf.ClientConfig(
         api_base_url="http://worker-a:8000/v1",
@@ -279,730 +176,97 @@ def test_client_identity_distinguishes_base_url_and_dp_rank():
     assert Scheduler._client_identity(client_a) != Scheduler._client_identity(client_b)
 
 
-def test_get_metrics_logs_instrumentation_payload():
-    scheduler = make_scheduler()
-    scheduler.inflight_rollouts_at_pause = 4
-    scheduler.oldest_off_policy_at_pause = 2
-    scheduler.last_update_metrics = {"time/update_ready_marker": 0.25}
-    scheduler.metric_values["rollout_request_wall_seconds"].append(1.5)
-    scheduler.metric_counts["scheduler/cancelled_rollouts/client_1_worker_a_8000_dp_0"] = 3
+def test_lora_policy_update_in_sft_keeps_teacher_model_name():
+    """In sft mode, train_pool is the teacher. LoRA updates the student inference
+    pool but must not change scheduler.model_name (which is what gets sent to the
+    teacher endpoint on each rollout request)."""
 
-    metrics = scheduler.get_metrics()
-
-    assert metrics["rollout_request_wall_seconds"] == 1.5
-    assert metrics["time/update_ready_marker"] == 0.25
-
-    message = scheduler.logger.info.call_args.args[0]
-    prefix = "Scheduler instrumentation metrics: "
-    assert message.startswith(prefix)
-    payload = json.loads(message.removeprefix(prefix))
-    assert payload["rollout_request_wall_seconds"] == 1.5
-    assert payload["scheduler/cancelled_rollouts/client_1_worker_a_8000_dp_0"] == 3
-    assert payload["scheduler/inflight_rollouts_at_pause"] == 4
-    assert payload["scheduler/oldest_off_policy_at_pause"] == 2
-    assert payload["time/update_ready_marker"] == 0.25
-
-
-def test_record_contributing_rollouts_tracks_tokens_and_slowest_request():
-    scheduler = make_scheduler()
-    client_a = vf.ClientConfig(
-        client_idx=1,
-        api_base_url="http://worker-a:8000/v1",
-        extra_headers={"X-data-parallel-rank": "0"},
-    )
-    client_b = vf.ClientConfig(
-        client_idx=2,
-        api_base_url="http://worker-b:8000/v1",
-        extra_headers={"X-data-parallel-rank": "1"},
-    )
-    group = GroupState(example={"env_name": "math"}, rollouts_to_schedule=0, pinned_client=client_a)
-
-    scheduler._record_contributing_rollouts(
-        group,
-        InflightRequest(
-            off_policy_steps=0,
-            client_config=client_a,
-            env_name="math",
-            request_id=10,
-        ),
-        [rollout(prompt_tokens=3, completion_tokens=5)],
-        request_wall_seconds=7.0,
-    )
-    scheduler._record_contributing_rollouts(
-        group,
-        InflightRequest(
-            off_policy_steps=0,
-            client_config=client_b,
-            env_name="math",
-            request_id=11,
-        ),
-        [rollout(prompt_tokens=2, completion_tokens=13)],
-        request_wall_seconds=17.0,
-    )
-
-    assert group.completed_request_count == 2
-    assert group.prompt_tokens == 5
-    assert group.completion_tokens == 18
-    assert group.seq_tokens == 23
-    assert group.slowest_request_id == 11
-    assert group.slowest_request_client == client_b
-    assert scheduler.metric_values["rollout_request_completion_tokens"] == [5.0, 13.0]
-    assert scheduler.metric_values["rollout_request_seq_tokens/client_2_worker_b_8000_dp_1"] == [15.0]
-    assert scheduler.completion_tokens_by_client[Scheduler._client_identity(client_a)] == [5.0]
-    assert scheduler.completion_tokens_by_client[Scheduler._client_identity(client_b)] == [13.0]
-
-
-def test_record_completed_group_attribution_emits_tail_diagnostics():
-    scheduler = make_scheduler()
-    pinned_client = vf.ClientConfig(
-        client_idx=1,
-        api_base_url="http://worker-a:8000/v1",
-        extra_headers={"X-data-parallel-rank": "0"},
-    )
-    slowest_client = vf.ClientConfig(
-        client_idx=2,
-        api_base_url="http://worker-b:8000/v1",
-        extra_headers={"X-data-parallel-rank": "1"},
-    )
-    group = GroupState(example={"env_name": "math"}, rollouts_to_schedule=0, pinned_client=pinned_client)
-    group.created_at = 10.0
-    group.first_dispatch_at = 12.0
-    group.first_completion_at = 25.0
-    group.completed_request_count = 2
-    group.prompt_tokens = 7
-    group.completion_tokens = 19
-    group.seq_tokens = 26
-    group.request_wall_seconds = [11.0, 21.0]
-    group.slowest_request_wall_seconds = 21.0
-    group.slowest_request_client = slowest_client
-
-    scheduler._record_completed_group_attribution(group, group_wall_seconds=40.0, group_tail_seconds=15.0)
-
-    assert scheduler.metric_values["rollout_group_wall_seconds"] == [40.0]
-    assert scheduler.metric_values["rollout_group_wall_seconds/client_1_worker_a_8000_dp_0"] == [40.0]
-    assert scheduler.metric_values["rollout_group_prompt_tokens"] == [7.0]
-    assert scheduler.metric_values["rollout_group_completion_tokens"] == [19.0]
-    assert scheduler.metric_values["rollout_group_completed_request_count"] == [2.0]
-    assert scheduler.metric_values["rollout_group_slowest_request_wall_seconds"] == [21.0]
-    assert scheduler.metric_values["rollout_group_request_wall_spread_seconds"] == [10.0]
-    assert scheduler.metric_values["rollout_group_time_to_first_dispatch_seconds"] == [2.0]
-    assert scheduler.metric_values["rollout_group_time_to_first_completion_seconds"] == [15.0]
-    assert scheduler.metric_counts["rollout_group_slowest_request_client/client_2_worker_b_8000_dp_1"] == 1
-
-
-def test_candidate_stats_marks_endpoint_metrics_scope_for_dp_rank_clients():
-    scheduler = make_scheduler()
-    scheduler.inference_pool = SimpleNamespace(
-        get_metrics=lambda: {},
-        get_client_metrics=lambda: {"worker_a_8000": {"num_requests_waiting": 2.0}},
-    )
-    clients = [
-        vf.ClientConfig(
-            client_idx=1,
-            api_base_url="http://worker-a:8000/v1",
-            extra_headers={"X-data-parallel-rank": "0"},
-        ),
-        vf.ClientConfig(
-            client_idx=2,
-            api_base_url="http://worker-a:8000/v1",
-            extra_headers={"X-data-parallel-rank": "1"},
-        ),
-    ]
-
-    stats = scheduler._candidate_stats(clients)
-
-    for client in clients:
-        metrics = stats[Scheduler._client_identity(client)].endpoint_metrics
-        assert metrics is not None
-        assert metrics["metrics_available"] == 1.0
-        assert metrics["metrics_scope_dp_rank_precise"] == 0.0
-        assert metrics["metrics_scope_base_url_client_count"] == 2.0
-        assert metrics["num_requests_waiting"] == 2.0
-
-
-def test_candidate_stats_maps_backend_admin_metrics_to_router_clients_on_same_host():
-    scheduler = make_scheduler()
-    scheduler.inference_pool = SimpleNamespace(
-        get_metrics=lambda: {},
-        get_client_metrics=lambda: {
-            "worker_a_8100": {
-                "decode_throughput_tps": 100.0,
-                "completed_requests_per_s": 2.0,
-                "num_requests_waiting": 3.0,
-            }
-        },
-    )
-    client = vf.ClientConfig(
-        client_idx=1,
-        api_base_url="http://worker-a:8000/v1",
-        extra_headers={"X-data-parallel-rank": "0"},
-    )
-
-    stats = scheduler._candidate_stats([client])
-    metrics = stats[Scheduler._client_identity(client)].endpoint_metrics
-
-    assert metrics is not None
-    assert metrics["metrics_available"] == 1.0
-    assert metrics["metrics_scope_endpoint_exact"] == 0.0
-    assert metrics["metrics_scope_host_match_count"] == 1.0
-    assert metrics["metrics_scope_dp_rank_precise"] == 0.0
-    assert metrics["decode_throughput_tps"] == 100.0
-    assert metrics["completed_requests_per_s"] == 2.0
-    assert metrics["num_requests_waiting"] == 3.0
-
-
-def test_group_completion_history_predicts_future_completion_tokens():
-    scheduler = make_scheduler()
-    group = GroupState(
-        example={"env_name": "math", "prompt": "hard problem"},
-        rollouts_to_schedule=0,
-    )
-    scheduler._ensure_group_prediction(group)
-
-    assert group.example_fingerprint is not None
-    assert group.predicted_completion_tokens is None
-
-    client = vf.ClientConfig(
-        client_idx=1,
-        api_base_url="http://worker-a:8000/v1",
-        extra_headers={"X-data-parallel-rank": "0"},
-    )
-    scheduler._record_contributing_rollouts(
-        group,
-        InflightRequest(
-            off_policy_steps=0,
-            client_config=client,
-            env_name="math",
-            request_id=10,
-        ),
-        [rollout(prompt_tokens=3, completion_tokens=4096)],
-        request_wall_seconds=90.0,
-    )
-
-    next_group = GroupState(
-        example={"env_name": "math", "prompt": "hard problem"},
-        rollouts_to_schedule=1,
-    )
-    scheduler._ensure_group_prediction(next_group)
-
-    assert next_group.example_fingerprint == group.example_fingerprint
-    assert next_group.predicted_completion_tokens == 4096.0
-    assert next_group.completion_prediction_source == "fingerprint"
-
-
-def test_env_completion_history_predicts_unknown_fingerprints_after_warmup():
-    scheduler = make_scheduler()
-    scheduler.completion_tokens_by_env["math"].extend([3072.0, 4096.0])
-
-    group = GroupState(
-        example={"env_name": "math", "prompt": "unseen problem"},
-        rollouts_to_schedule=1,
-    )
-    scheduler._ensure_group_prediction(group)
-
-    assert group.predicted_completion_tokens == 3584.0
-    assert group.completion_prediction_source == "env"
-
-
-def test_long_output_cold_start_ratio_predicts_without_history():
-    scheduler = make_scheduler()
-    scheduler.request_picker = PrimeAwareRequestPicker(long_output_cold_start_ratio=1.0)
-
-    group = GroupState(
-        example={"env_name": "math", "prompt": "cold start problem"},
-        rollouts_to_schedule=1,
-    )
-    scheduler._ensure_group_prediction(group)
-
-    assert group.predicted_completion_tokens == 4096.0
-    assert group.completion_prediction_source == "cold_start"
-
-
-def test_candidate_stats_include_completion_history_and_predicted_inflight_load():
     async def run() -> None:
         scheduler = make_scheduler()
-        client = vf.ClientConfig(
-            client_idx=1,
-            api_base_url="http://worker-a:8000/v1",
-            extra_headers={"X-data-parallel-rank": "0"},
+        scheduler.model_name = "teacher-model"
+        scheduler.lora_name = "student-lora"
+
+        student_inference = SimpleNamespace(
+            update_weights=AsyncMock(),
+            update_model_name=MagicMock(),
         )
-        identity = Scheduler._client_identity(client)
-        scheduler.completion_tokens_by_client[identity].extend([1024.0, 4096.0])
-        scheduler.last_completion_tokens_by_client[identity] = 4096.0
-        task = asyncio.create_task(asyncio.sleep(60))
-        scheduler.inflight_requests[task] = InflightRequest(
-            off_policy_steps=0,
-            client_config=client,
-            env_name="math",
-            group_id=1,
-            rollout_count=2,
-            predicted_completion_tokens=2048.0,
-        )
+        teacher_inference = SimpleNamespace()
+        scheduler.student_inference = student_inference
+        scheduler.rollout_inference = teacher_inference  # sft: train_pool != student_inference
+        scheduler._update_off_policy = AsyncMock()
 
-        stats = scheduler._candidate_stats([client])
+        with (
+            patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=8),
+            patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()),
+        ):
+            await scheduler.maybe_update_policy()
 
-        assert stats[identity].completion_tokens_mean == 2560.0
-        assert stats[identity].completion_tokens_last == 4096.0
-        assert stats[identity].inflight_predicted_completion_tokens == 2048.0
-
-        await safe_cancel_all([task])
+        student_inference.update_weights.assert_awaited_once()
+        student_inference.update_model_name.assert_called_once_with("student-lora")
+        assert scheduler.model_name == "teacher-model"
 
     asyncio.run(run())
 
 
-def test_long_output_cold_start_activates_candidate_score_metrics():
+def test_lora_policy_update_in_rl_updates_model_name():
+    """In rl/opd mode, train_pool is the student. LoRA updates redirect rollout
+    requests to the new LoRA name."""
+
     async def run() -> None:
         scheduler = make_scheduler()
-        clients = [
-            vf.ClientConfig(
-                client_idx=1,
-                api_base_url="http://worker-a:8000/v1",
-                extra_headers={"X-data-parallel-rank": "0"},
-            ),
-            vf.ClientConfig(
-                client_idx=2,
-                api_base_url="http://worker-a:8000/v1",
-                extra_headers={"X-data-parallel-rank": "1"},
-            ),
-        ]
-        scheduler.inference_pool = SimpleNamespace(
-            train_clients=clients,
-            get_metrics=lambda: {},
-            get_client_metrics=lambda: {},
-        )
-        scheduler.request_picker = PrimeAwareRequestPicker(
-            inflight_weight=0.0,
-            waiting_weight=0.0,
-            running_weight=0.0,
-            request_wall_weight=0.0,
-            group_wall_weight=0.0,
-            group_tail_weight=0.0,
-            off_policy_weight=0.0,
-            cancelled_weight=0.0,
-            decode_deficit_weight=0.0,
-            cache_usage_weight=0.0,
-            long_output_weight=4.0,
-            long_output_cold_start_ratio=1.0,
-        )
-        task = asyncio.create_task(asyncio.sleep(60))
-        scheduler.inflight_requests[task] = InflightRequest(
-            off_policy_steps=0,
-            client_config=clients[0],
-            env_name="math",
-            group_id=1,
-            request_started_at=1.0,
-            predicted_completion_tokens=4096.0,
-        )
-        scheduler.groups[2] = GroupState(example={"env_name": "math"}, rollouts_to_schedule=1)
+        scheduler.model_name = "student-model"
+        scheduler.lora_name = "student-lora"
 
-        client, _ = await scheduler._select_request_client(
-            2,
-            scheduler.groups[2],
-            "math",
-            cache_salt="7",
-            request_id=11,
-            dispatch_wave_id=12,
-            refill_wave_id=13,
+        student_inference = SimpleNamespace(
+            update_weights=AsyncMock(),
+            update_model_name=MagicMock(),
         )
+        scheduler.student_inference = student_inference
+        scheduler.rollout_inference = student_inference  # rl/opd: same pool
+        scheduler._update_off_policy = AsyncMock()
 
-        assert client == clients[1]
-        assert scheduler.groups[2].predicted_completion_tokens == 4096.0
-        assert scheduler.groups[2].completion_prediction_source == "cold_start"
-        assert scheduler.metric_values["request_picker_score_component/long_output/max"][0] > 0.0
-        replay_events = [
-            call.args[0]
-            for call in scheduler.logger.info.call_args_list
-            if call.args and call.args[0].startswith("Scheduler replay event: ")
-        ]
-        assert len(replay_events) == 1
-        dispatch = json.loads(replay_events[0].removeprefix("Scheduler replay event: "))
-        assert dispatch["event"] == "dispatch"
-        assert dispatch["request_id"] == 11
-        assert dispatch["dispatch_wave_id"] == 12
-        assert dispatch["refill_wave_id"] == 13
-        assert dispatch["selected_client_idx"] == 2
-        assert dispatch["completion_prediction_source"] == "cold_start"
-        assert dispatch["predicted_completion_tokens"] == 4096.0
-        selected_candidate = next(candidate for candidate in dispatch["candidates"] if candidate["selected"])
-        assert selected_candidate["score_components"]["long_output"] == 0.0
-        assert (
-            max(
-                candidate["score_components"]["long_output"]
-                for candidate in dispatch["candidates"]
-                if candidate["score_components"] is not None
+        with (
+            patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=8),
+            patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()),
+        ):
+            await scheduler.maybe_update_policy()
+
+        student_inference.update_weights.assert_awaited_once()
+        student_inference.update_model_name.assert_called_once_with("student-lora")
+        assert scheduler.model_name == "student-lora"
+
+    asyncio.run(run())
+
+
+def test_schedule_rollout_uses_train_pool():
+    """schedule_rollout dispatches to train_pool's clients with train_pool's model name."""
+
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.model_name = "teacher-model"
+        teacher_client = vf.ClientConfig(api_base_url="http://teacher.example/v1")
+        env = SimpleNamespace(
+            requires_group_scoring=False,
+            run_rollout=AsyncMock(return_value=[]),
+        )
+        scheduler.rollout_inference = SimpleNamespace(train_clients=[teacher_client])
+        scheduler.train_envs = SimpleNamespace(get=MagicMock(return_value=env))
+        scheduler.groups = {
+            0: GroupState(
+                example={"env_name": "math", "example_id": "ex-1"},
+                rollouts_to_schedule=1,
             )
-            > 0.0
-        )
+        }
 
-        await safe_cancel_all([task])
+        await scheduler.schedule_rollout(group_id=0)
+        await asyncio.gather(*scheduler.inflight_requests)
+
+        env.run_rollout.assert_awaited_once_with(
+            client=teacher_client,
+            example={"env_name": "math", "example_id": "ex-1"},
+            model_name="teacher-model",
+            cache_salt="7",
+        )
+        assert scheduler.groups[0].pinned_client is teacher_client
 
     asyncio.run(run())
-
-
-def test_replay_completion_event_joins_dispatch_to_actual_tokens_and_group_close():
-    scheduler = make_scheduler()
-    client = vf.ClientConfig(
-        client_idx=1,
-        api_base_url="http://worker-a:8000/v1",
-        extra_headers={"X-data-parallel-rank": "0"},
-    )
-    group = GroupState(
-        example={"env_name": "math"},
-        rollouts_to_schedule=0,
-        completed_request_count=1,
-        completion_tokens=4096,
-        slowest_request_id=22,
-        slowest_request_wall_seconds=44.0,
-        slowest_request_client=client,
-    )
-    info = InflightRequest(
-        off_policy_steps=0,
-        client_config=client,
-        env_name="math",
-        group_id=7,
-        request_id=22,
-        dispatch_wave_id=3,
-        refill_wave_id=2,
-        predicted_completion_tokens=4096.0,
-        completion_prediction_source="cold_start",
-    )
-
-    scheduler._log_completion_replay_event(
-        rollout_info=info,
-        group=group,
-        valid_rollouts=[rollout(prompt_tokens=5, completion_tokens=4096)],
-        request_wall_seconds=44.0,
-        group_closed=True,
-        group_wall_seconds=45.0,
-        group_tail_seconds=1.0,
-    )
-
-    replay_events = [
-        call.args[0]
-        for call in scheduler.logger.info.call_args_list
-        if call.args and call.args[0].startswith("Scheduler replay event: ")
-    ]
-    assert len(replay_events) == 1
-    completion = json.loads(replay_events[0].removeprefix("Scheduler replay event: "))
-    assert completion["event"] == "completion"
-    assert completion["request_id"] == 22
-    assert completion["dispatch_wave_id"] == 3
-    assert completion["actual_completion_tokens"] == 4096.0
-    assert completion["request_wall_seconds"] == 44.0
-    assert completion["group_closed"] is True
-    assert completion["group_wall_seconds"] == 45.0
-    assert completion["group_slowest_request_client"].startswith("client_1_")
-
-
-def test_wave_minimax_assignment_spreads_predicted_long_groups():
-    async def run() -> None:
-        scheduler = make_scheduler()
-        clients = [
-            vf.ClientConfig(
-                client_idx=1,
-                api_base_url="http://worker-a:8000/v1",
-                extra_headers={"X-data-parallel-rank": "0"},
-            ),
-            vf.ClientConfig(
-                client_idx=2,
-                api_base_url="http://worker-a:8000/v1",
-                extra_headers={"X-data-parallel-rank": "1"},
-            ),
-        ]
-        scheduler.inference_pool = SimpleNamespace(
-            train_clients=clients,
-            get_metrics=lambda: {},
-            get_client_metrics=lambda: {},
-        )
-        task = asyncio.create_task(asyncio.sleep(60))
-        scheduler.inflight_requests[task] = InflightRequest(
-            off_policy_steps=0,
-            client_config=clients[0],
-            env_name="math",
-            group_id=1,
-            request_started_at=1.0,
-            predicted_completion_tokens=4096.0,
-        )
-        scheduler.groups[10] = GroupState(
-            example={"env_name": "math"},
-            rollouts_to_schedule=1,
-            predicted_completion_tokens=4096.0,
-            completion_prediction_source="cold_start",
-        )
-        scheduler.groups[11] = GroupState(
-            example={"env_name": "math"},
-            rollouts_to_schedule=1,
-            predicted_completion_tokens=4096.0,
-            completion_prediction_source="cold_start",
-        )
-
-        assignments = await scheduler._assign_wave_minimax_clients([10, 11])
-
-        assert assignments[10] == clients[1]
-        assert assignments[11] == clients[0]
-        assert scheduler.metric_values["request_picker_wave_minimax_group_count"] == [2.0]
-        replay_events = [
-            call.args[0]
-            for call in scheduler.logger.info.call_args_list
-            if call.args and call.args[0].startswith("Scheduler replay event: ")
-        ]
-        wave = json.loads(replay_events[0].removeprefix("Scheduler replay event: "))
-        assert wave["event"] == "wave_assignment"
-        assert wave["group_ids"] == [10, 11]
-        assert [assignment["client_idx"] for assignment in wave["assignments"]] == [2, 1]
-
-        await safe_cancel_all([task])
-
-    asyncio.run(run())
-
-
-def test_wave_minimax_assignment_uses_throughput_guardrails():
-    async def run() -> None:
-        scheduler = make_scheduler()
-        clients = [
-            vf.ClientConfig(
-                client_idx=1,
-                api_base_url="http://slow-worker:8000/v1",
-                extra_headers={"X-data-parallel-rank": "0"},
-            ),
-            vf.ClientConfig(
-                client_idx=2,
-                api_base_url="http://fast-worker:8000/v1",
-                extra_headers={"X-data-parallel-rank": "0"},
-            ),
-        ]
-        scheduler.inference_pool = SimpleNamespace(
-            train_clients=clients,
-            get_metrics=lambda: {},
-            get_client_metrics=lambda: {
-                "slow_worker_8000": {
-                    "decode_throughput_tps": 50.0,
-                    "completed_requests_per_s": 1.0,
-                },
-                "fast_worker_8000": {
-                    "decode_throughput_tps": 100.0,
-                    "completed_requests_per_s": 2.0,
-                },
-            },
-        )
-        scheduler.request_picker = PrimeAwareRequestPicker(
-            wave_minimax_size=2,
-            decode_guardrail_ratio=0.1,
-            decode_guardrail_penalty=10.0,
-            completed_rps_deficit_weight=10.0,
-        )
-        scheduler.groups[10] = GroupState(
-            example={"env_name": "math"},
-            rollouts_to_schedule=1,
-            predicted_completion_tokens=4096.0,
-            completion_prediction_source="cold_start",
-        )
-
-        assignments = await scheduler._assign_wave_minimax_clients([10])
-
-        assert assignments[10] == clients[1]
-        replay_events = [
-            call.args[0]
-            for call in scheduler.logger.info.call_args_list
-            if call.args and call.args[0].startswith("Scheduler replay event: ")
-        ]
-        wave = json.loads(replay_events[0].removeprefix("Scheduler replay event: "))
-        assert wave["assignments"][0]["client_idx"] == 2
-        assert wave["assignments"][0]["throughput_penalty"] == 0.0
-
-    asyncio.run(run())
-
-
-def test_wave_minimax_assignment_uses_prime_side_proxy_when_dp_metrics_are_ambiguous():
-    async def run() -> None:
-        scheduler = make_scheduler()
-        clients = [
-            vf.ClientConfig(
-                client_idx=1,
-                api_base_url="http://shared-router:8000/v1",
-                extra_headers={"X-data-parallel-rank": "0"},
-            ),
-            vf.ClientConfig(
-                client_idx=2,
-                api_base_url="http://shared-router:8000/v1",
-                extra_headers={"X-data-parallel-rank": "1"},
-            ),
-        ]
-        slow_identity = Scheduler._client_identity(clients[0])
-        fast_identity = Scheduler._client_identity(clients[1])
-        scheduler.request_wall_seconds_by_client[slow_identity].extend([500.0])
-        scheduler.request_wall_seconds_by_client[fast_identity].extend([50.0])
-        scheduler.group_wall_seconds_by_client[slow_identity].extend([500.0])
-        scheduler.group_wall_seconds_by_client[fast_identity].extend([50.0])
-        scheduler.completion_tokens_by_client[slow_identity].extend([4096.0])
-        scheduler.completion_tokens_by_client[fast_identity].extend([512.0])
-        scheduler.completed_rollouts_by_client[slow_identity] = 1
-        scheduler.completed_rollouts_by_client[fast_identity] = 8
-        scheduler.inference_pool = SimpleNamespace(
-            train_clients=clients,
-            get_metrics=lambda: {},
-            get_client_metrics=lambda: {
-                "shared_router_8000": {
-                    "decode_throughput_tps": 100.0,
-                    "completed_requests_per_s": 2.0,
-                },
-            },
-        )
-        scheduler.request_picker = PrimeAwareRequestPicker(
-            wave_minimax_size=2,
-            decode_guardrail_ratio=0.1,
-            decode_guardrail_penalty=8.0,
-            completed_rps_deficit_weight=8.0,
-        )
-        scheduler.groups[10] = GroupState(
-            example={"env_name": "math"},
-            rollouts_to_schedule=1,
-            predicted_completion_tokens=4096.0,
-            completion_prediction_source="cold_start",
-        )
-
-        assignments = await scheduler._assign_wave_minimax_clients([10])
-
-        assert assignments[10] == clients[1]
-        stats = scheduler._candidate_stats(clients)
-        assert stats[slow_identity].endpoint_metrics == stats[fast_identity].endpoint_metrics
-        replay_events = [
-            call.args[0]
-            for call in scheduler.logger.info.call_args_list
-            if call.args and call.args[0].startswith("Scheduler replay event: ")
-        ]
-        wave = json.loads(replay_events[0].removeprefix("Scheduler replay event: "))
-        assert wave["assignments"][0]["client_idx"] == 2
-        assert wave["assignments"][0]["throughput_penalty"] == 0.0
-
-    asyncio.run(run())
-
-
-def test_wave_minimax_refill_pins_and_schedules_wave_without_cap():
-    async def run() -> None:
-        scheduler = make_scheduler()
-        clients = [
-            vf.ClientConfig(
-                client_idx=1,
-                api_base_url="http://worker-a:8000/v1",
-                extra_headers={"X-data-parallel-rank": "0"},
-            ),
-            vf.ClientConfig(
-                client_idx=2,
-                api_base_url="http://worker-a:8000/v1",
-                extra_headers={"X-data-parallel-rank": "1"},
-            ),
-        ]
-        examples = iter(
-            [
-                {"env_name": "math", "prompt": "problem-a"},
-                {"env_name": "math", "prompt": "problem-b"},
-            ]
-        )
-
-        class Env:
-            requires_group_scoring = False
-
-            async def run_rollout(self, **kwargs):
-                await asyncio.sleep(60)
-
-        scheduler.train_envs = SimpleNamespace(get=lambda env_name: Env())
-        scheduler.buffer = SimpleNamespace(sample_examples=lambda n: [next(examples)])
-        scheduler.inference_pool = SimpleNamespace(
-            train_clients=clients,
-            get_metrics=lambda: {},
-            get_client_metrics=lambda: {},
-        )
-        scheduler.request_picker = PrimeAwareRequestPicker(
-            wave_minimax_size=2,
-            long_output_cold_start_ratio=1.0,
-        )
-        scheduler.max_inflight_rollouts = 2
-        scheduler.rollouts_per_example = 1
-
-        await scheduler._fill_inflight_requests()
-
-        assert len(scheduler.inflight_requests) == 2
-        pinned_clients = [info.client_config for info in scheduler.inflight_requests.values()]
-        assert pinned_clients == clients
-        assert all(info.predicted_completion_tokens == 4096.0 for info in scheduler.inflight_requests.values())
-        assert all(info.completion_prediction_source == "cold_start" for info in scheduler.inflight_requests.values())
-        assert scheduler.metric_values["request_picker_wave_minimax_group_count"] == [2.0]
-
-        await safe_cancel_all(list(scheduler.inflight_requests))
-
-    asyncio.run(run())
-
-
-def test_wave_minimax_refill_stops_when_overhang_limit_is_reached_after_progress_gate():
-    async def run() -> None:
-        scheduler = make_scheduler()
-        clients = [
-            vf.ClientConfig(
-                client_idx=1,
-                api_base_url="http://worker-a:8000/v1",
-                extra_headers={"X-data-parallel-rank": "0"},
-            ),
-            vf.ClientConfig(
-                client_idx=2,
-                api_base_url="http://worker-a:8000/v1",
-                extra_headers={"X-data-parallel-rank": "1"},
-            ),
-        ]
-        examples = iter(
-            [
-                {"env_name": "math", "prompt": "problem-a"},
-                {"env_name": "math", "prompt": "problem-b"},
-            ]
-        )
-
-        class Env:
-            requires_group_scoring = False
-
-            async def run_rollout(self, **kwargs):
-                await asyncio.sleep(60)
-
-        scheduler.train_envs = SimpleNamespace(get=lambda env_name: Env())
-        scheduler.buffer = SimpleNamespace(sample_examples=lambda n: [next(examples)])
-        scheduler.inference_pool = SimpleNamespace(
-            train_clients=clients,
-            get_metrics=lambda: {},
-            get_client_metrics=lambda: {},
-        )
-        scheduler.request_picker = PrimeAwareRequestPicker(
-            wave_minimax_size=2,
-            long_output_cold_start_ratio=1.0,
-            wave_overhang_limit=1,
-            wave_overhang_start_progress=0.5,
-        )
-        scheduler.max_inflight_rollouts = 2
-        scheduler.rollouts_per_example = 1
-        scheduler.batch_size = 4
-        scheduler.step_dispatched_requests = 3
-        scheduler.step_completed_requests = 2
-
-        await scheduler._fill_inflight_requests(batch_progress=2)
-
-        assert len(scheduler.inflight_requests) == 0
-        assert scheduler.metric_values["request_picker_wave_overhang_limited"] == [1.0]
-        assert scheduler.metric_values["request_picker_wave_effective_size"] == [0.0]
-
-    asyncio.run(run())
-
-
-def test_wave_minimax_refill_reduces_wave_to_overhang_headroom():
-    scheduler = make_scheduler()
-    scheduler.batch_size = 8
-    scheduler.step_dispatched_requests = 5
-    scheduler.step_completed_requests = 3
-    scheduler.request_picker = PrimeAwareRequestPicker(
-        wave_minimax_size=32,
-        wave_overhang_limit=5,
-        wave_overhang_start_progress=0.5,
-    )
-
-    assert scheduler._effective_wave_minimax_size(32, batch_progress=4) == 3
-    assert scheduler.metric_values["request_picker_wave_overhang"] == [2.0]
-    assert scheduler.metric_values["request_picker_wave_overhang_limit"] == [5.0]
-    assert scheduler.metric_values["request_picker_wave_overhang_limited"] == [1.0]
-    assert scheduler.metric_values["request_picker_wave_effective_size"] == [3.0]

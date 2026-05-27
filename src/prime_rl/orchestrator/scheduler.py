@@ -196,7 +196,8 @@ class Scheduler:
     def __init__(
         self,
         train_envs: TrainEnvs,
-        inference_pool: InferencePool,
+        student_inference: InferencePool,
+        teacher_inference: InferencePool | None,
         buffer: Buffer,
         config: OrchestratorConfig,
         max_inflight_rollouts: int,
@@ -217,18 +218,23 @@ class Scheduler:
         self.config = config
         self.batch_size = config.batch_size
         self.token_batch_size = config.token_batch_size
-        self.rollouts_per_example = config.rollouts_per_example
+        self.rollouts_per_example = config.group_size
         self.max_inflight_rollouts = max_inflight_rollouts
         self.max_async_level = max_async_level
         self.max_off_policy_steps = max_off_policy_steps
         self.strict_async_level = strict_async_level
         self.enable_policy_updates = enable_policy_updates
         self.lora_name = lora_name
-        self.model_name = self.config.model.name
+        self.student_inference = student_inference
+        self.teacher_inference = teacher_inference
+        if config.training_mode == "sft":
+            assert teacher_inference is not None
+            self.rollout_inference = teacher_inference
+        else:
+            self.rollout_inference = student_inference
+        self.model_name = self.rollout_inference.model_name
         self.json_logging = config.log.json_logging
 
-        # Inference pool - used for admin operations (adapter sync) and metrics
-        self.inference_pool = inference_pool
         self.request_picker = setup_request_picker(config.experimental.request_picker)
 
         group_scoring_envs = [env.name for env in train_envs if env.requires_group_scoring]
@@ -309,18 +315,21 @@ class Scheduler:
         return self.batch_size
 
     def _effective_max_async_level(self) -> int:
-        weight_broadcast = self.config.weight_broadcast
+        max_async_level = getattr(self, "max_async_level", 1)
+        weight_broadcast = getattr(self.config, "weight_broadcast", None)
+        if weight_broadcast is None:
+            return max_async_level
         final_step_async_level = (
             weight_broadcast.final_step_async_level
             if weight_broadcast.type == "nccl" and weight_broadcast.final_step_async_level is not None
-            else self.max_async_level
+            else max_async_level
         )
-        max_steps = self.config.max_steps
-        if max_steps is None or final_step_async_level <= self.max_async_level:
-            return self.max_async_level
+        max_steps = getattr(self.config, "max_steps", None)
+        if max_steps is None or final_step_async_level <= max_async_level:
+            return max_async_level
 
         last_broadcast_step = max(max_steps - final_step_async_level - 1, 0)
-        return max(self.max_async_level, self.step - last_broadcast_step)
+        return max(max_async_level, self.step - last_broadcast_step)
 
     def get_batch_progress_increment(self, rollouts: list[vf.RolloutOutput]) -> int:
         if self.uses_token_batching:
@@ -348,9 +357,13 @@ class Scheduler:
         return client_identity(c)
 
     def _record_value(self, name: str, value: float) -> None:
+        if not hasattr(self, "metric_values"):
+            self.metric_values = defaultdict(list)
         self.metric_values[name].append(value)
 
     def _record_count(self, name: str, value: int | float = 1) -> None:
+        if not hasattr(self, "metric_counts"):
+            self.metric_counts = Counter()
         self.metric_counts[name] += value
 
     def _record_client_count(self, prefix: str, client: vf.ClientConfig, value: int | float = 1) -> None:
@@ -853,18 +866,18 @@ class Scheduler:
         Uses (api_base_url, dp_rank) as identity rather than client_idx so that
         load tracking survives elastic pool refreshes (which reassign indices).
         """
-        clients = self.inference_pool.train_clients
+        clients = self.rollout_inference.train_clients
         while not clients:
             await asyncio.sleep(1)
-            clients = self.inference_pool.train_clients
+            clients = self.rollout_inference.train_clients
         inflight = Counter(self._client_identity(info.client_config) for info in self.inflight_requests.values())
         return min(clients, key=lambda c: inflight[self._client_identity(c)])
 
     async def _get_train_clients(self) -> list[vf.ClientConfig]:
-        clients = self.inference_pool.train_clients
+        clients = self.rollout_inference.train_clients
         while not clients:
             await asyncio.sleep(1)
-            clients = self.inference_pool.train_clients
+            clients = self.rollout_inference.train_clients
         return clients
 
     def _oldest_inflight_seconds(self) -> float:
@@ -875,7 +888,8 @@ class Scheduler:
         return max(ages, default=0.0)
 
     def _candidate_stats(self, clients: list[vf.ClientConfig]) -> dict[ClientIdentity, CandidateStats]:
-        endpoint_metrics = self.inference_pool.get_client_metrics()
+        get_client_metrics = getattr(self.rollout_inference, "get_client_metrics", None)
+        endpoint_metrics = get_client_metrics() if get_client_metrics is not None else {}
         endpoint_client_counts = Counter(endpoint_label_from_url(client.api_base_url) for client in clients)
         inflight_predicted_completion_tokens: Counter[ClientIdentity] = Counter()
         for info in self.inflight_requests.values():
@@ -887,11 +901,11 @@ class Scheduler:
         stats: dict[ClientIdentity, CandidateStats] = {}
         for client in clients:
             identity = self._client_identity(client)
-            wall_times = self.request_wall_seconds_by_client.get(identity, [])
-            completion_tokens = self.completion_tokens_by_client.get(identity, [])
-            group_wall_times = self.group_wall_seconds_by_client.get(identity, [])
-            tail_times = self.group_tail_seconds_by_client.get(identity, [])
-            off_policy_steps = self.off_policy_steps_by_client.get(identity, [])
+            wall_times = getattr(self, "request_wall_seconds_by_client", {}).get(identity, [])
+            completion_tokens = getattr(self, "completion_tokens_by_client", {}).get(identity, [])
+            group_wall_times = getattr(self, "group_wall_seconds_by_client", {}).get(identity, [])
+            tail_times = getattr(self, "group_tail_seconds_by_client", {}).get(identity, [])
+            off_policy_steps = getattr(self, "off_policy_steps_by_client", {}).get(identity, [])
             endpoint_label = endpoint_label_from_url(client.api_base_url)
             endpoint_metric_snapshot, endpoint_exact_match, host_match_count = self._endpoint_metrics_for_client(
                 client, endpoint_metrics
@@ -907,35 +921,36 @@ class Scheduler:
                 endpoint_client_counts[endpoint_label]
             )
             stats[identity] = CandidateStats(
-                completed_rollouts=self.completed_rollouts_by_client[identity],
-                cancelled_rollouts=self.cancelled_rollouts_by_client[identity],
+                completed_rollouts=getattr(self, "completed_rollouts_by_client", Counter())[identity],
+                cancelled_rollouts=getattr(self, "cancelled_rollouts_by_client", Counter())[identity],
                 request_wall_seconds_mean=sum(wall_times) / len(wall_times) if wall_times else None,
-                request_wall_seconds_last=self.last_request_wall_seconds_by_client.get(identity),
+                request_wall_seconds_last=getattr(self, "last_request_wall_seconds_by_client", {}).get(identity),
                 completion_tokens_mean=(sum(completion_tokens) / len(completion_tokens) if completion_tokens else None),
-                completion_tokens_last=self.last_completion_tokens_by_client.get(identity),
+                completion_tokens_last=getattr(self, "last_completion_tokens_by_client", {}).get(identity),
                 group_wall_seconds_mean=(sum(group_wall_times) / len(group_wall_times) if group_wall_times else None),
-                group_wall_seconds_last=self.last_group_wall_seconds_by_client.get(identity),
+                group_wall_seconds_last=getattr(self, "last_group_wall_seconds_by_client", {}).get(identity),
                 group_tail_seconds_mean=sum(tail_times) / len(tail_times) if tail_times else None,
-                group_tail_seconds_last=self.last_group_tail_seconds_by_client.get(identity),
+                group_tail_seconds_last=getattr(self, "last_group_tail_seconds_by_client", {}).get(identity),
                 off_policy_steps_mean=(sum(off_policy_steps) / len(off_policy_steps) if off_policy_steps else None),
-                off_policy_steps_last=self.last_off_policy_steps_by_client.get(identity),
+                off_policy_steps_last=getattr(self, "last_off_policy_steps_by_client", {}).get(identity),
                 inflight_predicted_completion_tokens=float(inflight_predicted_completion_tokens[identity]),
                 endpoint_metrics=endpoint_metric_snapshot,
             )
         return stats
 
     def _predict_completion_tokens(self, example_fingerprint: str, env_name: str | None) -> tuple[float | None, str]:
-        completion_tokens = self.completion_tokens_by_fingerprint.get(example_fingerprint)
+        completion_tokens = getattr(self, "completion_tokens_by_fingerprint", {}).get(example_fingerprint)
         if completion_tokens:
             return sum(completion_tokens) / len(completion_tokens), "fingerprint"
 
         if env_name is not None:
-            env_completion_tokens = self.completion_tokens_by_env.get(env_name)
+            env_completion_tokens = getattr(self, "completion_tokens_by_env", {}).get(env_name)
             if env_completion_tokens:
                 return sum(env_completion_tokens) / len(env_completion_tokens), "env"
 
             max_completion_tokens = self._max_completion_tokens_for_env(env_name)
-            cold_start_ratio = request_picker_long_output_cold_start_ratio(self.request_picker)
+            request_picker = getattr(self, "request_picker", DirectRequestPicker())
+            cold_start_ratio = request_picker_long_output_cold_start_ratio(request_picker)
             if max_completion_tokens is not None and cold_start_ratio > 0:
                 return cold_start_ratio * max_completion_tokens, "cold_start"
 
@@ -951,7 +966,9 @@ class Scheduler:
             )
 
     def _max_completion_tokens_for_env(self, env_name: str) -> int | None:
-        return self.max_completion_tokens_by_env.get(env_name, self.default_max_completion_tokens)
+        return getattr(self, "max_completion_tokens_by_env", {}).get(
+            env_name, getattr(self, "default_max_completion_tokens", None)
+        )
 
     async def _select_request_client(
         self,
@@ -984,7 +1001,8 @@ class Scheduler:
         )
         candidate_stats = self._candidate_stats(clients)
 
-        if isinstance(self.request_picker, DirectRequestPicker):
+        request_picker = getattr(self, "request_picker", DirectRequestPicker())
+        if isinstance(request_picker, DirectRequestPicker):
             start = time.perf_counter()
             client = min(clients, key=lambda c: inflight[self._client_identity(c)])
             latency_seconds = time.perf_counter() - start
@@ -997,7 +1015,7 @@ class Scheduler:
             candidate_score_components = None
         else:
             result = await select_with_metrics(
-                self.request_picker,
+                request_picker,
                 clients,
                 inflight,
                 context,
@@ -1096,9 +1114,9 @@ class Scheduler:
         env_name = group.example["env_name"]
         env = self.train_envs.get(env_name)
         cache_salt = str(self.ckpt_step)
-        request_id = self.next_request_id
-        dispatch_wave_id = self.next_dispatch_wave_id
-        refill_wave_id = self.current_refill_wave_id
+        request_id = getattr(self, "next_request_id", 0)
+        dispatch_wave_id = getattr(self, "next_dispatch_wave_id", 0)
+        refill_wave_id = getattr(self, "current_refill_wave_id", 0)
         selected_inflight = 0
         if group.pinned_client is not None:
             client_config = group.pinned_client
@@ -1138,8 +1156,8 @@ class Scheduler:
             if group_id not in self.groups:
                 return False
             group.pinned_client = client_config
-        self.next_request_id += 1
-        self.next_dispatch_wave_id += 1
+        self.next_request_id = request_id + 1
+        self.next_dispatch_wave_id = dispatch_wave_id + 1
 
         if group.first_dispatch_at is None:
             group.first_dispatch_at = time.perf_counter()
@@ -1207,9 +1225,9 @@ class Scheduler:
             predicted_completion_tokens=group.predicted_completion_tokens,
             completion_prediction_source=group.completion_prediction_source,
         )
-        self.step_dispatched_requests += 1
+        self.step_dispatched_requests = getattr(self, "step_dispatched_requests", 0) + 1
         self._record_value("request_picker_step_dispatched_requests", float(self.step_dispatched_requests))
-        self._record_value("request_picker_step_dispatch_overhang", float(self.step_dispatch_overhang))
+        self._record_value("request_picker_step_dispatch_overhang", float(getattr(self, "step_dispatch_overhang", 0)))
         return True
 
     @property
@@ -1324,7 +1342,8 @@ class Scheduler:
         latest_ckpt_step = get_latest_ckpt_step(get_broadcast_dir(self.config.output_dir)) or 0
         effective_max_async_level = self._effective_max_async_level()
         async_away_ckpt_step = max(self.step - effective_max_async_level, 0)
-        if self.strict_async_level or effective_max_async_level > self.max_async_level:
+        max_async_level = getattr(self, "max_async_level", 1)
+        if getattr(self, "strict_async_level", False) or effective_max_async_level > max_async_level:
             return async_away_ckpt_step
         return max(async_away_ckpt_step, latest_ckpt_step)
 
@@ -1352,7 +1371,7 @@ class Scheduler:
         self.oldest_off_policy_at_pause = self.max_off_policy_level
         update_weights_start_time = time.perf_counter()
         weights_path = get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step)
-        update_metrics = await self.inference_pool.update_weights(
+        update_metrics = await self.student_inference.update_weights(
             weights_path, lora_name=self.lora_name, step=next_ckpt_step
         )
         self.last_update_metrics = update_metrics or {}
@@ -1361,8 +1380,9 @@ class Scheduler:
 
         self.ckpt_step = next_ckpt_step
         if self.lora_name is not None:
-            self.model_name = self.lora_name
-            self.inference_pool.update_model_name(self.model_name)
+            self.student_inference.update_model_name(self.lora_name)
+            if self.rollout_inference is self.student_inference:
+                self.model_name = self.lora_name
 
         self.checkpoint_ready.set()
         await self._update_off_policy()
@@ -1385,7 +1405,7 @@ class Scheduler:
 
     async def maybe_update_policy(self):
         """Updates the policy to the latest available checkpoint. Aborts rollout requests that are older than the max retention steps."""
-        if not self.enable_policy_updates:
+        if not getattr(self, "enable_policy_updates", True):
             self.ckpt_step = self.step
             self.checkpoint_ready.set()
             return
@@ -1686,7 +1706,9 @@ class Scheduler:
         if self.inflight_policy_update_task is not None:
             await safe_cancel(self.inflight_policy_update_task)
             self.inflight_policy_update_task = None
-        await self.request_picker.aclose()
+        request_picker = getattr(self, "request_picker", None)
+        if request_picker is not None:
+            await request_picker.aclose()
 
     @property
     def max_off_policy_level(self) -> int:
@@ -1762,7 +1784,7 @@ class Scheduler:
         self.cancelled_rollouts_by_client.clear()
 
         # Add inference pool metrics (e.g. elastic pool server counts)
-        metrics.update(self.inference_pool.get_metrics())
+        metrics.update(self.rollout_inference.get_metrics())
 
         self._log_instrumentation_metrics(metrics)
 
