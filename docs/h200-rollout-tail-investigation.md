@@ -6,15 +6,29 @@ this fork, what H200 measured, and what should happen next.
 
 ## Current state
 
-The current branch is `chokevin/prime-vllm-straggler-analysis`. The latest
-Prime-RL ref is `d475c3c38447f5355e4e9f173ad9aa872db7b365`
-(`Require admin metrics for guarded waves`).
+All of the hill-climb refs below (`e86a4c37` slack4, `69cf6571` wave/minimax,
+`38d08f38` proxyguard, `a75e0e11` overhang, `d475c3c3` admin-metrics guard) are
+now merged into `main` via PRs #3–#6 — they no longer live only on
+`chokevin/prime-vllm-straggler-analysis`. The vLLM latency metrics collector
+landed separately (PR #5).
 
-That ref is a safety/config guard, not a new H200 policy row. The current
-blocker is H200-side config: throughput-guarded wave/minimax policies need
-backend/admin vLLM metrics. The most recent overhang run polled the router
-endpoint and parsed no tracked vLLM metrics, so the policy still relied on
-Prime-side proxy signals.
+The backend/admin vLLM metrics blocker is **resolved**. The `h200-rl-lab`
+preflight harness (`scripts/preflight-vllm-metrics.py`) added the
+endpoint/config and warmup-output gates, and H200 proved real backend/admin
+metrics reached the scheduler. With metrics proven, `d475c3c3` was scored
+against the slack4 baseline and **rejected** — it did not recover the tail
+(see the table below).
+
+`d475c3c3` itself remains a safety/config guard, not a policy: throughput-guarded
+`wave_minimax` with `dp_rank_count > 1` requires `client.admin_base_url` when
+`collect_inference_metrics = true` (see [Current guard](#current-guard)).
+
+The Prime-RL-side request-picker hill-climb is now **effectively closed**. The
+6-env baseline-vs-`prime_aware` matrix has been collected and an offline
+counterfactual analyzer has bounded the achievable gains (see
+[Campaign close-out](#campaign-close-out)). Further p99 improvement requires
+vLLM **serving-shape** knobs, not new `request_picker` policies. There is no
+launchable next policy row on the Prime-RL side.
 
 ## Baseline and best candidate
 
@@ -23,6 +37,7 @@ Prime-side proxy signals.
 | slack4 baseline | `e86a4c37` | locked healthy baseline | `1315.17s` | `1133.74` | `0.13665` | `519.65s` |
 | proxyguard8 | `38d08f38` | best H200 candidate, throughput caveat | `1284.96s` | `957.14` | `0.10569` | `381.86s` |
 | overhang16 | `a75e0e11` | rejected | `1307.27s` | `943.31` | `0.10768` | `511.63s` |
+| admin-metrics guard | `d475c3c3` | rejected (metrics proven, no tail recovery) | `1290.10s` | `~1101` | `0.0688` | `511.95s` |
 
 Proxyguard8 is the best measured tradeoff so far: it greatly reduces max
 rollout group wall time versus slack4 and wave32, but it is still not a
@@ -61,12 +76,15 @@ caveat, not a final answer.
    proxyguard8 compresses the extreme tail while pushing more work into the
    300s band.
 
-8. **Real vLLM metrics are still the next blocker.** Overhang16 had
-   `collect_inference_metrics = true`, but the run config only had
+8. **Real vLLM metrics were the blocker at overhang16 — since resolved.**
+   Overhang16 had `collect_inference_metrics = true`, but the run config only had
    `client.base_url = ["http://localhost:8000/v1"]` and no `client.admin_base_url`.
    The metric collector warned that `/metrics` responded but no tracked vLLM
-   metrics were parsed. Scheduler candidates therefore did not receive real
-   backend decode/cache/running/waiting signals.
+   metrics were parsed, so scheduler candidates did not receive real backend
+   decode/cache/running/waiting signals. This was later fixed: the `h200-rl-lab`
+   preflight harness wired `admin_base_url` to the backends and proved the
+   metrics reached the scheduler. With metrics proven, `d475c3c3` was scored and
+   rejected (see [Current state](#current-state) and the table).
 
 ## What landed in this branch
 
@@ -99,10 +117,12 @@ The guard applies when:
 
 ## Next action
 
-Owner: H200 harness session / experiment owner.
+Owner: experiment owner / H200 harness session.
 
-Before another H200 policy row, update the H200 config so the orchestrator has
-backend/admin vLLM metrics:
+The backend/admin metrics gate is **satisfied** — `h200-rl-lab` shipped
+`scripts/preflight-vllm-metrics.py` and H200 proved that real backend decode /
+completed-RPS / queue signals reach the scheduler. The reference gate that was
+required before any throughput-guarded row (and is now passing):
 
 ```toml
 [client]
@@ -115,17 +135,6 @@ admin_base_url = [
 dp_rank_count = 4
 ```
 
-Then run a dry-run/preflight that proves:
-
-- `scheduler/client_metrics_available > 0`
-- replay candidate `metrics_available` becomes nonzero after warmup
-- replay candidate `decode_throughput_tps` and `completed_requests_per_s` are
-  non-null for at least one candidate after warmup
-- W&B/logs include `inference/server/<endpoint>/*` metrics
-
-The H200 harness owns this proof. The `h200-rl-lab` preflight branch adds the
-concrete gate script:
-
 ```bash
 CONFIG="${CONFIG:-configs/prime-rl/phi4-reasoning-plus-math-16h200.toml}"
 export PRIME_RL_ADMIN_BASE_URLS="http://<backend-0>:8100 http://<backend-1>:8100"
@@ -137,10 +146,50 @@ export PRIME_RL_ADMIN_BASE_URLS="http://<backend-0>:8100 http://<backend-1>:8100
 ./scripts/preflight-vllm-metrics.py --output-dir "$OUTPUT_DIR" --warmup-step 1
 ```
 
-Only after those gates pass should H200 spend another throughput-guarded
-wave/minimax row.
+The gates that now pass: `scheduler/client_metrics_available > 0`, replay
+candidate `metrics_available` nonzero after warmup, candidate
+`decode_throughput_tps` / `completed_requests_per_s` non-null after warmup, and
+`inference/server/<endpoint>/*` metrics in W&B/logs.
 
-## Candidate direction after metrics are fixed
+Because the gate is met and `d475c3c3` was already scored and rejected, the
+metrics-plumbing path is exhausted on the Prime-RL side. The subsequent 6-env
+campaign and offline counterfactual analysis (see
+[Campaign close-out](#campaign-close-out)) showed that no `request_picker`
+routing policy can push p99 below `max(per_client_p99)` once `wave >= num_clients`.
+The next step is **not** a new Prime-RL policy or another config-only rerun — it
+is vLLM serving-shape experimentation, owned by the H200 harness.
+
+## Campaign close-out
+
+The auto-hillclimb campaign closed on 2026-05-28 after a full 6-env
+baseline-vs-`prime_aware` matrix (math, alphabet, gsm8k, reverse, science,
+blackjack):
+
+- **`prime_aware` is env-gated, not a blanket win.** It cut step-0 p99 by
+  ~60–64% on cap-saturated reasoning envs (math/alphabet/gsm8k) but was a no-op
+  on cold-start envs (reverse), with blackjack mixed. On math it also regressed
+  late-step rollout p99 (~+22s on steps 3–9) and dropped `completed_rps_positive`
+  from 32→5 at roughly equal total wall time.
+- **Routing policies are bounded.** The offline counterfactual analyzer
+  (`analyze-scheduler-counterfactual.py` in `h200-rl-lab`) ranked five routing
+  policies; with uniform per-client distributions they all saturate at
+  `sim_p99 = max(per_client_p99)` once `wave >= num_clients`. No `request_picker`
+  policy can beat that bound.
+- **Next lever is serving shape, not routing.** Further p99 improvement requires
+  vLLM serving-shape knobs — e.g. `wave_minimax_size = 4`, `enforce_eager = false`,
+  `tp = 1 / dp = 8` — explored on the H200 harness, not new Prime-RL request-picker
+  code.
+
+This supersedes the "candidate direction" options below, which are retained for
+historical context only.
+
+## Candidate direction after metrics are fixed (superseded — historical)
+
+> **Superseded by the [Campaign close-out](#campaign-close-out).** These were the
+> candidate policy directions considered *before* the 6-env matrix and offline
+> counterfactual showed routing policies are bounded by `max(per_client_p99)`.
+> They are retained for historical context; do not pursue them as new Prime-RL
+> request-picker work.
 
 Do not continue scalar proxyguard sweeps. Proxyguard4 and proxyguard16 failed
 non-monotonically.
