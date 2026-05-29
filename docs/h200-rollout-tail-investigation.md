@@ -23,9 +23,12 @@ against the slack4 baseline and **rejected** — it did not recover the tail
 `wave_minimax` with `dp_rank_count > 1` requires `client.admin_base_url` when
 `collect_inference_metrics = true` (see [Current guard](#current-guard)).
 
-There is no launchable next policy row on the Prime-RL side. The next step is a
-**tested** metric-backed candidate (direction #1 below) or a stop memo — owned
-by the experiment owner, not a config-only rerun.
+The Prime-RL-side request-picker hill-climb is now **effectively closed**. The
+6-env baseline-vs-`prime_aware` matrix has been collected and an offline
+counterfactual analyzer has bounded the achievable gains (see
+[Campaign close-out](#campaign-close-out)). Further p99 improvement requires
+vLLM **serving-shape** knobs, not new `request_picker` policies. There is no
+launchable next policy row on the Prime-RL side.
 
 ## Baseline and best candidate
 
@@ -148,12 +151,45 @@ candidate `metrics_available` nonzero after warmup, candidate
 `decode_throughput_tps` / `completed_requests_per_s` non-null after warmup, and
 `inference/server/<endpoint>/*` metrics in W&B/logs.
 
-Because the gate is met and `d475c3c3` was already scored and rejected, the next
-step is **not** another config-only rerun. It is one of: a tested metric-backed
-candidate (direction #1 below), or a stop memo if the tail is judged
-unrecoverable with the current dispatch model.
+Because the gate is met and `d475c3c3` was already scored and rejected, the
+metrics-plumbing path is exhausted on the Prime-RL side. The subsequent 6-env
+campaign and offline counterfactual analysis (see
+[Campaign close-out](#campaign-close-out)) showed that no `request_picker`
+routing policy can push p99 below `max(per_client_p99)` once `wave >= num_clients`.
+The next step is **not** a new Prime-RL policy or another config-only rerun — it
+is vLLM serving-shape experimentation, owned by the H200 harness.
 
-## Candidate direction after metrics are fixed
+## Campaign close-out
+
+The auto-hillclimb campaign closed on 2026-05-28 after a full 6-env
+baseline-vs-`prime_aware` matrix (math, alphabet, gsm8k, reverse, science,
+blackjack):
+
+- **`prime_aware` is env-gated, not a blanket win.** It cut step-0 p99 by
+  ~60–64% on cap-saturated reasoning envs (math/alphabet/gsm8k) but was a no-op
+  on cold-start envs (reverse), with blackjack mixed. On math it also regressed
+  late-step rollout p99 (~+22s on steps 3–9) and dropped `completed_rps_positive`
+  from 32→5 at roughly equal total wall time.
+- **Routing policies are bounded.** The offline counterfactual analyzer
+  (`analyze-scheduler-counterfactual.py` in `h200-rl-lab`) ranked five routing
+  policies; with uniform per-client distributions they all saturate at
+  `sim_p99 = max(per_client_p99)` once `wave >= num_clients`. No `request_picker`
+  policy can beat that bound.
+- **Next lever is serving shape, not routing.** Further p99 improvement requires
+  vLLM serving-shape knobs — e.g. `wave_minimax_size = 4`, `enforce_eager = false`,
+  `tp = 1 / dp = 8` — explored on the H200 harness, not new Prime-RL request-picker
+  code.
+
+This supersedes the "candidate direction" options below, which are retained for
+historical context only.
+
+## Candidate direction after metrics are fixed (superseded — historical)
+
+> **Superseded by the [Campaign close-out](#campaign-close-out).** These were the
+> candidate policy directions considered *before* the 6-env matrix and offline
+> counterfactual showed routing policies are bounded by `max(per_client_p99)`.
+> They are retained for historical context; do not pursue them as new Prime-RL
+> request-picker work.
 
 Do not continue scalar proxyguard sweeps. Proxyguard4 and proxyguard16 failed
 non-monotonically.
