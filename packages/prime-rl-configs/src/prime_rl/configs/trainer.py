@@ -6,25 +6,21 @@ from pydantic import Field, model_validator
 
 from prime_rl.configs.shared import (
     BaseModelConfig,
-    FileSystemTransportConfig,
+    EnvVars,
+    FileMonitorConfig,
     HeartbeatConfig,
     MetricsServerConfig,
     TrainerLogConfig,
     TransportConfig,
     WandbConfig,
+    ZMQTransportConfig,
 )
 from prime_rl.utils.config import BaseConfig
 
 # -- Shared trainer configs (used by both SFT and RL trainers) --
 
-AttnImplementation: TypeAlias = Literal["eager", "sdpa", "flash_attention_2", "flash_attention_3", "fa4"]
+AttnImplementation: TypeAlias = Literal["flash_attention_2", "flash_attention_3", "flash_attention_4", "auto"]
 EPCommBackend: TypeAlias = Literal["torch", "deepep"]
-
-# User-facing name -> internal name. Users set `flash_attention_4` in configs,
-# which gets rewritten to `fa4` before pydantic validation.
-# We use `fa4` internally because `flash_attention_*` triggers transformers
-# to attempt installing a kernel from hub.
-_ATTN_ALIASES = {"flash_attention_4": "fa4"}
 
 
 class GCConfig(BaseConfig):
@@ -115,26 +111,65 @@ class DebugModelConfig(BaseConfig):
     """Replace MoE token-choice routing with a round-robin assignment so every expert sees an equal share. Intended for fake-data smoke tests where untrained routing would otherwise OOM under severe imbalance. Gating scores are still gathered from the override indices so the forward pass stays consistent."""
 
 
+MXFP8Recipe: TypeAlias = Literal["mxfp8_rceil", "mxfp8_rceil_wgrad_with_hp"]
+
+_DEFAULT_FP8_IGNORE_PATTERNS: list[str] = [
+    "lm_head",
+    "router",
+    # Use escaped dots — re.search treats `.` as any-char, so the previous
+    # "mlp.gate." pattern was also matching dense MLP `mlp.gate_proj` (the
+    # trailing `.` was matching `_`). That left the dense MLP gate projection
+    # in BF16 on the trainer while inference quantized it to FP8, causing
+    # hidden-state drift before the MoE router.
+    r"mlp\.gate\.",
+    "shared_expert_gate",  # Qwen3.5 MoE: nn.Linear(hidden, 1, bias=False)
+    "eh_proj",
+    "weights_proj",
+    "in_proj_a",
+    "in_proj_b",
+]
+
+
+class FP8Config(BaseConfig):
+    type: Literal["fp8"] = "fp8"
+    enable_grouped_gemm: bool = True
+    ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
+
+
+class MXFP8Config(BaseConfig):
+    type: Literal["mxfp8"] = "mxfp8"
+    recipe: MXFP8Recipe = "mxfp8_rceil"
+    enable_grouped_gemm: bool = True
+    enable_a2a: bool = True
+    ignore_patterns: list[str] = _DEFAULT_FP8_IGNORE_PATTERNS
+
+
+QuantizationConfig: TypeAlias = Annotated[FP8Config | MXFP8Config, Field(discriminator="type")]
+
+
 class ModelConfig(BaseModelConfig):
+    conversion_dir: Path | None = None
+    """Directory for the auto-converted weights (written to a `prime`/`hf` subdirectory). If not set, we write into the model snapshot directory."""
+
     seq_len: int = 2048
     """Sequence length the model is trained on."""
 
-    attn: AttnImplementation = "flash_attention_2"
-    """Attention implementation. With CP enabled, ring attention uses the matching kernel family (FA2/FA3/FA4)."""
+    attn: AttnImplementation = "auto"
+    """Attention implementation. ``auto`` selects FA3 on Hopper (SM90) and FA4 on Blackwell (SM100+). With CP enabled, ring attention uses the matching kernel family (FA2/FA3/FA4)."""
 
-    compile: CompileConfig | None = None
+    compile: CompileConfig | None = CompileConfig()
     """Compile the model with ``torch.compile``."""
 
-    ac: ActivationCheckpointConfig | None = None
+    ac: ActivationCheckpointConfig | None = ActivationCheckpointConfig()
     """Activation checkpointing configuration. If None, activation checkpointing is disabled."""
 
-    ac_offloading: ActivationOffloadingConfig | None = None
+    ac_offloading: ActivationOffloadingConfig | None = ActivationOffloadingConfig()
     """Activation offloading configuration. If None, activation offloading is disabled."""
 
     fsdp_cpu_offload: bool = False
     """Enable FSDP CPU offloading for parameters, gradients, and optimizer states. Uses pinned memory for efficient CPU↔GPU transfers."""
 
-    optim_cpu_offload: bool = False
+    optim_cpu_offload: bool = True
     """Offload only optimizer states (momentum, variance) to CPU, keeping weights on GPU. Avoids the H2D all-gather overhead of FSDP CPU offload while still saving GPU memory."""
 
     reshard_after_forward: bool = True
@@ -143,8 +178,8 @@ class ModelConfig(BaseModelConfig):
     dp_replicate: int = 1
     """Data parallel dim where model weights are replicated."""
 
-    ep: int = 1
-    """Expert parallelism degree for MoE layers. 1 disables EP."""
+    ep: int | Literal["auto"] = "auto"
+    """Expert parallelism degree for MoE layers. 1 disables EP. ``auto`` resolves to ``min(fsdp_island_size, 8)`` for MoE models (where ``fsdp_island_size = world_size // dp_replicate``), and to 1 for non-MoE models. Set an explicit integer to override."""
 
     ep_comm_backend: EPCommBackend = "torch"
     """Communication backend for expert parallelism. ``torch`` uses TorchTitan all-to-all collectives; ``deepep`` uses DeepEP custom kernels."""
@@ -170,11 +205,13 @@ class ModelConfig(BaseModelConfig):
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
     """dtype for gradient/parameter reductions."""
 
+    moe_router_dtype: Literal["bfloat16", "float32"] = "float32"
+    """Compute dtype for MoE router gates. ``float32`` (default) keeps router gate weights in fp32 through forward and backward (exempt from FSDP bf16 parameter casting) and computes the gate GEMM and routing logits in fp32, matching models trained with fp32 routing (e.g. GLM-5.x via Megatron's ``--moe-router-dtype fp32``). ``bfloat16`` computes the gate GEMM in the model compute dtype. Router score functions (sigmoid/softmax) run in fp32 regardless. Only affects the custom MoE implementation; a no-op for non-MoE and HF-impl models."""
+
     moe_use_grouped_mm: bool = True
     """Use grouped mm for MoE layers. Requires compute capability ≥ 9.0."""
 
-    fp8: bool = False
-    """FP8 training via DeepGEMM. Replaces ``nn.Linear`` with FP8 blockwise linear and uses FP8 grouped GEMM for MoE experts. Requires SM90 (Hopper) GPUs and ``model.impl='custom'``."""
+    quantization: QuantizationConfig | None = None
 
     index_cache: IndexCacheConfig | None = None
     """DSA IndexCache sub-configuration. If set, sparse-attention top-k indices are reused across decoder layers per the configured schedule (mirrors vLLM's IndexCache HF overrides). If None, every layer recomputes its own indices."""
@@ -188,16 +225,8 @@ class ModelConfig(BaseModelConfig):
     debug: DebugModelConfig = DebugModelConfig()
     """Debugging knobs for the model and distributed training."""
 
-    fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = "disabled"
-    """Flattened token chunk size for the fused LM head. ``int >= 1`` sets the tokens per LM-head chunk explicitly; ``auto`` auto-enables (RL training picks 8192); ``disabled`` uses the vanilla LM head. Integer values aren't supported for SFT training."""
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize_attn_alias(cls, data):
-        """Rewrite user-facing `flash_attention_4` to internal `fa4` before validation."""
-        if isinstance(data, dict) and data.get("attn") in _ATTN_ALIASES:
-            data["attn"] = _ATTN_ALIASES[data["attn"]]
-        return data
+    fused_lm_head_token_chunk_size: int | Literal["disabled"] = 1024
+    """Flattened token chunk size for the fused LM head. ``int >= 1`` sets the tokens per LM-head chunk explicitly; ``disabled`` uses the vanilla LM head. SFT training silently disables this (not supported yet)."""
 
     @model_validator(mode="after")
     def trust_remote_code_only_with_hf(self):
@@ -208,17 +237,25 @@ class ModelConfig(BaseModelConfig):
         return self
 
     @model_validator(mode="after")
-    def cp_only_with_flash_attn(self):
-        if self.cp > 1 and self.attn not in ["flash_attention_2", "flash_attention_3", "fa4"]:
-            raise ValueError("CP is only supported with flash attention 2, flash attention 3, or fa4")
-        if self.cp > 1 and self.attn in ("flash_attention_3", "fa4") and self.impl != "custom":
-            # Both ring and ulysses route FA3/FA4 through our custom FlashAttention class:
-            # ring patches `_compute_attention` with the ring kernel, ulysses patches it with
-            # the all-to-all wrapper around the FA3/FA4 kernel. The HF path patches
-            # `_flash_attention_forward` which only wraps FA2.
+    def vlm_only_with_custom_impl(self):
+        if self.vlm is not None and self.impl != "custom":
+            raise ValueError("VLM training requires model.impl='custom'")
+        return self
+
+    @model_validator(mode="after")
+    def vlm_cp_requires_ulysses(self):
+        if self.vlm is not None and self.cp > 1 and self.cp_style != "ulysses":
+            raise ValueError("VLM models require cp_style='ulysses' for context parallelism")
+        return self
+
+    @model_validator(mode="after")
+    def validate_cp(self):
+        if self.cp > 1 and self.attn not in ["flash_attention_2", "flash_attention_3", "flash_attention_4", "auto"]:
+            raise ValueError("CP is only supported with flash attention 2, 3, or 4")
+        if self.cp > 1 and self.impl not in ("custom", "auto"):
             raise ValueError(
-                f"CP with {self.attn} requires model.impl='custom' "
-                "(FA3/FA4 paths are only implemented for the custom model attention class)"
+                "Context parallelism requires model.impl='custom' or 'auto' "
+                "(resolved to a custom PrimeRL implementation)"
             )
         return self
 
@@ -243,14 +280,15 @@ class ModelConfig(BaseModelConfig):
 
     @model_validator(mode="after")
     def flash_attention_4_only_with_custom_impl(self):
-        if self.attn == "fa4" and self.impl != "custom":
-            raise ValueError("Flash attention 4 is only supported with the custom implementation")
+        # "auto" may resolve to FA4 on Blackwell, so apply the same impl constraint.
+        if self.attn in ("flash_attention_4", "auto") and self.impl not in ("custom", "auto"):
+            raise ValueError("Flash attention 4 is only supported with model.impl='custom' or 'auto'")
         return self
 
     @model_validator(mode="after")
-    def fp8_only_with_custom_impl(self):
-        if self.fp8 and self.impl not in ("custom", "auto"):
-            raise ValueError("FP8 training is only supported with model.impl='custom' or 'auto'.")
+    def quantization_only_with_custom_impl(self):
+        if self.quantization is not None and self.impl not in ("custom", "auto"):
+            raise ValueError(f"{self.quantization.type} training is only supported with model.impl='custom' or 'auto'.")
         return self
 
     @model_validator(mode="after")
@@ -258,9 +296,15 @@ class ModelConfig(BaseModelConfig):
         if self.ep_comm_backend == "torch":
             return self
 
-        if self.ep <= 1:
+        if isinstance(self.ep, int) and self.ep <= 1:
             raise ValueError(f"model.ep_comm_backend='{self.ep_comm_backend}' requires model.ep > 1.")
 
+        return self
+
+    @model_validator(mode="after")
+    def mxfp8_only_with_torch_ep_backend(self):
+        if isinstance(self.quantization, MXFP8Config) and self.ep_comm_backend != "torch":
+            raise ValueError("MXFP8 quantization requires model.ep_comm_backend='torch'.")
         return self
 
 
@@ -425,6 +469,18 @@ class DefaultLossConfig(BaseConfig):
     """Temperature for the KL term."""
 
 
+class IPOLossConfig(BaseConfig):
+    type: Literal["ipo"] = "ipo"
+    ipo_threshold: float = Field(0.1, ge=0)
+    """Upper DPPO masking threshold."""
+
+    adv_tau: float = Field(1.0, ge=0)
+    """Temperature for the advantage term."""
+
+    kl_tau: float = Field(1e-3, ge=0)
+    """Temperature for the KL term."""
+
+
 class CustomLossConfig(BaseConfig):
     type: Literal["custom"] = "custom"
 
@@ -435,7 +491,7 @@ class CustomLossConfig(BaseConfig):
     """Kwargs forwarded to the loss function."""
 
 
-LossConfig: TypeAlias = Annotated[DefaultLossConfig | CustomLossConfig, Field(discriminator="type")]
+LossConfig: TypeAlias = Annotated[DefaultLossConfig | IPOLossConfig | CustomLossConfig, Field(discriminator="type")]
 
 
 class FakeDataLoaderConfig(BaseConfig):
@@ -465,44 +521,45 @@ class FileSystemWeightBroadcastConfig(BaseWeightBroadcastConfig):
     """Weight checkpoint serialization format."""
 
 
-class NCCLWeightBroadcastConfig(BaseWeightBroadcastConfig):
-    type: Literal["nccl"] = "nccl"
-
+class InMemoryWeightBroadcastConfig(BaseWeightBroadcastConfig):
     host: str = "localhost"
-    """Host for the NCCL broadcast rendezvous."""
+    """Weight transfer host."""
 
-    port: int = 29501
-    """Port for the NCCL broadcast rendezvous."""
+    port: int
+    """Weight transfer port."""
 
     timeout: int = 1200
-    """Timeout in seconds for the NCCL broadcast."""
-
-    allow_async_level_gt_1: bool = False
-    """Allow NCCL broadcast with max_async_level > 1 for finite async-slack runs."""
-
-    final_step_async_level: int | None = Field(None, ge=1)
-    """Use this async level for finite-run final-step drain."""
+    """Weight transfer timeout in seconds."""
 
     # TODO: Should not be configurable, but auto-inferred
     inference_world_size: int = 1
-    """Number of GPUs used for inference."""
+    """Number of inference workers."""
+
+
+class NCCLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
+    type: Literal["nccl"] = "nccl"
+
+    port: int = 29501
+    """Port for the NCCL broadcast rendezvous."""
 
     quantize_in_weight_transfer: bool = False
     """Use kernel-format FP8 quantized NCCL transfer for weight updates. When disabled, uses default HF checkpoint-format transfer."""
 
 
+class NIXLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
+    type: Literal["nixl"] = "nixl"
+
+    port: int = 8001
+    """ModelExpress gRPC port."""
+
+    session_id: str = "default"
+    """ModelExpress session ID."""
+
+
 WeightBroadcastConfig: TypeAlias = Annotated[
-    FileSystemWeightBroadcastConfig | NCCLWeightBroadcastConfig, Field(discriminator="type")
+    FileSystemWeightBroadcastConfig | NCCLWeightBroadcastConfig | NIXLWeightBroadcastConfig,
+    Field(discriminator="type"),
 ]
-
-
-class TokenExportConfig(BaseConfig):
-    """Configures per-token rollout exports from the RL trainer."""
-
-
-class TrainerExperimentalConfig(BaseConfig):
-    token_export: TokenExportConfig | None = None
-    """Opt-in per-token JSONL export for rollout debugging. When enabled, writes token ids and aligned trainer metrics after each forward pass."""
 
 
 class TrainerConfig(BaseConfig):
@@ -513,7 +570,7 @@ class TrainerConfig(BaseConfig):
     data: DataLoaderConfig = DataLoaderConfig()
 
     loss: LossConfig = DefaultLossConfig()
-    """Loss config for rl-mode batches. opd and sft batches dispatch to their own loss fns unconditionally and do not read this."""
+    """Loss config for the rl loss component (see ``setup_rl_loss_fn``). The ce / ref_kl components are fixed and do not read this."""
 
     optim: OptimizerConfig = AdamWConfig()
 
@@ -525,12 +582,15 @@ class TrainerConfig(BaseConfig):
     weight_broadcast: WeightBroadcastConfig = FileSystemWeightBroadcastConfig()
     """Transport used to broadcast updated weights from trainer to inference."""
 
-    rollout_transport: TransportConfig = FileSystemTransportConfig()
+    rollout_transport: TransportConfig = ZMQTransportConfig()
     """Transport used to ship rollouts from orchestrator to trainer."""
 
     log: TrainerLogConfig = TrainerLogConfig()
 
     wandb: WandbConfig | None = None
+
+    file_monitor: FileMonitorConfig | None = None
+    """Local JSONL metric sink. If set, trainer metrics are appended to ``<output_dir>/metrics.jsonl``."""
 
     output_dir: Path = Path("outputs")
     """Directory to write outputs to — checkpoints, weights, rollouts, and logs are written as subdirectories. Should be a persistent directory with enough disk space and unique per experiment running on a single node."""
@@ -556,7 +616,7 @@ class TrainerConfig(BaseConfig):
     trace_path: Path | None = None
     """Path to write the PyTorch profiler trace to."""
 
-    dist_timeout_seconds: int = 600
+    dist_timeout_seconds: int = 3600
     """Timeout in seconds for torch distributed ops."""
 
     heartbeat: HeartbeatConfig | None = None
@@ -568,7 +628,11 @@ class TrainerConfig(BaseConfig):
     max_concurrent_runs: int = Field(1, ge=1)
     """Maximum number of concurrent runs to allow. If 1, only one run may run at a time."""
 
-    experimental: TrainerExperimentalConfig = TrainerExperimentalConfig()
+    enable_token_export: bool = False
+    """Opt-in per-token JSONL export for rollout debugging. When enabled, writes token ids and aligned trainer metrics after each forward pass."""
+
+    env_vars: EnvVars = {}
+    """Extra environment variables for the trainer process(es). Merged on top of the launcher defaults."""
 
     @model_validator(mode="after")
     def deepep_disables_grad_clipping(self):
@@ -646,9 +710,8 @@ class TrainerConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_lora_broadcast(self):
-        if self.model.lora is not None and self.weight_broadcast.type == "nccl":
-            # TODO: Support this
-            raise ValueError("NCCL weight broadcast does not support LoRA yet.")
+        if self.model.lora is not None and self.weight_broadcast.type in ("nccl", "nixl"):
+            raise ValueError("In-memory weight broadcast does not support LoRA yet.")
         return self
 
     @model_validator(mode="after")
@@ -660,15 +723,8 @@ class TrainerConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
-    def auto_setup_fused_lm_head_token_chunk_size(self):
-        if self.model.fused_lm_head_token_chunk_size == "auto":
-            self.model.fused_lm_head_token_chunk_size = 8192
-
-        return self
-
-    @model_validator(mode="after")
     def ep_only_with_custom_impl(self):
-        if self.model.ep > 1 and self.model.impl not in ("custom", "auto"):
+        if self.model.ep != 1 and self.model.ep != "auto" and self.model.impl not in ("custom", "auto"):
             raise ValueError("EP is only supported with the custom implementation or auto mode")
 
         return self

@@ -2,11 +2,12 @@
     "$schema": "https://mintlify.com/docs.json",
     "navigation": [
         {
-            "group": "PRIME-RL",
+            "group": "prime-rl",
             "pages": [
                 "overview",
                 "configuration",
                 "training",
+                "inference",
                 "scaling",
                 "algorithms",
                 "advanced",

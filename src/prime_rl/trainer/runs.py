@@ -1,4 +1,5 @@
 import pickle
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
@@ -20,7 +21,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class Progress:
-    step: int = 0
+    step: int = 1
     total_tokens: int = 0
     total_samples: int = 0
 
@@ -235,9 +236,20 @@ class MultiRunManager:
             with open(config_path, "rb") as f:
                 config_dict = tomli.load(f)
 
+            from verifiers.v1.loaders import skip_plugin_install
+
             from prime_rl.configs.orchestrator import OrchestratorConfig
 
-            config = OrchestratorConfig(**config_dict)
+            # The trainer only reads training-relevant fields (model, lora, seq_len, buffers,
+            # env names) and never runs the env, so skip resolving/installing taskset/harness
+            # plugins from the Environments Hub while parsing. Otherwise a private v1 hub env
+            # (`taskset.id = owner/name@version`) 404s here — the trainer has no Hub creds — and
+            # the run is silently skipped. The env server still installs the plugin at runtime.
+            token = skip_plugin_install.set(True)
+            try:
+                config = OrchestratorConfig(**config_dict)
+            finally:
+                skip_plugin_install.reset(token)
         except Exception as e:
             if error_path.parent.exists():
                 with open(error_path, "w") as f:
@@ -247,7 +259,12 @@ class MultiRunManager:
 
         # Run registered validation hooks
         for hook in self._config_validation_hooks:
-            is_valid, error_message = hook(config)
+            try:
+                is_valid, error_message = hook(config)
+            except Exception as e:
+                hook_name = getattr(hook, "__name__", type(hook).__name__)
+                is_valid = False
+                error_message = f"Validation hook {hook_name} crashed: {e}"
             if not is_valid:
                 self.logger.error(f"Run {run_id}: {error_message}")
                 if error_path.parent.exists():
@@ -273,16 +290,17 @@ class MultiRunManager:
 
         # Set progress based on resume_step config (match orchestrator behavior)
         self.progress[new_id] = Progress()
+        # ``step_S`` means step S finished; resume continues at S+1.
         if config.ckpt is None or config.ckpt.resume_step is None:
-            self.progress[new_id].step = 0
+            self.progress[new_id].step = 1
         elif config.ckpt.resume_step == -1:
             ckpt_dir = self.get_run_dir(new_id) / "checkpoints"
             # In multi-run, the trainer writes STABLE after saving LoRA weights to the run's checkpoint dir.
             # In single-run, only the orchestrator writes checkpoints here (trainer has its own dir), so no STABLE exists.
             steps = get_stable_ckpt_steps(ckpt_dir) if self.max_runs > 1 else get_all_ckpt_steps(ckpt_dir)
-            self.progress[new_id].step = max(steps) if steps else 0
+            self.progress[new_id].step = max(steps) + 1 if steps else 1
         else:
-            self.progress[new_id].step = config.ckpt.resume_step
+            self.progress[new_id].step = config.ckpt.resume_step + 1
 
         # Store the parsed config
         self.config[new_id] = config
@@ -457,6 +475,20 @@ class MultiRunManager:
     # Properties and Accessors
     # =========================================================================
 
+    def wait_for_run(self, idx: int = 0, poll_interval: float = 1.0) -> None:
+        """Block until run ``idx`` is registered. Master discovers from disk; all ranks synchronize.
+
+        Runs are otherwise only discovered during batch collection (``packer.discover_runs``), so
+        callers that need a run before the first batch (optimizer setup, first-step weight sync)
+        use this to populate ``idx_2_id``/``used_idxs``.
+        """
+        while idx not in self.idx_2_id:
+            if self.world.is_master:
+                self.discover_runs()
+            self.synchronize_state()
+            self.logger.info(f"Waiting for run {idx} to be created ({self.id_2_idx=})")
+            time.sleep(poll_interval)
+
     @property
     def used_idxs(self):
         return sorted(self.idx_2_id.keys())
@@ -510,22 +542,22 @@ def setup_multi_run_manager(
         trainer_lora = lora_config
 
         def validate_lora_rank(orch_config: "OrchestratorConfig") -> tuple[bool, str]:
+            if orch_config.model.lora is None:
+                return False, "orchestrator.model.lora is required when trainer is configured with LoRA"
             # Default to trainer's rank/alpha if not specified
-            if orch_config.student.model.lora.rank is None:
-                orch_config.student.model.lora.rank = trainer_lora.rank
-            if orch_config.student.model.lora.alpha is None:
-                orch_config.student.model.lora.alpha = trainer_lora.alpha
-            if orch_config.student.model.lora.rank > trainer_lora.rank:
+            if orch_config.model.lora.rank is None:
+                orch_config.model.lora.rank = trainer_lora.rank
+            if orch_config.model.lora.alpha is None:
+                orch_config.model.lora.alpha = trainer_lora.alpha
+            if orch_config.model.lora.rank > trainer_lora.rank:
                 return (
                     False,
-                    f"student.model.lora.rank ({orch_config.student.model.lora.rank}) exceeds trainer max rank ({trainer_lora.rank})",
+                    f"orchestrator.model.lora.rank ({orch_config.model.lora.rank}) exceeds trainer max rank ({trainer_lora.rank})",
                 )
             return True, ""
 
         def on_run_discovered(idx: int, run_id: str, orch_config: "OrchestratorConfig") -> None:
-            _MULTI_RUN_MANAGER.scaling_factors[idx] = (
-                orch_config.student.model.lora.alpha / orch_config.student.model.lora.rank
-            )
+            _MULTI_RUN_MANAGER.scaling_factors[idx] = orch_config.model.lora.alpha / orch_config.model.lora.rank
 
         _MULTI_RUN_MANAGER.register_config_validation_hook(validate_lora_rank)
         _MULTI_RUN_MANAGER.register_discovered_hook(on_run_discovered)

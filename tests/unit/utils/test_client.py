@@ -1,12 +1,12 @@
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
-import verifiers as vf
+from verifiers.v1.clients.config import EvalClientConfig
 
 from prime_rl.configs.shared import ClientConfig
-from prime_rl.utils.client import _is_retryable_lora_error, load_lora_adapter, setup_clients, update_weights
+from prime_rl.utils.client import _is_retryable_lora_error, check_health, load_lora_adapter, setup_clients
 
 
 def test_is_retryable_lora_error_returns_true_for_404():
@@ -49,47 +49,13 @@ def test_load_lora_adapter_succeeds_on_first_attempt():
     )
 
 
-def test_update_weights_creates_durable_ready_marker_and_returns_split_metrics(tmp_path):
-    class FakeResponse:
-        def raise_for_status(self) -> None:
-            return None
-
-    class FakeClient:
-        base_url = "http://worker-a:8000"
-
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, dict]] = []
-
-        async def post(self, path: str, **kwargs) -> FakeResponse:
-            self.calls.append((path, kwargs))
-            return FakeResponse()
-
-    async def run() -> None:
-        client = FakeClient()
-        weight_dir = tmp_path / "broadcasts" / "step_1"
-
-        metrics = await update_weights([client], weight_dir)
-
-        assert (weight_dir / "NCCL_READY").exists()
-        assert [path for path, _ in client.calls] == ["/pause", "/update_weights", "/resume"]
-        assert client.calls[1][1]["json"] == {"weight_dir": weight_dir.as_posix()}
-        assert "time/update_ready_marker" in metrics
-        assert "time/update_pause" in metrics
-        assert "time/update_fanout" in metrics
-        assert "time/update_resume" in metrics
-        assert "time/update_total" in metrics
-
-    asyncio.run(run())
-
-
-def test_setup_clients_assigns_renderer_and_dp_rank_headers():
+def test_setup_clients_creates_one_renderer_client_per_url():
     from renderers import Qwen3VLRendererConfig
 
     client_config = ClientConfig(
-        base_url=["http://worker-a:8000/v1"],
+        base_url=["http://worker-a:8000/v1", "http://worker-b:8000/v1"],
         api_key_var="PRIME_API_KEY",
         headers={"X-Test": "test"},
-        dp_rank_count=2,
         extra_headers_from_state={"X-Session-ID": "session_id"},
     )
 
@@ -100,13 +66,28 @@ def test_setup_clients_assigns_renderer_and_dp_rank_headers():
         renderer_config=renderer_settings,
     )
 
-    assert [client.client_type for client in clients] == ["renderer", "renderer"]
-    assert [client.renderer_config for client in clients] == [renderer_settings, renderer_settings]
+    assert [client.type for client in clients] == ["train", "train"]
+    assert [client.renderer for client in clients] == [renderer_settings, renderer_settings]
     assert [client.renderer_model_name for client in clients] == [None, None]
-    assert [client.api_base_url for client in clients] == ["http://worker-a:8000/v1"] * 2
-    assert [client.extra_headers["X-data-parallel-rank"] for client in clients] == ["0", "1"]
-    assert clients[0].extra_headers["X-Test"] == "test"
-    assert clients[0].extra_headers_from_state == {"X-Session-ID": "session_id"}
+    assert [client.base_url for client in clients] == [
+        "http://worker-a:8000/v1",
+        "http://worker-b:8000/v1",
+    ]
+    assert all("X-data-parallel-rank" not in client.headers for client in clients)
+    assert clients[0].headers["X-Test"] == "test"
+
+
+def test_check_health_retries_non_success_status():
+    client = AsyncMock()
+    unavailable = httpx.Response(503, request=httpx.Request("GET", "http://worker/health"))
+    healthy = httpx.Response(200, request=httpx.Request("GET", "http://worker/health"))
+    client.get.side_effect = [unavailable, healthy]
+    client.base_url = httpx.URL("http://worker")
+
+    with patch("prime_rl.utils.client.asyncio.sleep", new=AsyncMock()):
+        asyncio.run(check_health([client], interval=1, timeout=2))
+
+    assert client.get.await_count == 2
 
 
 def test_setup_clients_assigns_renderer_model_name():
@@ -136,17 +117,9 @@ def test_setup_clients_preserves_chat_client_defaults():
     clients = setup_clients(client_config)
 
     assert clients == [
-        vf.ClientConfig(
-            client_idx=0,
-            client_type="openai_chat_completions",
+        EvalClientConfig(
             api_key_var="PRIME_API_KEY",
-            api_base_url="http://worker-a:8000/v1",
-            timeout=client_config.timeout,
-            connect_timeout=client_config.connect_timeout,
-            max_connections=8192,
-            max_keepalive_connections=8192,
-            max_retries=10,
-            extra_headers={},
-            extra_headers_from_state={},
+            base_url="http://worker-a:8000/v1",
+            headers={},
         )
     ]

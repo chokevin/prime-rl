@@ -1,9 +1,13 @@
-from typing import Any
+from __future__ import annotations
 
-import verifiers as vf
+from typing import TYPE_CHECKING, Any
 
 from prime_rl.utils.logger import get_logger
 from prime_rl.utils.monitor.base import Monitor
+from prime_rl.utils.monitor.prime import PrimeMonitor
+
+if TYPE_CHECKING:
+    from prime_rl.orchestrator.types import Rollout
 
 
 class MultiMonitor(Monitor):
@@ -12,6 +16,9 @@ class MultiMonitor(Monitor):
     def __init__(self, monitors: list[Monitor]):
         self.monitors = monitors
         self.logger = get_logger()
+        # Prefer the platform run id over W&B's when both report one.
+        prime = next((m for m in monitors if isinstance(m, PrimeMonitor)), None)
+        self.run_id = (prime.run_id if prime else None) or next((m.run_id for m in monitors if m.run_id), None)
 
     @property
     def history(self) -> list[dict[str, Any]]:
@@ -26,14 +33,14 @@ class MultiMonitor(Monitor):
             except Exception as e:
                 self.logger.warning(f"Failed to log metrics to {monitor.__class__.__name__}: {e}")
 
-    def log_samples(self, rollouts: list[vf.RolloutOutput], step: int) -> None:
+    def log_samples(self, rollouts: list[Rollout], step: int) -> None:
         for monitor in self.monitors:
             try:
                 monitor.log_samples(rollouts=rollouts, step=step)
             except Exception as e:
                 self.logger.warning(f"Failed to log samples to {monitor.__class__.__name__}: {e}")
 
-    def log_eval_samples(self, rollouts: list[vf.RolloutOutput], env_name: str, step: int) -> None:
+    def log_eval_samples(self, rollouts: list[Rollout], env_name: str, step: int) -> None:
         for monitor in self.monitors:
             try:
                 monitor.log_eval_samples(rollouts=rollouts, env_name=env_name, step=step)

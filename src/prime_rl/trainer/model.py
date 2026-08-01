@@ -26,8 +26,15 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Genera
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.utils.import_utils import is_flash_attn_3_available
 
-from prime_rl.configs.trainer import ActivationCheckpointConfig, CompileConfig, ModelConfig, TokenizerConfig
-from prime_rl.trainer.distributed import DeepEPExpertParallel
+from prime_rl.configs.trainer import (
+    ActivationCheckpointConfig,
+    CompileConfig,
+    FP8Config,
+    ModelConfig,
+    MXFP8Config,
+    TokenizerConfig,
+)
+from prime_rl.trainer.distributed import DeepEPExpertParallel, MXFP8AllToAllExpertParallel
 from prime_rl.trainer.lora import apply_lora_to_model, freeze_all_except_lora_and_specified, strip_lora_from_state_dict
 from prime_rl.trainer.models import (
     AutoModelForCausalLMPrimeRL,
@@ -37,6 +44,7 @@ from prime_rl.trainer.models import (
     get_custom_vlm_cls,
     supports_custom_impl,
 )
+from prime_rl.trainer.models.glm_moe_dsa.sparse_mla_attention import Indexer
 from prime_rl.trainer.models.layers.checkpointing import (
     get_supported_targets,
     set_selective_activation_checkpointing,
@@ -44,7 +52,9 @@ from prime_rl.trainer.models.layers.checkpointing import (
 )
 from prime_rl.trainer.models.layers.fp8_linear import replace_linear_with_fp8_blockwise_linear
 from prime_rl.trainer.models.layers.lm_head import inject_prime_lm_head
-from prime_rl.trainer.models.layers.moe import LatentMoE, MoE
+from prime_rl.trainer.models.layers.moe import LatentMoE, MoE, TokenChoiceTopKRouter
+from prime_rl.trainer.models.layers.mxfp8_grouped_gemm import apply_mxfp8_moe_grouped_gemm
+from prime_rl.trainer.models.layers.mxfp8_linear import replace_linear_with_mxfp8_linear
 from prime_rl.trainer.parallel_dims import ParallelDims
 from prime_rl.trainer.weights import (
     load_state_dict,
@@ -79,7 +89,7 @@ def _patch_qwen3_5_moe_conversion_mapping():
     incorrectly maps qwen3_5_moe → qwen2_moe, which assumes per-expert 2D checkpoint weights,
     causing revert_weight_conversion to produce wrong shapes during weight broadcasting.
 
-    Remove once the pinned transformers commit fixes this.
+    Remove once an official Transformers release fixes this.
     """
     from transformers.conversion_mapping import (
         get_checkpoint_conversion_mapping,
@@ -99,7 +109,7 @@ def _patch_qwen3_5_text_position_ids():
     """Fix Qwen3.5 passing 3D MRoPE position_ids to decoder layers instead of 2D text_position_ids.
 
     Upstream fix: https://github.com/huggingface/transformers/pull/44399
-    Remove once the pinned transformers commit includes this fix.
+    Remove once an official Transformers release includes this fix.
     """
     import inspect
 
@@ -143,10 +153,37 @@ def _patch_qwen3_5_linear_attn_varlen():
         apply_mask_to_padding_states,
     )
 
+    try:
+        from fla.modules.convolution import causal_conv1d as fla_causal_conv1d
+        from fla.ops.cp import build_cp_context
+    except ImportError:
+        build_cp_context = None
+        fla_causal_conv1d = None
+
+    if fla_causal_conv1d is not None:
+        # The CP boundary-state exchange inside fla's conv is not dynamo-traceable;
+        # graph-break deliberately so the rest of the layer still compiles.
+        fla_causal_conv1d = torch.compiler.disable(fla_causal_conv1d)
+
     if getattr(Qwen3_5GatedDeltaNet.forward, "_prl_varlen_patched", False):
         return
 
     _gdn_orig = Qwen3_5GatedDeltaNet.forward
+
+    def _build_cp_context(self, local_seq_len: int, device: torch.device, cu_seqlens=None):
+        cp_group = getattr(self, "cp_group", None)
+        if cp_group is None or build_cp_context is None:
+            return None
+        global_seq_len = local_seq_len * self.cp_world_size
+        if cu_seqlens is not None and int(cu_seqlens[-1].item()) == global_seq_len:
+            global_cu_seqlens = cu_seqlens.to(device=device, dtype=torch.int32)
+        else:
+            global_cu_seqlens = torch.tensor([0, global_seq_len], dtype=torch.int32, device=device)
+        return build_cp_context(
+            cu_seqlens=global_cu_seqlens,
+            group=cp_group,
+            conv1d_kernel_size=self.conv_kernel_size,
+        )
 
     def _gdn_forward(self, hidden_states, cache_params=None, attention_mask=None, cu_seqlens=None):
         if cu_seqlens is None or cache_params is not None:
@@ -160,7 +197,18 @@ def _patch_qwen3_5_linear_attn_varlen():
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
 
-        if self.causal_conv1d_fn is not None:
+        cp_context = _build_cp_context(self, seq_len, hidden_states.device, cu_seqlens)
+
+        if cp_context is not None and fla_causal_conv1d is not None:
+            mixed_qkv, _ = fla_causal_conv1d(
+                x=mixed_qkv.transpose(1, 2),
+                weight=self.conv1d.weight.squeeze(1),
+                bias=self.conv1d.bias,
+                activation=self.activation,
+                cp_context=cp_context,
+            )
+            mixed_qkv = mixed_qkv.transpose(1, 2)
+        elif self.causal_conv1d_fn is not None:
             seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
             seq_idx = torch.repeat_interleave(
                 torch.arange(seg_lens.numel(), dtype=torch.int32, device=hidden_states.device),
@@ -196,17 +244,29 @@ def _patch_qwen3_5_linear_attn_varlen():
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        core_attn_out, _ = self.chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens,
-        )
+        if cp_context is not None:
+            core_attn_out, _ = self.chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cp_context.cu_seqlens,
+                cp_context=cp_context,
+            )
+        else:
+            core_attn_out, _ = self.chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu_seqlens,
+            )
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -272,7 +332,7 @@ def _patch_qwen3_5_linear_attn_varlen():
     ):
         attn_impl = getattr(self.config, "_attn_implementation", None)
         cu_seqlens = None
-        if attn_impl in ("flash_attention_2", "flash_attention_3", "fa4") and position_ids is not None:
+        if attn_impl in ("flash_attention_2", "flash_attention_3", "flash_attention_4") and position_ids is not None:
             pids = position_ids
             if pids.ndim == 3:
                 pids = pids[0]
@@ -338,8 +398,8 @@ def freeze_moe_router(model: nn.Module) -> None:
             for param in mlp.router.parameters():
                 param.requires_grad = False
                 num_frozen += 1
-        # HuggingFace implementation: gate attribute (nn.Linear)
-        elif hasattr(mlp, "gate") and isinstance(mlp.gate, nn.Linear):
+        # HuggingFace implementation: gate may have been wrapped with LoRA.
+        elif hasattr(mlp, "gate") and isinstance(mlp.gate, nn.Module):
             for param in mlp.gate.parameters():
                 param.requires_grad = False
                 num_frozen += 1
@@ -348,6 +408,52 @@ def freeze_moe_router(model: nn.Module) -> None:
         raise ValueError("No MoE router parameters found to freeze. Is this a MoE model?")
 
     logger.info(f"Froze {num_frozen} MoE router parameters")
+
+
+def apply_fp32_moe_router(model: nn.Module) -> None:
+    """Cast MoE router gates to fp32 so routing runs in fp32 in forward and backward.
+
+    The FSDP bf16 cast exemption is applied separately in `setup_fsdp`.
+    """
+    logger = get_logger()
+    language_model = get_language_model(model)
+    num_routers = 0
+
+    for layer in language_model.layers:
+        mlp = layer.mlp if hasattr(layer, "mlp") else layer.feed_forward if hasattr(layer, "feed_forward") else None
+        if isinstance(mlp, (MoE, LatentMoE)):
+            mlp.router.to(torch.float32)
+            if isinstance(mlp.router, TokenChoiceTopKRouter):
+                mlp.router.fp32_gate = True
+            num_routers += 1
+
+    # No-op for non-MoE and HF-impl models: moe_router_dtype='float32' is the default,
+    # so absence of custom-impl MoE routers is the common case, not an error.
+    if num_routers > 0:
+        logger.info(f"Running {num_routers} MoE router gates in fp32")
+
+
+def freeze_sparse_indexer(model: nn.Module) -> None:
+    """Freeze DSA sparse-attention indexer parameters.
+
+    The indexer's `compute_sparse_indices` forward runs under `torch.no_grad()`, so its
+    params never receive a gradient and cannot be trained. Left with requires_grad=True
+    they stay stateless in the optimizer, which breaks strict checkpoint resume: DCP
+    materializes optimizer state for every requires_grad param at load time, but the
+    stateless params were never saved -> "Missing key in checkpoint state_dict". Freezing
+    them keeps the saved and loaded optimizer state symmetric.
+    """
+    logger = get_logger()
+    num_frozen = 0
+
+    for module in model.modules():
+        if isinstance(module, Indexer):
+            for param in module.parameters():
+                param.requires_grad = False
+                num_frozen += 1
+
+    if num_frozen > 0:
+        logger.info(f"Froze {num_frozen} sparse indexer parameters")
 
 
 def apply_force_balanced_routing(model: nn.Module) -> None:
@@ -454,17 +560,14 @@ def get_model(
             )
 
     # GPT-OSS only supports FlashAttention via kernels-community/vllm-flash-attn3, which requires Hopper (SM 90).
-    # On other architectures (e.g. Blackwell), users must fall back to eager attention.
     HOPPER_MAJOR = 9
     if getattr(model_config, "model_type", "") == "gpt_oss":
-        if config.attn != "eager":
-            major, minor = torch.cuda.get_device_capability()
-            if major != HOPPER_MAJOR:
-                raise ValueError(
-                    f"GPT-OSS requires 'attn = \"eager\"' on non-Hopper GPUs (detected SM {major}{minor}). "
-                    f"The only flash attention kernel supported by GPT-OSS (kernels-community/vllm-flash-attn3) is Hopper-only. "
-                    f'Set [trainer.model] attn = "eager" in your config.'
-                )
+        major, minor = torch.cuda.get_device_capability()
+        if major != HOPPER_MAJOR:
+            raise ValueError(
+                f"GPT-OSS requires Hopper (SM 90) for flash attention, detected SM {major}{minor}. "
+                f"GPT-OSS is not supported on non-Hopper GPUs."
+            )
         # Enable hub kernels for GPT-OSS (disabled by default to avoid interfering with other models).
         import transformers.integrations.hub_kernels as _hub_kernels
 
@@ -475,17 +578,40 @@ def get_model(
         _patch_qwen3_5_text_position_ids()
         _patch_qwen3_5_moe_conversion_mapping()
         _patch_qwen3_5_linear_attn_varlen()
+    if is_vlm_arch and config.cp > 1 and config.cp_style == "ulysses":
+        vision_config = getattr(model_config, "vision_config", None)
+        if vision_config is not None:
+            logger.info("Using SDPA for VLM vision encoder under CP")
+            vision_config._attn_implementation = "sdpa"
+            if hasattr(vision_config, "_attn_implementation_internal"):
+                vision_config._attn_implementation_internal = "sdpa"
     for subconfig_key in getattr(model_config, "sub_configs", {}):
         subconfig = getattr(model_config, subconfig_key, None)
         if subconfig is not None and hasattr(subconfig, "use_cache"):
             subconfig.use_cache = False
     model_config.use_grouped_mm = config.moe_use_grouped_mm
-    model_config.fp8 = config.fp8
+    # MoEArgs.fp8 (read via getattr(config, "fp8") in the modeling files) gates the
+    # DeepGEMM FP8 grouped GEMM. MXFP8 grouped GEMM is applied by wrapping the expert
+    # weights with torchao (see apply_quantization), so it leaves this flag False and
+    # the experts keep calling torch._grouped_mm — which the wrapper tensor intercepts.
+    model_config.fp8 = isinstance(config.quantization, FP8Config) and config.quantization.enable_grouped_gemm
 
     if config.index_cache is not None:
         model_config.use_index_cache = True
         model_config.index_topk_freq = config.index_cache.topk_freq
         model_config.index_topk_pattern = config.index_cache.topk_pattern
+        # Explicit override supersedes the model's native IndexShare schedule.
+        model_config.indexer_types = None
+    else:
+        # Auto-enable IndexShare from the model's own indexer schedule (e.g. GLM-5.2). The model
+        # reads `indexer_types` directly: shared layers reuse cached indices and carry no indexer weights.
+        indexer_types = getattr(model_config, "indexer_types", None)
+        if indexer_types and any(t == "shared" for t in indexer_types):
+            model_config.use_index_cache = True
+            logger.info(
+                f"Auto-enabled IndexShare from indexer_types schedule "
+                f"({sum(t == 'full' for t in indexer_types)}/{len(indexer_types)} full layers)"
+            )
 
     # Ensure pad_token_id is set (some models like Qwen3MoE don't have it).
     # In transformers v5, token IDs moved from PretrainedConfig to GenerationConfig.
@@ -518,6 +644,15 @@ def get_model(
 
     logger.debug(f"Loaded model config ({model_config.to_dict()})")
 
+    # NemotronH: transformers' Mamba2 mixer __init__ calls lazy_load_kernel("mamba-ssm" /
+    # "causal-conv1d") whenever config.use_mamba_kernels is set. That hub-kernel path is gated only
+    # by whether the `kernels` package is importable (NOT by USE_HUB_KERNELS) and resolves from the
+    # HF Hub, which hard-crashes under HF_HUB_OFFLINE=1. prime-rl swaps in its own mamba_ssm Triton
+    # SSD kernels via _patch_mamba2_use_triton_ssd, so the hub kernels are redundant; disable them
+    # to keep model init offline-safe.
+    if getattr(model_config, "model_type", "") == "nemotron_h":
+        model_config.use_mamba_kernels = False
+
     if config.debug.num_layers is not None:
         # VLM configs nest num_hidden_layers under text_config
         target_config = getattr(model_config, "text_config", model_config)
@@ -537,6 +672,24 @@ def get_model(
         logger.info(f"Auto-selected implementation: {impl_to_use}")
     else:
         impl_to_use = config.impl
+
+    if config.attn in ("flash_attention_3", "flash_attention_4") and impl_to_use == "hf":
+        raise ValueError(
+            f"{config.attn} requires model.impl='custom' or 'auto' (resolved to 'custom'), "
+            f"but model.impl resolved to 'hf'. Set model.impl='custom' explicitly."
+        )
+
+    if config.cp > 1 and config.impl == "auto" and impl_to_use != "custom":
+        raise ValueError(
+            "Context parallelism with model.impl='auto' requires a supported custom PrimeRL implementation, "
+            "but this architecture resolved to model.impl='hf'."
+        )
+
+    if config.vlm is not None and not (is_vlm_arch and custom_vlm_cls):
+        raise ValueError(
+            "VLM training requires a registered custom PrimeRL VLM implementation; "
+            f"{getattr(model_config, 'model_type', config.name)!r} has none."
+        )
 
     with device:
         if impl_to_use == "custom" and custom_vlm_cls is not None:
@@ -569,10 +722,6 @@ def get_model(
             )
         logger.debug(f"Loaded model {config.name} in {time.perf_counter() - load_model_start_time:.2f} seconds")
 
-    # For VLM models, optionally freeze the vision encoder
-    if is_vlm_training and config.vlm.freeze_vision_encoder:
-        freeze_vision_encoder(model, override_attr=config.vlm.vision_encoder_attr)
-
     assert model.lm_head.weight.dtype == dtype, (
         f"LM head dtype wasnt loaded correctly {model.lm_head.weight.dtype} != {dtype}"
     )
@@ -594,6 +743,23 @@ def setup_tokenizer(config: TokenizerConfig) -> PreTrainedTokenizer:
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
     return tokenizer
+
+
+def setup_processor(config: ModelConfig):
+    """Load an ``AutoProcessor`` for VLM models. Returns ``None`` for text-only models."""
+    from transformers import AutoProcessor
+
+    logger = get_logger()
+    try:
+        processor = AutoProcessor.from_pretrained(config.name, trust_remote_code=config.trust_remote_code)
+    except (ValueError, OSError, KeyError) as e:
+        logger.debug(f"No AutoProcessor available for {config.name} ({type(e).__name__}); treating as text-only.")
+        return None
+    if not (getattr(processor, "image_processor", None) or getattr(processor, "video_processor", None)):
+        logger.debug(f"AutoProcessor for {config.name} has no image/video processor; treating as text-only.")
+        return None
+    logger.info(f"Loaded multimodal processor: {type(processor).__name__}")
+    return processor
 
 
 def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
@@ -635,6 +801,17 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
             fully_shard(block_mlp.experts, mesh=dp_mod_ep_mesh, **fsdp_config)
 
             block_mlp.experts.set_gradient_divide_factor(parallel_dims.fsdp_gradient_divide_factor)
+
+        if config.moe_router_dtype == "float32" and isinstance(block_mlp, (MoE, LatentMoE)):
+            # Own FSDP unit with an fp32 policy so the gate weight is not cast to
+            # bf16 for forward and its gradients reduce in fp32.
+            fully_shard(
+                block_mlp.router,
+                mesh=hsdp_mesh,
+                mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32),
+                offload_policy=offload_policy,
+                reshard_after_forward=config.reshard_after_forward,
+            )
 
         fully_shard(
             transformer_block,
@@ -689,7 +866,11 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
         if next_transformer_block is not None:
             next_mlp = getattr(next_transformer_block, "mlp", None)
             if next_mlp is not None and isinstance(next_mlp, (MoE, LatentMoE)):
-                transformer_block.set_modules_to_forward_prefetch([next_transformer_block, next_mlp.experts])
+                prefetch_modules = [next_transformer_block]
+                if isinstance(next_mlp.router, FSDPModule):
+                    prefetch_modules.append(next_mlp.router)
+                prefetch_modules.append(next_mlp.experts)
+                transformer_block.set_modules_to_forward_prefetch(prefetch_modules)
             else:
                 transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
         elif language_model.norm is not None and model.lm_head is not None:
@@ -710,7 +891,10 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
         if prev_transformer_block is not None:
             prev_mlp = getattr(prev_transformer_block, "mlp", None)
             if prev_mlp is not None and isinstance(prev_mlp, (MoE, LatentMoE)):
-                transformer_block.set_modules_to_backward_prefetch([prev_transformer_block, prev_mlp.experts])
+                prefetch_modules = [prev_transformer_block, prev_mlp.experts]
+                if isinstance(prev_mlp.router, FSDPModule):
+                    prefetch_modules.append(prev_mlp.router)
+                transformer_block.set_modules_to_backward_prefetch(prefetch_modules)
             else:
                 transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
         elif embed_module is not None:
@@ -748,33 +932,38 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     # All ranks read just the key names (cheap) to determine the path independently.
     # Only master loads the full state dict when conversion is actually needed.
     if isinstance(model, PreTrainedModelPrimeRL):
-        snapshot_keys = dict.fromkeys(load_state_dict_keys(snapshot_path))
+        source_path = snapshot_path
+        convert_dir = config.conversion_dir or source_path
+        snapshot_keys = dict.fromkeys(load_state_dict_keys(source_path))
         model_keys = dict.fromkeys(model.state_dict().keys())
 
-        if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
+        snapshot_is_hf = model.is_hf_state_dict(snapshot_keys)
+        snapshot_is_prime = model.is_prime_state_dict(snapshot_keys)
+
+        if snapshot_is_hf and not snapshot_is_prime and model.is_prime_state_dict(model_keys):
             logger.warning(
                 "Found HF weight format in snapshot state dict and PrimeRL weight format in model state dict. Trying to auto-convert..."
             )
-            snapshot_path = snapshot_path / "prime"
+            snapshot_path = convert_dir / "prime"
             if not snapshot_path.exists() and get_world().is_master:
                 logger.debug(
                     f"Converting snapshot state dict to PrimeRL format and saving to {snapshot_path} on master rank. This is a one-time operation."
                 )
-                snapshot_state_dict = load_state_dict(snapshot_path.parent)
+                snapshot_state_dict = load_state_dict(source_path)
                 model.convert_to_prime(snapshot_state_dict)
                 save_state_dict(snapshot_state_dict, snapshot_path)
                 del snapshot_state_dict
 
-        elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(model_keys):
+        elif snapshot_is_prime and not snapshot_is_hf and model.is_hf_state_dict(model_keys):
             logger.warning(
                 "Found PrimeRL weight format in snapshot state dict and HF weight format in model state dict. Trying to auto-convert..."
             )
-            snapshot_path = snapshot_path / "hf"
+            snapshot_path = convert_dir / "hf"
             if not snapshot_path.exists() and get_world().is_master:
                 logger.debug(
                     f"Converting snapshot state dict to HF format and saving to {snapshot_path} on master rank. This is a one-time operation."
                 )
-                snapshot_state_dict = load_state_dict(snapshot_path.parent)
+                snapshot_state_dict = load_state_dict(source_path)
                 model.convert_to_hf(snapshot_state_dict)
                 save_state_dict(snapshot_state_dict, snapshot_path)
                 del snapshot_state_dict
@@ -787,7 +976,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     state_dict = model.state_dict()
     state_dict = strip_lora_from_state_dict(state_dict)
     if model.config.tie_word_embeddings:
-        del state_dict["lm_head.weight"]
+        state_dict.pop("lm_head.weight")
     dcp_load(
         state_dict,
         storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
@@ -949,13 +1138,43 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
     get_logger().info(f"Compiled {len(language_model.layers)} layers (fullgraph={compile_config.fullgraph})")
 
 
+def apply_quantization(model: nn.Module, config: ModelConfig) -> None:
+    """Swap dense linears and MoE expert GEMMs to the configured low-precision path.
+
+    Runs after the LM head is injected but before LoRA / EP / FSDP so the swapped
+    modules and wrapped parameters are picked up by the later parallelisms. The
+    FP8 grouped GEMM (DeepGEMM) is gated separately via ``model_config.fp8`` since
+    it lives inside the modeling code; here we only handle the dense-linear swap
+    and the torchao MXFP8 expert-weight wrapping.
+    """
+    quant = config.quantization
+    if quant is None:
+        return
+
+    if isinstance(quant, FP8Config):
+        replace_linear_with_fp8_blockwise_linear(model, ignore_modules=quant.ignore_patterns)
+    elif isinstance(quant, MXFP8Config):
+        capability = torch.cuda.get_device_capability()
+        if capability < (10, 0):
+            raise ValueError(
+                f"MXFP8 quantization requires SM100 (Blackwell) or newer, but device is SM{capability[0]}{capability[1]}."
+            )
+        replace_linear_with_mxfp8_linear(model, recipe=quant.recipe, ignore_modules=quant.ignore_patterns)
+        if quant.enable_grouped_gemm:
+            apply_mxfp8_moe_grouped_gemm(model, recipe=quant.recipe)
+
+
 def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
     language_model = get_language_model(model)
     for transformer_block in language_model.layers:
         block_mlp = getattr(transformer_block, "mlp", None)
         if block_mlp is not None and isinstance(block_mlp, (MoE, LatentMoE)):
             if config.ep_comm_backend == "torch":
-                parallelize_plan = ExpertParallel()
+                quant = config.quantization
+                if isinstance(quant, MXFP8Config) and quant.enable_a2a:
+                    parallelize_plan = MXFP8AllToAllExpertParallel()
+                else:
+                    parallelize_plan = ExpertParallel()
             else:
                 parallelize_plan = DeepEPExpertParallel()
             parallelize_module(
@@ -963,6 +1182,21 @@ def apply_ep(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims)
                 device_mesh=parallel_dims.get_mesh("ep"),
                 parallelize_plan=parallelize_plan,
             )
+
+
+def configure_trainable_parameters(model: nn.Module, config: ModelConfig) -> nn.Module | None:
+    """Apply LoRA and identify any vision encoder that must remain frozen."""
+    frozen_vision_encoder = None
+    if config.vlm is not None and config.vlm.freeze_vision_encoder:
+        frozen_vision_encoder = get_vision_encoder(model, override=config.vlm.vision_encoder_attr)
+    elif config.vlm is None:
+        frozen_vision_encoder = get_vision_encoder(model)
+        if frozen_vision_encoder is not None:
+            get_logger().info("Training a VLM checkpoint on text-only data; freezing the vision encoder")
+
+    if config.lora is not None:
+        apply_lora_to_model(model, config.lora)
+    return frozen_vision_encoder
 
 
 def _move_buffers_to_cuda(model: nn.Module, config: ModelConfig) -> None:
@@ -1000,36 +1234,41 @@ def _validate_flash_attn_4_installed() -> None:
         )
 
 
-def _register_fa4_attention_interface() -> None:
-    """Register a dummy `fa4` attention with transformers so AutoConfig accepts it.
+def resolve_auto_attn(config: ModelConfig) -> None:
+    """Resolve ``attn='auto'`` to a concrete flash attention implementation based on GPU architecture.
 
-    The `flash_attention_*` naming pattern triggers transformers to attempt
-    installing a kernel from the hub, so we use the short name `fa4` internally.
-    This dummy is never called because fa4 is only supported with our custom
-    model implementation.
+    FA4 on datacenter Blackwell (SM100), FA3 on Hopper (SM90), FA2 otherwise.
+    Workstation Blackwell GPUs (e.g. RTX PRO 6000, SM120) lack FA4 kernels and
+    can't run the Hopper-only FA3 kernels, so they fall back to FA2.
     """
-    from transformers import AttentionInterface
-
-    def _noop(*args, **kwargs) -> None:
-        pass
-
-    AttentionInterface.register("fa4", _noop)
+    if config.attn != "auto":
+        return
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) == (10, 0):
+        resolved = "flash_attention_4"
+    elif major == 9:
+        resolved = "flash_attention_3"
+    else:
+        resolved = "flash_attention_2"
+    logger = get_logger()
+    logger.info(f"Auto-resolved attn='auto' to '{resolved}' (SM{major}{minor})")
+    config.attn = resolved
 
 
 def setup_model(
     config: ModelConfig,
     parallel_dims: ParallelDims,
     loading_from_checkpoint_later: bool = False,
-    fused_cross_entropy: bool | str = False,
 ) -> nn.Module:
+    resolve_auto_attn(config)
+
     if config.attn == "flash_attention_3" and not is_flash_attn_3_available():
         raise ValueError(
             "Flash attention 3 is only supported if the flash_attn_3 package is installed. Install with `uv pip install 'flash-attn-3 @ git+https://github.com/Dao-AILab/flash-attention.git@main#subdirectory=hopper' --no-build-isolation`"
         )
 
-    if config.attn == "fa4":
+    if config.attn == "flash_attention_4":
         _validate_flash_attn_4_installed()
-        _register_fa4_attention_interface()
 
     logger = get_logger()
 
@@ -1054,17 +1293,22 @@ def setup_model(
     if isinstance(config.fused_lm_head_token_chunk_size, int):
         lm_head_chunk_size = config.fused_lm_head_token_chunk_size
 
-    inject_prime_lm_head(model, chunk_size=lm_head_chunk_size, fused_cross_entropy=fused_cross_entropy)
+    inject_prime_lm_head(model, chunk_size=lm_head_chunk_size)
 
-    if config.fp8:
-        replace_linear_with_fp8_blockwise_linear(model)
+    apply_quantization(model, config)
 
-    # Apply LoRA before FSDP setup
-    if config.lora is not None:
-        apply_lora_to_model(model, config.lora)
+    frozen_vision_encoder = configure_trainable_parameters(model, config)
 
     if config.freeze_moe_router:
         freeze_moe_router(model)
+
+    if config.moe_router_dtype == "float32":
+        apply_fp32_moe_router(model)
+
+    # The DSA sparse-attention indexer runs its forward under torch.no_grad(), so it is
+    # never trainable. Freeze it so optimizer state stays symmetric across checkpoint
+    # save/resume. No-op for models without a sparse indexer.
+    freeze_sparse_indexer(model)
 
     if config.debug.force_balanced_routing:
         apply_force_balanced_routing(model)
@@ -1075,6 +1319,12 @@ def setup_model(
         # re-freeze base params that LoRA froze earlier.
         if config.lora is not None:
             freeze_all_except_lora_and_specified(model, config.lora)
+
+    if frozen_vision_encoder is not None:
+        freeze_vision_encoder(
+            model,
+            override_attr=config.vlm.vision_encoder_attr if config.vlm is not None else None,
+        )
 
     # the right order is AC -> Compile -> FSDP
     if config.ac is not None:
@@ -1118,6 +1368,8 @@ def forward(
     model: nn.Module,
     input_ids: Int[Tensor, "batch seq"],
     position_ids: Int[Tensor, "batch seq"],
+    *,
+    seq_lens: Int[Tensor, "segments"],
     labels: Int[Tensor, "batch seq"] | None = None,
     temperature: Tensor | None = None,
     routed_experts: Int[Tensor, "batch seq layers topk"] | None = None,
@@ -1125,12 +1377,13 @@ def forward(
     # "image_grid_thw": ...} for Qwen3-VL; just {"pixel_values": ...}
     # for Gemma3). Passed straight through to ``model(**kwargs)`` so
     # the model's HF forward signature is the schema. ``mm_token_type_ids``
-    # is split out because it's prime-rl-computed (from token ids),
-    # not a renderer/processor output.
+    # is split out because it comes from the renderer rather than the processor.
     mm_kwargs: dict[str, Tensor] | None = None,
     mm_token_type_ids: Int[Tensor, "batch seq"] | None = None,
+    # True when seq_lens holds the full pre-CP-shard document boundaries
+    # (kept global because documents can straddle the shard cut).
+    seq_lens_are_pre_shard: bool = False,
 ) -> PrimeLmOutput:
-    # Build kwargs for model forward
     kwargs = {
         "input_ids": input_ids,
         "labels": labels,
@@ -1144,14 +1397,14 @@ def forward(
         kwargs.update(mm_kwargs)
         if mm_token_type_ids is not None:
             kwargs["mm_token_type_ids"] = mm_token_type_ids
-        # ``position_ids`` for MRoPE families: Qwen3-VL's HF forward
-        # recomputes 3D positions from ``image_grid_thw`` and breaks if
-        # given the trainer's pre-computed 1D ``position_ids``. Detect
-        # via the mm_kwargs shape so we don't enumerate model_types.
         if "image_grid_thw" not in mm_kwargs:
             kwargs["position_ids"] = position_ids
     else:
         kwargs["position_ids"] = position_ids
+
+    if isinstance(model, PreTrainedModelPrimeRL):
+        kwargs["seq_lens"] = seq_lens
+        kwargs["seq_lens_are_pre_shard"] = seq_lens_are_pre_shard
 
     if routed_experts is not None:
         kwargs["routed_experts"] = routed_experts

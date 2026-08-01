@@ -15,8 +15,11 @@ def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
-def align(x: int, y: int) -> int:
-    return ceil_div(x, y) * y
+def ue8m0_for_device(device: torch.device | None = None) -> bool:
+    """DeepGEMM requires UE8M0 (power-of-2) scales on SM100; SM90 supports exact float
+    scales, and UE8M0 there is a pure precision loss (it measurably raises the
+    trainer/inference mismatch KL)."""
+    return torch.cuda.get_device_capability(device)[0] >= 10
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +256,7 @@ def _grouped_per_token_fp8_kernel(
 
 
 @triton.jit
-def _grouped_per_channel_fp8_sm90_kmajor_kernel(
+def _grouped_per_channel_fp8_kernel(
     x_ptr,
     block_to_group_ptr,
     starts_ptr,
@@ -268,6 +271,7 @@ def _grouped_per_channel_fp8_sm90_kmajor_kernel(
     stride_sf0,
     stride_sf1,
     USE_UE8M0: tl.constexpr,
+    K_MAJOR: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -297,8 +301,20 @@ def _grouped_per_channel_fp8_sm90_kmajor_kernel(
         scale = tl.exp2(tl.ceil(tl.log2(scale)))
     y = x / scale[None, :]
     flat_base = block_start.to(tl.int64) * BLOCK_K * cols
-    out_ptrs = out_ptr + flat_base + col_offsets_i64[:, None] * aligned_m + row_offsets_i64[None, :]
-    tl.store(out_ptrs, tl.trans(y).to(tl.float8e4nv), mask=valid_cols[:, None] & (row_offsets[None, :] < aligned_m))
+    if K_MAJOR:
+        out_ptrs = out_ptr + flat_base + col_offsets_i64[:, None] * aligned_m + row_offsets_i64[None, :]
+        tl.store(
+            out_ptrs,
+            tl.trans(y).to(tl.float8e4nv),
+            mask=valid_cols[:, None] & (row_offsets[None, :] < aligned_m),
+        )
+    else:
+        out_ptrs = out_ptr + flat_base + row_offsets_i64[:, None] * cols + col_offsets_i64[None, :]
+        tl.store(
+            out_ptrs,
+            y.to(tl.float8e4nv),
+            mask=(row_offsets[:, None] < aligned_m) & valid_cols[None, :],
+        )
     tl.store(
         sf_ptr + pid_blk * stride_sf0 + col_offsets_i64 * stride_sf1,
         scale,
@@ -481,7 +497,7 @@ def grouped_per_channel_cast_to_fp8_sm90_kmajor_triton(
     if block_to_group.numel() == 0:
         return out, sf.T
     grid = (block_to_group.numel(), ceil_div(x.size(1), 128))
-    _grouped_per_channel_fp8_sm90_kmajor_kernel[grid](
+    _grouped_per_channel_fp8_kernel[grid](
         x,
         block_to_group,
         starts_tensor,
@@ -496,11 +512,54 @@ def grouped_per_channel_cast_to_fp8_sm90_kmajor_triton(
         sf.stride(0),
         sf.stride(1),
         USE_UE8M0=use_ue8m0,
+        K_MAJOR=True,
         BLOCK_K=gran_k,
         BLOCK_N=128,
         num_warps=4,
     )
     return out, sf.T
+
+
+def grouped_per_channel_cast_to_fp8_rowmajor_triton(
+    x: torch.Tensor,
+    padded_total_m: int,
+    block_to_group: torch.Tensor,
+    starts_tensor: torch.Tensor,
+    actual_ms_tensor: torch.Tensor,
+    ks_tensor: torch.Tensor,
+    block_starts_tensor: torch.Tensor,
+    use_ue8m0: bool,
+    gran_k: int = GROUP_ALIGNMENT,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2
+    assert gran_k == GROUP_ALIGNMENT
+    out = torch.empty((padded_total_m, x.size(1)), device=x.device, dtype=torch.float8_e4m3fn)
+    total_blocks = padded_total_m // gran_k
+    sf = torch.empty((total_blocks, x.size(1)), device=x.device, dtype=torch.float32)
+    if block_to_group.numel() == 0:
+        return out, sf
+    grid = (block_to_group.numel(), ceil_div(x.size(1), 128))
+    _grouped_per_channel_fp8_kernel[grid](
+        x,
+        block_to_group,
+        starts_tensor,
+        actual_ms_tensor,
+        ks_tensor,
+        block_starts_tensor,
+        out,
+        sf,
+        x.size(1),
+        x.stride(0),
+        x.stride(1),
+        sf.stride(0),
+        sf.stride(1),
+        USE_UE8M0=use_ue8m0,
+        K_MAJOR=False,
+        BLOCK_K=gran_k,
+        BLOCK_N=128,
+        num_warps=4,
+    )
+    return out, sf
 
 
 def grouped_per_block_cast_to_fp8_triton(
@@ -550,3 +609,71 @@ def per_block_cast_to_fp8_triton(
         gran_k,
     )
     return out[0], sf[0]
+
+
+def per_block_cast_to_fp8_tp_triton(
+    x: torch.Tensor, use_ue8m0: bool, gran_k: int = GROUP_ALIGNMENT
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Block-fp8 cast of ``x.T`` without materializing the transpose."""
+    assert x.dim() == 2
+    assert gran_k == GROUP_ALIGNMENT
+    rows, cols = x.shape
+    x3 = x.unsqueeze(0)
+    out = torch.empty((cols, rows), device=x.device, dtype=torch.float8_e4m3fn)
+    sf = torch.empty((ceil_div(cols, gran_k), ceil_div(rows, gran_k)), device=x.device, dtype=torch.float32)
+    grid = (1, ceil_div(rows, gran_k), ceil_div(cols, gran_k))
+    _grouped_per_block_fp8_kernel[grid](
+        x3,
+        out,
+        sf,
+        1,
+        rows,
+        cols,
+        x3.stride(0),
+        x3.stride(1),
+        x3.stride(2),
+        # transposed output: x's element (row, col) lands at out[col, row]
+        cols * rows,
+        1,
+        rows,
+        # transposed scales: x's tile (pid_m, pid_n) lands at sf[pid_n, pid_m]
+        ceil_div(cols, gran_k) * ceil_div(rows, gran_k),
+        1,
+        ceil_div(rows, gran_k),
+        USE_UE8M0=use_ue8m0,
+        BLOCK_M=gran_k,
+        BLOCK_N=gran_k,
+        num_warps=8,
+    )
+    return out, sf
+
+
+def per_token_cast_to_fp8_tp_triton(
+    x: torch.Tensor, use_ue8m0: bool, gran_k: int = GROUP_ALIGNMENT
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-token fp8 cast of ``x.T`` without materializing the transpose."""
+    assert x.dim() == 2
+    assert gran_k == GROUP_ALIGNMENT
+    rows, cols = x.shape
+    out = torch.empty((cols, rows), device=x.device, dtype=torch.float8_e4m3fn)
+    sf = torch.empty((cols, ceil_div(rows, gran_k)), device=x.device, dtype=torch.float32)
+    grid = lambda meta: (ceil_div(cols, meta["BLOCK_M"]), ceil_div(rows, meta["BLOCK_K"]))
+    _per_token_fp8_kernel[grid](
+        x,
+        out,
+        sf,
+        cols,
+        rows,
+        # transposed read: the kernel's per-row amax reduces over x's rows
+        x.stride(1),
+        x.stride(0),
+        out.stride(0),
+        out.stride(1),
+        sf.stride(0),
+        sf.stride(1),
+        USE_UE8M0=use_ue8m0,
+        BLOCK_M=8,
+        BLOCK_K=gran_k,
+        num_warps=4,
+    )
+    return out, sf

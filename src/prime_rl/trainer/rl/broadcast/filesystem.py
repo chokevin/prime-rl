@@ -17,7 +17,6 @@ from prime_rl.trainer.weights import (
     save_state_dict,
 )
 from prime_rl.trainer.world import get_world
-from prime_rl.utils.pathing import durable_touch
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 
 
@@ -47,7 +46,6 @@ class FileSystemWeightBroadcast(WeightBroadcast):
             if isinstance(model, PreTrainedModelPrimeRL) and model.is_prime_state_dict(state_dict):
                 model.convert_to_hf(state_dict)
             else:
-                # For regular transformers models, revert internal format to original HF hub format
                 from transformers.core_model_loading import revert_weight_conversion
 
                 state_dict = revert_weight_conversion(model, state_dict)
@@ -70,16 +68,18 @@ class FileSystemWeightBroadcast(WeightBroadcast):
             # TODO: Broadcast ready to update in sync, then we dont need to gather on not ready
             if self.world.is_master:
                 try:
+                    # pack() already advanced progress to the next step, so the model we just
+                    # trained — policy v(step-1) — broadcasts to broadcasts/step_{step-1}.
                     save_dir = get_step_path(
                         get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
-                        self.multi_run_manager.progress[idx].step,
+                        self.multi_run_manager.progress[idx].step - 1,
                     )
                     save_dir.mkdir(parents=True, exist_ok=True)
 
                     self.logger.debug(f"Saving weights for run {idx} to {save_dir}")
                     save_state_dict(state_dict, save_dir, self.save_format, self.save_sharded, adapter=adapter_only)
                     if adapter_only:
-                        orch_lora = self.multi_run_manager.config[idx].student.model.lora
+                        orch_lora = self.multi_run_manager.config[idx].model.lora
                         save_lora_config(
                             model,
                             save_dir,
@@ -108,12 +108,12 @@ class FileSystemWeightBroadcast(WeightBroadcast):
     def _notify_orchestrator(self, save_dir: Path):
         """Notify the orchestrator that the weights have been broadcast by writing a 'STABLE' file to a shared filesystem."""
         stable_file = save_dir / "STABLE"
-        durable_touch(stable_file)
+        stable_file.touch()
 
     def maybe_clean(self, interval_to_keep: int | None):
         for idx in self.multi_run_manager.used_idxs:
             maybe_clean(
                 get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
-                self.multi_run_manager.progress[idx].step,
+                self.multi_run_manager.progress[idx].step - 1,
                 interval_to_keep,
             )

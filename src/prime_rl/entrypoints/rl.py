@@ -12,8 +12,11 @@ from threading import Event, Thread
 import pynvml
 import tomli_w
 
+from prime_rl.configs.algorithm import FrozenModelConfig
+from prime_rl.configs.inference import VllmRouterConfig
 from prime_rl.configs.rl import RLConfig
-from prime_rl.utils.config import cli
+from prime_rl.entrypoints.inference import vllm_overrides_fragment
+from prime_rl.utils.config import cli, to_toml_dict
 from prime_rl.utils.logger import get_logger, setup_logger
 from prime_rl.utils.pathing import (
     clean_future_steps,
@@ -23,7 +26,15 @@ from prime_rl.utils.pathing import (
     resolve_latest_ckpt_step,
     validate_output_dir,
 )
-from prime_rl.utils.process import cleanup_processes, cleanup_threads, monitor_process, set_proc_title
+from prime_rl.utils.process import (
+    DEFAULT_COMMON_ENV_VARS,
+    DEFAULT_INFERENCE_ENV_VARS,
+    DEFAULT_TRAINER_ENV_VARS,
+    cleanup_processes,
+    cleanup_threads,
+    monitor_process,
+    set_proc_title,
+)
 
 RL_TOML = "rl.toml"
 RL_SBATCH = "rl.sbatch"
@@ -45,9 +56,8 @@ def get_physical_gpu_ids() -> list[int]:
 def write_config(config: RLConfig, output_dir: Path, exclude: set[str] | None = None) -> None:
     """Write resolved config to disk, excluding launcher-only fields."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    config_dict = config.model_dump(exclude=exclude, exclude_none=True, mode="json")
     with open(output_dir / RL_TOML, "wb") as f:
-        tomli_w.dump(config_dict, f)
+        tomli_w.dump(to_toml_dict(config, exclude=exclude), f)
 
 
 def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
@@ -55,16 +65,20 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with open(output_dir / TRAINER_TOML, "wb") as f:
-        tomli_w.dump(config.trainer.model_dump(exclude_none=True, mode="json"), f)
+        tomli_w.dump(to_toml_dict(config.trainer), f)
 
     with open(output_dir / ORCHESTRATOR_TOML, "wb") as f:
-        tomli_w.dump(config.orchestrator.model_dump(exclude_none=True, mode="json"), f)
+        tomli_w.dump(to_toml_dict(config.orchestrator), f)
 
     if config.inference is not None:
         # Exclude launcher-only fields that are not needed by the vLLM server
         exclude_inference = {"deployment", "slurm", "output_dir", "dry_run"}
+        inference_dict = to_toml_dict(config.inference, exclude=exclude_inference)
+        if config.deployment.type == "multi_node":
+            # Per-rank processes run bare engines; the sbatch starts the single global router.
+            inference_dict["router"] = "None"
         with open(output_dir / INFERENCE_TOML, "wb") as f:
-            tomli_w.dump(config.inference.model_dump(exclude=exclude_inference, exclude_none=True, mode="json"), f)
+            tomli_w.dump(inference_dict, f)
 
 
 def rl_local(config: RLConfig):
@@ -116,16 +130,16 @@ def rl_local(config: RLConfig):
     }
 
     # Validate client port matches inference server port
-    if config.inference is not None and not config.orchestrator.student.client.is_elastic:
+    if config.inference is not None and not config.orchestrator.model.client.is_elastic:
         from urllib.parse import urlparse
 
-        base_url = config.orchestrator.student.client.base_url[0]
+        base_url = config.orchestrator.model.client.base_url[0]
         parsed = urlparse(base_url)
         client_port = parsed.port
         expected_port = config.inference.server.port
         if client_port != expected_port:
             raise ValueError(
-                f"orchestrator.student.client.base_url port ({client_port}) does not match "
+                f"orchestrator.model.client.base_url port ({client_port}) does not match "
                 f"inference.server.port ({expected_port}). "
                 f"Update the base_url to use port {expected_port} to match the inference server."
             )
@@ -160,6 +174,10 @@ def rl_local(config: RLConfig):
                     inference_cmd,
                     env={
                         **os.environ,
+                        **DEFAULT_COMMON_ENV_VARS,
+                        **DEFAULT_INFERENCE_ENV_VARS,
+                        **config.env_vars,
+                        **config.inference.env_vars,
                         "CUDA_VISIBLE_DEVICES": ",".join(map(str, infer_gpu_ids)),
                     },
                     stdout=log_file,
@@ -179,27 +197,29 @@ def rl_local(config: RLConfig):
             monitor_threads.append(monitor_thread)
         else:
             logger.warning(
-                "No [inference] block configured - the student inference server will not be started here. "
-                "All training modes (rl/opd/sft) require a student inference pool for evals + weight sync; "
-                "make sure one is running at orchestrator.student.client.base_url "
-                f"({', '.join(config.orchestrator.student.client.base_url)}), otherwise the orchestrator "
+                "No [inference] block configured - the policy inference server will not be started here. "
+                "Every algorithm requires a policy inference pool for evals + weight sync; "
+                "make sure one is running at orchestrator.model.client.base_url "
+                f"({', '.join(config.orchestrator.model.client.base_url)}), otherwise the orchestrator "
                 "will hang waiting for it."
             )
 
-        if config.orchestrator.teacher:
+        frozen_endpoints: list[str] = []
+        for env in config.orchestrator.train.source:
+            algo = env.algo
+            assert algo is not None, "TrainSourceConfig.algo must be resolved before launch (inherit_env_algorithms)"
+            for ref in (algo.sampling.source, getattr(algo, "teacher", None)):
+                if isinstance(ref, FrozenModelConfig):
+                    frozen_endpoints.append(f"{ref.name} ({', '.join(ref.base_url)})")
+        if frozen_endpoints:
+            endpoints = ", ".join(dict.fromkeys(frozen_endpoints))
             logger.info(
-                "orchestrator.teacher is configured - the rl entrypoint does not start teacher inference "
-                "servers. Make sure your teacher endpoint at "
-                f"{', '.join(config.orchestrator.teacher.client.base_url)} is running before the "
-                "orchestrator starts, otherwise rollouts will hang."
+                "Frozen model references are configured - the rl entrypoint does not start them. "
+                f"Make sure these endpoints are serving before the orchestrator starts: {endpoints}; "
+                "otherwise rollouts will hang."
             )
 
-        # Start orchestrator process
-        orchestrator_cmd = [
-            "orchestrator",
-            "@",
-            (config_dir / ORCHESTRATOR_TOML).as_posix(),
-        ]
+        orchestrator_cmd = ["orchestrator", "@", (config_dir / ORCHESTRATOR_TOML).as_posix()]
         logger.info("Starting orchestrator process")
         logger.debug(f"Orchestrator start command: {' '.join(orchestrator_cmd)}")
         with open(log_dir / "orchestrator.log", "w") as log_file:
@@ -209,11 +229,14 @@ def rl_local(config: RLConfig):
                 stderr=log_file,
                 env={
                     **os.environ,
-                    **wandb_shared_env,
-                    "WANDB_SHARED_LABEL": "orchestrator",
+                    **DEFAULT_COMMON_ENV_VARS,
                     "LOGURU_FORCE_COLORS": "1",
                     "WANDB_PROGRAM": "uv run rl",
                     "WANDB_ARGS": json.dumps(start_command),
+                    **config.env_vars,
+                    **config.orchestrator.env_vars,
+                    **wandb_shared_env,
+                    "WANDB_SHARED_LABEL": "orchestrator",
                 },
             )
         processes.append(orchestrator_process)
@@ -255,14 +278,16 @@ def rl_local(config: RLConfig):
                 trainer_cmd,
                 env={
                     **os.environ,
-                    **wandb_shared_env,
-                    "WANDB_SHARED_LABEL": "trainer",
-                    "CUDA_VISIBLE_DEVICES": ",".join(map(str, trainer_gpu_ids)),
-                    "PYTHONUNBUFFERED": "1",
-                    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                    **DEFAULT_COMMON_ENV_VARS,
+                    **DEFAULT_TRAINER_ENV_VARS,
                     "LOGURU_FORCE_COLORS": "1",
                     "WANDB_PROGRAM": "uv run rl",
                     "WANDB_ARGS": json.dumps(start_command),
+                    **config.env_vars,
+                    **config.trainer.env_vars,
+                    **wandb_shared_env,
+                    "WANDB_SHARED_LABEL": "trainer",
+                    "CUDA_VISIBLE_DEVICES": ",".join(map(str, trainer_gpu_ids)),
                 },
                 stdout=log_file,
                 stderr=log_file,
@@ -313,7 +338,7 @@ def rl_local(config: RLConfig):
             cleanup_processes(processes)
             sys.exit(1)
 
-        logger.success("RL training finished!")
+        logger.success("Training finished!")
 
         # Cleanup threads and processes
         cleanup_threads(monitor_threads)
@@ -341,6 +366,31 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
     env = Environment(loader=FileSystemLoader(config.slurm.template_path.parent), keep_trailing_newline=True)
     template = env.get_template(config.slurm.template_path.name)
 
+    offload = config.inference.kv_cache_offload if config.inference is not None else None
+    is_mooncake = offload is not None and offload.type == "mooncake"
+    mooncake_vars = dict(
+        kv_offload=offload is not None,
+        kv_offload_mooncake=is_mooncake,
+        kv_offload_cpu_bytes=int(offload.cpu.num_bytes) if is_mooncake else 0,
+        kv_offload_disk_path=str(offload.disk.path) if (is_mooncake and offload.disk is not None) else "",
+        kv_offload_device_name=offload.device_name if is_mooncake else "",
+    )
+
+    # Per-component env vars: launcher defaults (shared + multi-node-specific) with the
+    # user's config merged on top. Runtime wiring stays in the template.
+    trainer_env_vars = {
+        **DEFAULT_COMMON_ENV_VARS,
+        **DEFAULT_TRAINER_ENV_VARS,
+        **config.env_vars,
+        **config.trainer.env_vars,
+    }
+    orchestrator_env_vars = {**DEFAULT_COMMON_ENV_VARS, **config.env_vars, **config.orchestrator.env_vars}
+    inference_env_vars = (
+        {**DEFAULT_COMMON_ENV_VARS, **DEFAULT_INFERENCE_ENV_VARS, **config.env_vars, **config.inference.env_vars}
+        if config.inference
+        else {}
+    )
+
     if config.deployment.type == "single_node":
         script = template.render(
             **config.slurm.template_vars,
@@ -363,24 +413,31 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
             num_infer_replicas=config.deployment.num_infer_replicas,
             num_prefill_nodes=infer_deploy.num_prefill_nodes,
             num_decode_nodes=infer_deploy.num_decode_nodes,
+            prefill_nodes_per_replica=infer_deploy.prefill_nodes_per_replica,
+            decode_nodes_per_replica=infer_deploy.decode_nodes_per_replica,
             num_prefill_replicas=infer_deploy.num_prefill_replicas,
             num_decode_replicas=infer_deploy.num_decode_replicas,
             gpus_per_node=config.deployment.gpus_per_node,
-            router_port=infer_deploy.router_port,
+            router=config.inference.router,
+            router_port=config.inference.server.port,
             prefill_port=infer_deploy.prefill_port,
             decode_port=infer_deploy.decode_port,
             inference_tp=config.inference.parallel.tp,
             inference_data_parallel_rpc_port=config.inference.data_parallel_rpc_port,
             use_deep_gemm=config.inference.use_deep_gemm,
-            prefill_env_overrides=infer_deploy.prefill_env_overrides,
-            decode_env_overrides=infer_deploy.decode_env_overrides,
+            prefill_env_vars=infer_deploy.prefill_env_vars,
+            decode_env_vars=infer_deploy.decode_env_vars,
+            trainer_env_vars=trainer_env_vars,
+            orchestrator_env_vars=orchestrator_env_vars,
+            inference_env_vars=inference_env_vars,
+            prefill_vllm_extra_json=vllm_overrides_fragment(infer_deploy.prefill_vllm_overrides),
+            decode_vllm_extra_json=vllm_overrides_fragment(infer_deploy.decode_vllm_overrides),
             dp_per_node=config.deployment.gpus_per_node // config.inference.parallel.tp,
-            kv_offload=config.inference.kv_cache_offload is not None,
-            kv_offload_cpu_bytes=int(config.inference.kv_cache_offload.cpu_bytes)
-            if config.inference.kv_cache_offload
-            else 0,
+            **mooncake_vars,
             use_nccl_broadcast=config.weight_broadcast is not None and config.weight_broadcast.type == "nccl",
+            use_zmq_transport=config.rollout_transport is not None and config.rollout_transport.type == "zmq",
             ranks_filter=",".join(map(str, config.trainer.log.ranks_filter)),
+            orchestrator_on_inference=config.deployment.orchestrator_on_inference,
         )
     else:
         script = template.render(
@@ -391,18 +448,25 @@ def write_slurm_script(config: RLConfig, config_dir: Path, script_path: Path) ->
             orchestrator_output_dir=config.orchestrator.output_dir,
             num_train_nodes=config.deployment.num_train_nodes,
             num_infer_nodes=config.deployment.total_infer_nodes,
-            nodes_per_infer_replica=config.deployment.num_infer_nodes,
+            nodes_per_infer_replica=config.deployment.infer_nodes_per_replica,
             num_infer_replicas=config.deployment.num_infer_replicas,
             gpus_per_node=config.deployment.gpus_per_node,
-            router_port=getattr(config.inference.deployment, "router_port", 8000) if config.inference else 8000,
-            backend_port=getattr(config.inference.deployment, "backend_port", 8100) if config.inference else 8100,
+            router=config.inference.router if config.inference else VllmRouterConfig(),
+            router_port=config.inference.server.port if config.inference else 8000,
+            infer_nodes_per_replica=config.deployment.infer_nodes_per_replica,
+            backend_port=config.inference.backend_port if config.inference else 8100,
             inference_tp=config.inference.parallel.tp if config.inference else 1,
             inference_enable_expert_parallel=config.inference.enable_expert_parallel if config.inference else False,
             inference_data_parallel_rpc_port=config.inference.data_parallel_rpc_port if config.inference else 29600,
             dp_per_node=(config.deployment.gpus_per_node // config.inference.parallel.tp) if config.inference else 1,
-            kv_offload=config.inference is not None and config.inference.kv_cache_offload is not None,
+            **mooncake_vars,
             use_nccl_broadcast=config.weight_broadcast is not None and config.weight_broadcast.type == "nccl",
+            use_zmq_transport=config.rollout_transport is not None and config.rollout_transport.type == "zmq",
             ranks_filter=",".join(map(str, config.trainer.log.ranks_filter)),
+            orchestrator_on_inference=config.deployment.orchestrator_on_inference,
+            trainer_env_vars=trainer_env_vars,
+            orchestrator_env_vars=orchestrator_env_vars,
+            inference_env_vars=inference_env_vars,
         )
 
     script_path.parent.mkdir(parents=True, exist_ok=True)
@@ -423,8 +487,10 @@ def rl_slurm(config: RLConfig):
         write_config(config, config_dir, exclude={"slurm", "dry_run", "clean_output_dir"})
         logger.info(f"Wrote config to {config_dir / RL_TOML}")
 
-        train_env_names = [env.resolved_name for env in config.orchestrator.train.env]
-        eval_env_names = [env.resolved_name for env in config.orchestrator.eval.env] if config.orchestrator.eval else []
+        train_env_names = [env.resolved_name for env in config.orchestrator.train.source]
+        eval_env_names = (
+            [source.resolved_name for source in config.orchestrator.eval.source] if config.orchestrator.eval else []
+        )
 
         log_message = format_log_message(
             log_dir=log_dir,
@@ -438,10 +504,12 @@ def rl_slurm(config: RLConfig):
         write_subconfigs(config, config_dir)
         logger.info(f"Wrote subconfigs to {config_dir}")
 
-        train_env_names = [env.resolved_name for env in config.orchestrator.train.env]
-        eval_env_names = [env.resolved_name for env in config.orchestrator.eval.env] if config.orchestrator.eval else []
+        train_env_names = [env.resolved_name for env in config.orchestrator.train.source]
+        eval_env_names = (
+            [source.resolved_name for source in config.orchestrator.eval.source] if config.orchestrator.eval else []
+        )
 
-        has_infer = config.deployment.num_infer_nodes > 0
+        has_infer = config.deployment.infer_nodes_per_replica > 0
         log_message = format_log_message(
             log_dir=log_dir,
             trainer=True,

@@ -8,31 +8,18 @@ from prime_rl.transport.filesystem import (
     FileSystemTrainingBatchReceiver,
     FileSystemTrainingBatchSender,
 )
-from prime_rl.transport.types import MicroBatch, RoutedExperts, TrainingBatch, TrainingSample
+from prime_rl.transport.types import (
+    MicroBatch,
+    RoutedExperts,
+    TrainingBatch,
+    TrainingSample,
+)
 from prime_rl.transport.zmq import (
     ZMQMicroBatchReceiver,
     ZMQMicroBatchSender,
     ZMQTrainingBatchReceiver,
     ZMQTrainingBatchSender,
 )
-
-_RAY_EXPORTS = {
-    "RayTrainingBatchReceiver": "prime_rl.transport.ray",
-    "RayTrainingBatchSender": "prime_rl.transport.ray",
-    "RayMicroBatchReceiver": "prime_rl.transport.ray",
-    "RayMicroBatchSender": "prime_rl.transport.ray",
-}
-
-
-def __getattr__(name: str):
-    module_name = _RAY_EXPORTS.get(name)
-    if module_name is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    from importlib import import_module
-
-    value = getattr(import_module(module_name), name)
-    globals()[name] = value
-    return value
 
 
 def setup_training_batch_sender(output_dir: Path, transport: TransportConfig) -> TrainingBatchSender:
@@ -86,10 +73,6 @@ __all__ = [
     "TrainingBatch",
     "MicroBatch",
     "RoutedExperts",
-    "RayTrainingBatchSender",
-    "RayTrainingBatchReceiver",
-    "RayMicroBatchSender",
-    "RayMicroBatchReceiver",
     "setup_training_batch_sender",
     "setup_training_batch_receiver",
     "setup_micro_batch_sender",

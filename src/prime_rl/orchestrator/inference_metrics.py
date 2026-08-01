@@ -3,9 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
-from collections.abc import Callable
 from dataclasses import dataclass, field
-from urllib.parse import urlparse
 
 import wandb
 from httpx import AsyncClient
@@ -168,16 +166,8 @@ def build_metrics_endpoints(
         normalized_role = role if role in PD_ROLES else None
         if role is not None and normalized_role is None:
             raise ValueError(f"Unsupported inference metrics role: {role}")
-        endpoints.append(MetricsEndpoint(client=client, role=normalized_role, key=endpoint_label(str(client.base_url))))
+        endpoints.append(MetricsEndpoint(client=client, role=normalized_role, key=str(client.base_url).rstrip("/")))
     return endpoints
-
-
-def endpoint_label(base_url: str) -> str:
-    parsed = urlparse(base_url)
-    host = parsed.hostname or (parsed.netloc or parsed.path).split(":")[0]
-    port = parsed.port
-    label = f"{host}_{port}" if port is not None else host
-    return label.replace(".", "_").replace("-", "_")
 
 
 def max_vio(values: list[float]) -> float:
@@ -400,20 +390,12 @@ class InferenceMetricsCollector:
     disaggregated P/D deployment.
     """
 
-    def __init__(
-        self,
-        admin_clients: list[AsyncClient],
-        metric_sink: Callable[[dict[str, dict[str, float]]], None] | None = None,
-        roles: list[str | None] | None = None,
-    ):
+    def __init__(self, admin_clients: list[AsyncClient], roles: list[str | None] | None = None):
         self.endpoints = build_metrics_endpoints(admin_clients, roles=roles)
-        self.metric_sink = metric_sink
-        self.logger = get_logger()
         self.metric_history: dict[str, deque[float]] = {}
         self.previous: dict[str, TimedRollup] = {}
         self.task: asyncio.Task | None = None
         self.has_pd_roles = {endpoint.role for endpoint in self.endpoints if endpoint.role is not None} == PD_ROLES
-        self._last_unavailable_warning_at = 0.0
 
     async def start(self):
         wandb.define_metric("inference/*", step_metric="_timestamp")
@@ -423,7 +405,7 @@ class InferenceMetricsCollector:
                 try:
                     await self.collect_and_log()
                 except Exception as e:
-                    self.logger.debug(f"Inference metrics poll failed: {e!r}")
+                    get_logger().debug(f"Inference metrics poll failed: {e!r}")
                 await asyncio.sleep(POLL_INTERVAL)
 
         self.task = asyncio.create_task(poll_loop())
@@ -437,7 +419,7 @@ class InferenceMetricsCollector:
                 response.raise_for_status()
                 return response.text
             except Exception as e:
-                self.logger.debug(f"Failed to fetch metrics from {endpoint.client.base_url}: {e!r}")
+                get_logger().debug(f"Failed to fetch metrics from {endpoint.client.base_url}: {e!r}")
                 return None
 
         results = await asyncio.gather(*[fetch(endpoint) for endpoint in self.endpoints])
@@ -446,106 +428,29 @@ class InferenceMetricsCollector:
             for endpoint, text in zip(self.endpoints, results)
             if text is not None
         ]
-        failed_count = len(self.endpoints) - len(samples)
-        if failed_count:
-            self._warn_metrics_unavailable(failed_count, len(self.endpoints))
         if not samples:
             return
 
-        endpoint_metrics = self._build_endpoint_sink_metrics(samples)
         metrics = build_scope_metrics("agg", samples, self.previous)
         if self.has_pd_roles:
             for role in sorted(PD_ROLES):
                 role_samples = [sample for sample in samples if sample.endpoint.role == role]
                 if role_samples:
                     metrics.update(build_scope_metrics(role, role_samples, self.previous))
-        self._add_latency_alias_metrics(metrics, samples)
 
         for sample in samples:
             self.previous[sample.endpoint.key] = TimedRollup(timestamp=sample.timestamp, rollup=sample.rollup)
 
         smoothed_metrics = self.smooth_metrics(metrics)
-        if self.metric_sink is not None:
-            self.metric_sink(endpoint_metrics)
         if smoothed_metrics:
             smoothed_metrics["_timestamp"] = time.time()
             wandb.log(smoothed_metrics)
-
-    async def _collect_and_log(self):
-        await self.collect_and_log()
-
-    def _build_endpoint_sink_metrics(self, samples: list[EndpointSample]) -> dict[str, dict[str, float]]:
-        sink_metrics: dict[str, dict[str, float]] = {}
-        for sample in samples:
-            values: dict[str, float] = {}
-            running_requests = sample.rollup.summed("running_requests")
-            waiting_requests = sample.rollup.summed("waiting_requests")
-            if running_requests:
-                values["num_requests_running"] = running_requests
-            if waiting_requests:
-                values["num_requests_waiting"] = waiting_requests
-            e2e_latency = histogram_average(
-                [sample], self.previous, "e2e_request_latency_seconds_sum", "e2e_request_latency_seconds_count"
-            )
-            if e2e_latency is not None:
-                values["e2e_request_latency_seconds_avg_ms"] = e2e_latency * 1000
-            inter_token_latency = histogram_average(
-                [sample], self.previous, "inter_token_latency_seconds_sum", "inter_token_latency_seconds_count"
-            )
-            if inter_token_latency is not None:
-                values["inter_token_latency_seconds_avg_ms"] = inter_token_latency * 1000
-            ttft = histogram_average(
-                [sample], self.previous, "time_to_first_token_seconds_sum", "time_to_first_token_seconds_count"
-            )
-            if ttft is not None:
-                values["time_to_first_token_seconds_avg_ms"] = ttft * 1000
-            nixl = histogram_average(
-                [sample], self.previous, "nixl_xfer_time_seconds_sum", "nixl_xfer_time_seconds_count"
-            )
-            if nixl is not None:
-                values["nixl_xfer_time_seconds_avg_ms"] = nixl * 1000
-            sink_metrics[sample.endpoint.key] = values
-        return sink_metrics
-
-    def _add_latency_alias_metrics(self, metrics: dict[str, float], samples: list[EndpointSample]) -> None:
-        aliases = {
-            "e2e_request_latency_seconds": ("e2e_request_latency_seconds_sum", "e2e_request_latency_seconds_count"),
-            "inter_token_latency_seconds": ("inter_token_latency_seconds_sum", "inter_token_latency_seconds_count"),
-            "time_to_first_token_seconds": ("time_to_first_token_seconds_sum", "time_to_first_token_seconds_count"),
-            "nixl_xfer_time_seconds": ("nixl_xfer_time_seconds_sum", "nixl_xfer_time_seconds_count"),
-        }
-        for alias, (sum_attr, count_attr) in aliases.items():
-            value = histogram_average(samples, self.previous, sum_attr, count_attr)
-            if value is None:
-                continue
-            metrics[f"inference/{alias}_avg_ms"] = value * 1000
-
-            per_endpoint_values: list[float] = []
-            for sample in samples:
-                endpoint_value = histogram_average([sample], self.previous, sum_attr, count_attr)
-                if endpoint_value is None:
-                    continue
-                endpoint_ms = endpoint_value * 1000
-                per_endpoint_values.append(endpoint_ms)
-                metrics[f"inference/server/{sample.endpoint.key}/{alias}_avg_ms"] = endpoint_ms
-            if per_endpoint_values:
-                metrics[f"inference/skew/{alias}_avg_ms/max"] = max(per_endpoint_values)
 
     def smooth_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
         """Add current values to the smoothing window and return W&B-ready metrics."""
         for key, value in metrics.items():
             self.metric_history.setdefault(key, deque(maxlen=WINDOW_SIZE)).append(value)
         return {key: sum(values) / len(values) for key, values in self.metric_history.items() if values}
-
-    def _warn_metrics_unavailable(self, failed_count: int, total_count: int) -> None:
-        now = time.monotonic()
-        if now - self._last_unavailable_warning_at < 60:
-            return
-        self._last_unavailable_warning_at = now
-        self.logger.warning(
-            f"Inference metrics unavailable ({failed_count}/{total_count} inference /metrics endpoint(s) did not respond); "
-            "request picker throughput/cache signals will be absent."
-        )
 
     async def stop(self):
         if self.task is not None:

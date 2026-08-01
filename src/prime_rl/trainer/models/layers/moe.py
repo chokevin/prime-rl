@@ -77,7 +77,6 @@ class BCFeedForward(nn.Module):
         self.w3 = nn.Parameter(torch.empty(hidden_dim, dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # return torch.matmul(self.w2, F.silu(torch.matmul(self.w1, x.T)) * torch.matmul(self.w3, x.T))
         return torch.matmul(F.silu(torch.matmul(x, self.w1.T)) * torch.matmul(x, self.w3.T), self.w2.T)
 
     def init_weights(self, init_std: float):
@@ -427,6 +426,9 @@ class TokenChoiceTopKRouter(nn.Module):
         self.route_norm = route_norm
         self.route_scale = route_scale
         self.force_balanced = False
+        # Set via model.moe_router_dtype='float32': the gate weight is kept in fp32
+        # (exempt from FSDP bf16 casting) and the gate GEMM runs in fp32.
+        self.fp32_gate = False
 
     def forward(
         self, x: torch.Tensor, expert_bias: torch.Tensor | None = None, routed_experts: torch.Tensor | None = None
@@ -453,7 +455,7 @@ class TokenChoiceTopKRouter(nn.Module):
         assert routed_experts is None or routed_experts.shape[-1] == self.top_k, (
             f"routed_experts shape: {routed_experts.shape}, top_k: {self.top_k}"
         )
-        scores = self.gate(x)
+        scores = self.gate(x.to(torch.float32)) if self.fp32_gate else self.gate(x)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
         if self.score_func == "sigmoid":
@@ -796,6 +798,7 @@ class MoE(nn.Module):
                 self.expert_bias = torch.zeros(self.experts.num_experts, dtype=torch.float32)
 
 
+@torch.compile(dynamic=True)
 def relu2(x: torch.Tensor) -> torch.Tensor:
     return F.relu(x).square()
 
@@ -955,32 +958,44 @@ class NemotronHRouter(nn.Module):
         self.norm_topk_prob = norm_topk_prob
 
     def forward(
-        self, x: torch.Tensor, expert_bias: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        expert_bias: torch.Tensor | None = None,
+        routed_experts: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         scores = F.linear(x.float(), self.gate.float()).sigmoid()
-        scores_for_choice = scores + self.e_score_correction_bias
 
-        if expert_bias is not None:
-            scores_for_choice = scores_for_choice + expert_bias
+        if routed_experts is not None:
+            # Router replay: reuse the inference engine's expert selection and
+            # only recompute the gating weights from the trainer's scores. The
+            # correction/load-balancing biases only affect selection, so they
+            # are intentionally skipped here.
+            selected_experts_indices = routed_experts
+        else:
+            scores_for_choice = scores + self.e_score_correction_bias
 
-        # Group-based routing
-        if self.n_group > 1:
-            group_scores = (
-                scores_for_choice.view(-1, self.n_group, self.num_experts // self.n_group)
-                .topk(2, dim=-1)[0]
-                .sum(dim=-1)
-            )
-            group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-            group_mask = torch.zeros_like(group_scores)
-            group_mask.scatter_(1, group_idx, 1)
-            score_mask = (
-                group_mask.unsqueeze(-1)
-                .expand(-1, self.n_group, self.num_experts // self.n_group)
-                .reshape(-1, self.num_experts)
-            )
-            scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+            if expert_bias is not None:
+                scores_for_choice = scores_for_choice + expert_bias
 
-        selected_experts_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+            # Group-based routing
+            if self.n_group > 1:
+                group_scores = (
+                    scores_for_choice.view(-1, self.n_group, self.num_experts // self.n_group)
+                    .topk(2, dim=-1)[0]
+                    .sum(dim=-1)
+                )
+                group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+                group_mask = torch.zeros_like(group_scores)
+                group_mask.scatter_(1, group_idx, 1)
+                score_mask = (
+                    group_mask.unsqueeze(-1)
+                    .expand(-1, self.n_group, self.num_experts // self.n_group)
+                    .reshape(-1, self.num_experts)
+                )
+                scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+
+            selected_experts_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+
         top_scores = scores.gather(1, selected_experts_indices)
         routing_confidence_sum = _selected_probability_mass_sum(scores, top_scores, "sigmoid")
 
@@ -1181,8 +1196,13 @@ class LatentMoE(nn.Module):
         bs, slen, dim = x.shape
         x_flat = x.view(-1, dim)
 
+        if routed_experts is not None:
+            # Flatten to (bs * slen, top_k); reshape (not view) since the slice is non-contiguous.
+            _, _, top_k = routed_experts.shape
+            routed_experts = routed_experts.reshape(-1, top_k)
+
         top_scores, selected_experts_indices, num_tokens_per_expert, routing_confidence_sum = self.router(
-            x_flat, self.expert_bias
+            x_flat, self.expert_bias, routed_experts=routed_experts
         )
 
         with torch.no_grad():

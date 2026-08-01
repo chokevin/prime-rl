@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 from torch import Tensor, nn
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_model_state_dict, set_state_dict
 from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.checkpoint.state_dict_saver import save as dcp_save
 from torch.distributed.checkpoint.stateful import Stateful
@@ -18,6 +18,7 @@ from torch.nn import Module
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim.optimizer import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
+from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils import PreTrainedTokenizer
 
 from prime_rl.configs.trainer import CheckpointConfig, LoRAConfig, WeightCheckpointConfig
@@ -31,7 +32,6 @@ from prime_rl.trainer.weights import (
 )
 from prime_rl.trainer.world import get_world
 from prime_rl.utils.logger import get_logger
-from prime_rl.utils.pathing import durable_touch
 from prime_rl.utils.utils import get_all_ckpt_steps, get_ckpt_dir, get_step_path, get_weights_dir
 
 
@@ -68,8 +68,13 @@ class AppState(Stateful):
         """Extract base optimizers from wrappers like CPUOffloadOptimizer."""
         return [opt.base_optimizer if isinstance(opt, CPUOffloadOptimizer) else opt for opt in self.optimizers]
 
+    def _has_cpu_offload(self) -> bool:
+        return any(isinstance(opt, CPUOffloadOptimizer) for opt in self.optimizers)
+
     def state_dict(self) -> dict[str, Any]:
-        # Move CPU-offloaded states to GPU before checkpointing
+        # get_state_dict requires optimizer states to live on param.device. For an
+        # already-initialized CPU-offload optimizer that means staging back to GPU
+        # before the call; the matching offload happens after the dict is built.
         for opt in self.optimizers:
             if isinstance(opt, CPUOffloadOptimizer) and opt._initialized:
                 opt._move_states("cuda")
@@ -89,26 +94,53 @@ class AppState(Stateful):
             progress_state_dict = asdict(self.progress)
             state_dict["progress"] = progress_state_dict
 
-        # Move states back to CPU
+        # Offload optimizer states to CPU for every CPUOffloadOptimizer, including
+        # ones that were uninitialized on entry. dcp_load calls this method to build
+        # a template, and get_state_dict's internal _init_optim_state populates an
+        # empty optim.state with GPU tensors. Optimizer.state_dict() returns those
+        # values via shallow copy, so optimizer_state_dict["state"][fqn] is the same
+        # dict object as optim.state[param]. Replacing the entries with CPU tensors
+        # in place therefore flips the template too — dcp_load reads bytes from disk
+        # straight into CPU storage and optim.state is loaded by the time the load
+        # returns, without GPU optimizer state ever existing for the duration of the
+        # read.
+        has_cpu_offload = self._has_cpu_offload()
         for opt in self.optimizers:
-            if isinstance(opt, CPUOffloadOptimizer) and opt._initialized:
+            if isinstance(opt, CPUOffloadOptimizer):
                 opt._move_states("cpu")
+        if has_cpu_offload:
+            gc.collect()
+            torch.cuda.empty_cache()
 
         return state_dict
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         base_optimizers = self._get_base_optimizers()
-        set_state_dict(
-            self.model, base_optimizers, model_state_dict=state_dict["model"], optim_state_dict=state_dict["optimizers"]
-        )
+        has_cpu_offload = self._has_cpu_offload()
 
-        # Re-initialize CPU offload wrappers after loading
-        has_cpu_offload = False
-        for opt in self.optimizers:
-            if isinstance(opt, CPUOffloadOptimizer):
-                opt._move_states("cpu")
-                opt._initialized = True
-                has_cpu_offload = True
+        if has_cpu_offload:
+            # When CPU offload is on, the optimizer is already loaded by the time we
+            # get here: state_dict() handed dcp_load a template whose tensors share
+            # storage with optim.state[p][k], and dcp_load wrote the checkpoint bytes
+            # directly into those tensors via target_tensor.copy_(...). Running
+            # set_state_dict on the optimizer would route the loaded CPU values
+            # through Optimizer.load_state_dict, whose _cast hook does
+            # value.to(param.dtype, param.device) and would allocate a fresh GPU
+            # copy of every state tensor — undoing the in-place CPU load and
+            # detaching optim.state from the tensors we just populated. So we only
+            # apply the model side here and flip the wrappers to initialized so
+            # subsequent steps take the steady-state path.
+            set_model_state_dict(self.model, model_state_dict=state_dict["model"])
+            for opt in self.optimizers:
+                if isinstance(opt, CPUOffloadOptimizer):
+                    opt._initialized = True
+        else:
+            set_state_dict(
+                self.model,
+                base_optimizers,
+                model_state_dict=state_dict["model"],
+                optim_state_dict=state_dict["optimizers"],
+            )
 
         if self.scheduler is not None:
             self.scheduler.load_state_dict(state_dict["scheduler"])
@@ -116,15 +148,13 @@ class AppState(Stateful):
             for key, value in state_dict["progress"].items():
                 setattr(self.progress, key, value)
 
-        # Reclaim GPU memory freed by moving optimizer states to CPU.
-        # After set_state_dict + _move_states("cpu"), the optimizer states live on CPU,
-        # but the state_dict (owned by dcp_load) still holds references to stale GPU
-        # optimizer tensors. Clearing them and flushing the CUDA cache prevents OOM on
-        # the first training step.
+        # state_dict is the same dict object that dcp_load held internally; clearing
+        # it drops the last references to the loaded tensor wrappers so the cuda
+        # allocator can release whatever blocks it cached during the read.
         if has_cpu_offload:
-            state_dict.clear()  # drop stale GPU tensor references from dcp_load
-            gc.collect()  # break any circular references so tensors are freed
-            torch.cuda.empty_cache()  # return freed GPU memory to CUDA
+            state_dict.clear()
+            gc.collect()
+            torch.cuda.empty_cache()
 
 
 class CheckpointManager:
@@ -151,7 +181,7 @@ class CheckpointManager:
         """Write STABLE file to indicate checkpoint is complete (for eval to safely read)."""
         if self.world.is_master:
             step_path = get_step_path(self.ckpt_dir, step)
-            durable_touch(step_path / "STABLE")
+            (step_path / "STABLE").touch()
 
     def save_to_path(
         self,
@@ -172,7 +202,12 @@ class CheckpointManager:
         # Checkpoint the local dataloader
         if dataloader is not None:
             dataloader_dir = path / "dataloader"
-            dataloader_dir.mkdir(parents=True, exist_ok=True)
+            # Only the master creates the dir; the rest wait at a barrier. On a
+            # parallel FS (beegfs), concurrent mkdir from every rank can re-raise
+            # FileExistsError (EEXIST + stale is_dir() metadata).
+            if self.world.is_master:
+                dataloader_dir.mkdir(parents=True, exist_ok=True)
+            torch.distributed.barrier()
             torch.save(dataloader.state_dict(), dataloader_dir / f"rank_{self.world.rank}.pt")
 
         # Save sharded state
@@ -240,7 +275,11 @@ class CheckpointManager:
     ) -> None:
         """Save the full checkpoint state for a specified step."""
         ckpt_path = self.get_ckpt_path(step)
-        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        # Master-only mkdir + barrier: concurrent mkdir from every rank can
+        # re-raise FileExistsError on a parallel FS (see save_to_path).
+        if self.world.is_master:
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.distributed.barrier()
 
         self.save_to_path(ckpt_path, model, optimizers, scheduler, progress, dataloader)
         bisect.insort(self.ckpt_steps, step)
@@ -317,7 +356,7 @@ class WeightCheckpointManager:
         """Write STABLE file to indicate weight checkpoint is complete."""
         if self.world.is_master:
             step_path = self.get_step_path(step)
-            durable_touch(step_path / "STABLE")
+            (step_path / "STABLE").touch()
 
     def get_run_adapter_state_dict(self) -> dict[str, Tensor]:
         lora_state_dict = {
@@ -339,6 +378,7 @@ class WeightCheckpointManager:
         lora_state_dict: dict[str, Tensor] | None,
         model,
         tokenizer: PreTrainedTokenizer,
+        processor: ProcessorMixin | None = None,
     ):
         """Save HF-compatible weight checkpoint to a given path."""
         if self.world.is_master:
@@ -365,6 +405,10 @@ class WeightCheckpointManager:
                     gen_config = deepcopy(model.generation_config)
                     gen_config.use_cache = True
                     gen_config.save_pretrained(path)
+                # Processor first: it saves its own (unmodified) tokenizer, which the
+                # configured tokenizer (pad token, custom chat template) must override.
+                if processor is not None:
+                    processor.save_pretrained(path)
                 tokenizer.save_pretrained(path)
 
             if lora_state_dict is not None:
@@ -388,10 +432,15 @@ class WeightCheckpointManager:
         step: int,
         model: nn.Module,
         tokenizer: PreTrainedTokenizer,
+        processor: ProcessorMixin | None = None,
     ):
         """Save a HF-compatible weight-only checkpoint for a given step."""
         step_path = self.get_step_path(step)
-        step_path.mkdir(parents=True, exist_ok=True)
+        # Master-only mkdir + barrier: concurrent mkdir from every rank can
+        # re-raise FileExistsError on a parallel FS (EEXIST + stale is_dir()).
+        if self.world.is_master:
+            step_path.mkdir(parents=True, exist_ok=True)
+        torch.distributed.barrier()
 
         # Gather all weights on master rank
         self.logger.debug("Gathering weights on master rank for weight checkpoint")
@@ -421,7 +470,6 @@ class WeightCheckpointManager:
                 f"Converted PrimeRL format to HF format in {time.perf_counter() - start_time:.2f} seconds"
             )
         else:
-            # For regular transformers models, revert internal format to original HF hub format
             from transformers.core_model_loading import revert_weight_conversion
 
             self.logger.debug("Reverting transformers internal format to HF hub format for weight checkpoint")
@@ -430,7 +478,7 @@ class WeightCheckpointManager:
             self.logger.debug(f"Reverted to HF hub format in {time.perf_counter() - start_time:.2f} seconds")
 
         # Save weight checkpoint on master rank
-        self.save_to_path(step_path, state_dict, lora_state_dict, model, tokenizer)
+        self.save_to_path(step_path, state_dict, lora_state_dict, model, tokenizer, processor)
         self.mark_stable(step)
         bisect.insort(self.ckpt_steps, step)
 

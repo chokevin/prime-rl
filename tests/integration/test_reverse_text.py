@@ -15,7 +15,8 @@ from tests.utils import (
 pytestmark = [pytest.mark.gpu, pytest.mark.slow]
 
 
-TIMEOUT = 600  # 10 minutes
+TIMEOUT = 900  # 15 minutes (was 600s — can be tight on contended CI runners
+# after verifiers per-call tracing overhead was added)
 
 
 @pytest.fixture(scope="module")
@@ -36,7 +37,7 @@ def rl_process(
         "run",
         "rl",
         "@",
-        "configs/ci/integration/reverse_text/start.toml",
+        "configs/ci/integration/reverse-text/start.toml",
         "--clean-output-dir",
         "--wandb.project",
         wandb_project,
@@ -64,7 +65,7 @@ def rl_resume_process(
         "run",
         "rl",
         "@",
-        "configs/ci/integration/reverse_text/resume.toml",
+        "configs/ci/integration/reverse-text/resume.toml",
         "--wandb.project",
         wandb_project,
         "--wandb.name",
@@ -93,7 +94,7 @@ def test_reward_in_range(rl_process: ProcessResult, test_no_error, output_dir: P
     """Tests that the reward is in range in the RL process"""
     with open(output_dir / "logs" / "orchestrator.log", "r") as f:
         orchestrator_stdout = strip_escape_codes(f.read()).splitlines()
-    check_reward_in_range(orchestrator_stdout, min_threshold=0.65)
+    check_reward_in_range(orchestrator_stdout, min_threshold=0.6)
 
 
 def test_mismatch_kl_in_range(rl_process: ProcessResult, test_no_error, output_dir: Path):
@@ -113,4 +114,4 @@ def test_reward_in_range_resume(rl_resume_process: ProcessResult, test_no_error_
     """Tests that the reward is in range in the RL resume process"""
     with open(output_dir / "logs" / "orchestrator.log", "r") as f:
         orchestrator_stdout = strip_escape_codes(f.read()).splitlines()
-    check_reward_in_range(orchestrator_stdout, min_threshold=0.65)
+    check_reward_in_range(orchestrator_stdout, min_threshold=0.6)

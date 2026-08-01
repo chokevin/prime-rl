@@ -41,9 +41,9 @@ def create_run_with_config(
             "model": {"name": "test-model"},
             "batch_size": 32,
             "group_size": 4,
-            "env": [{"id": "test-env"}],
-            # test-model isn't in MODEL_RENDERER_MAP; bypass the renderer-resolution validator.
-            "renderer": "None",
+            "train": {"source": [{"legacy": {"id": "test-env"}}]},
+            # test-model isn't in MODEL_RENDERER_MAP; use the explicit default renderer.
+            "renderer": {"name": "default"},
         }
 
     with open(config_dir / "orch.toml", "wb") as f:
@@ -202,8 +202,8 @@ def test_config_loading(tmp_path: Path) -> None:
         "batch_size": 32,
         "max_steps": 1000,
         "group_size": 4,
-        "env": [{"id": "test-env"}],
-        "renderer": "None",
+        "train": {"source": [{"legacy": {"id": "test-env"}}]},
+        "renderer": {"name": "default"},
     }
     create_run_with_config(tmp_path, "run_test123", config=test_config)
 
@@ -217,7 +217,7 @@ def test_config_loading(tmp_path: Path) -> None:
 
     # Access config as OrchestratorConfig object
     config = multi_run_manager.config[run_idx]
-    assert config.student.model.name == "test-model"
+    assert config.model.name == "test-model"
     assert config.batch_size == 32
     assert config.max_steps == 1000
 
@@ -247,8 +247,8 @@ def test_config_cleanup_on_deletion(tmp_path: Path) -> None:
         "model": {"name": "test-model"},
         "batch_size": 16,
         "group_size": 4,
-        "env": [{"id": "test-env"}],
-        "renderer": "None",
+        "train": {"source": [{"legacy": {"id": "test-env"}}]},
+        "renderer": {"name": "default"},
     }
     run_dir = create_run_with_config(tmp_path, "run_delete_me", config=test_config)
 
@@ -278,7 +278,7 @@ def test_config_invalid(tmp_path: Path) -> None:
         "model": {"name": "test-model"},
         "batch_size": "not-a-number",  # Invalid type
         "group_size": 4,
-        "env": [{"id": "test-env"}],
+        "train": {"source": [{"legacy": {"id": "test-env"}}]},
     }
     run_dir = create_run_with_config(tmp_path, "run_invalid", config=invalid_config)
     config_dir = run_dir / "control"

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Callable, Generator, cast
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch import Tensor
 from torch.distributed.tensor import DTensor
@@ -11,18 +12,17 @@ from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.utils import StatelessProcessGroup
 
 from prime_rl.configs.trainer import NCCLWeightBroadcastConfig
+from prime_rl.trainer.conversion_utils import get_max_layer_num
 from prime_rl.trainer.models import PreTrainedModelPrimeRL
 from prime_rl.trainer.rl.broadcast.base import WeightBroadcast
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.utils import get_world
-from prime_rl.trainer.weights import get_max_layer_num
+from prime_rl.utils.client import NCCL_READY_MARKER
 from prime_rl.utils.logger import get_logger
 from prime_rl.utils.nccl import disable_nccl_p2p_if_unavailable
-from prime_rl.utils.pathing import durable_touch, sync_wait_for_path
+from prime_rl.utils.pathing import sync_wait_for_path
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 from prime_rl.utils.vlm import get_layer_prefix
-
-NCCL_READY_MARKER = "NCCL_READY"
 
 
 def broadcast_integer(integer: int, communicator: PyNcclCommunicator) -> None:
@@ -201,7 +201,7 @@ class NCCLWeightBroadcast(WeightBroadcast):
         # `_compute_notified_runs` is a pure function of SPMD-replicated state on
         # multi_run_manager, so every trainer rank derives the same list. Only
         # the master touches the filesystem to notify the orchestrator, but all
-        # ranks must wait on NCCL_READY before entering the broadcast path:
+        # ranks must wait for the inference pool before entering the broadcast path:
         # the broadcast preparation (DTensor resolution, quantization) enqueues
         # collectives on non-master ranks, and if those ranks start prep before
         # the orchestrator has paused inference, the collectives sit unmatched
@@ -209,7 +209,9 @@ class NCCLWeightBroadcast(WeightBroadcast):
         notified_runs = self._compute_notified_runs()
         if self.world.is_master:
             self._notify_orchestrator(notified_runs)
-        self._wait_for_nccl_ready(notified_runs)
+            self._wait_for_nccl_ready(notified_runs)
+        if self.world.world_size > 1:
+            dist.barrier()
         self.nccl_broadcast_sender.broadcast_weights(model, step)
         self.logger.debug(f"Weights broadcasted in {time.perf_counter() - start_time:.2f}s")
 
@@ -225,9 +227,11 @@ class NCCLWeightBroadcast(WeightBroadcast):
             if not self.multi_run_manager.ready_to_update[idx]:
                 continue
             try:
+                # pack() already advanced progress to the next step, so the model we just
+                # trained — policy v(step-1) — broadcasts to broadcasts/step_{step-1}.
                 save_dir = get_step_path(
                     get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
-                    self.multi_run_manager.progress[idx].step,
+                    self.multi_run_manager.progress[idx].step - 1,
                 )
                 notified_runs.append((idx, save_dir))
             except FileNotFoundError:
@@ -244,13 +248,9 @@ class NCCLWeightBroadcast(WeightBroadcast):
         """
         for idx, save_dir in notified_runs:
             try:
+                save_dir.mkdir(parents=True, exist_ok=True)
                 stable_file = save_dir / "STABLE"
-                marker_start = time.perf_counter()
-                durable_touch(stable_file)
-                self.logger.info(
-                    f"Created durable STABLE marker for run {idx} at {stable_file} "
-                    f"in {time.perf_counter() - marker_start:.2f}s"
-                )
+                stable_file.touch()
             except FileNotFoundError:
                 self.logger.warning(f"Run {idx} is deleted, skipping")
             except Exception as e:
@@ -262,9 +262,6 @@ class NCCLWeightBroadcast(WeightBroadcast):
         """Wait for inference workers to signal they are ready to receive NCCL broadcast."""
         for idx, save_dir in notified_runs:
             nccl_ready_file = save_dir / NCCL_READY_MARKER
-            start = time.perf_counter()
-            self.logger.info(f"Waiting for NCCL_READY marker at {nccl_ready_file}")
+            self.logger.debug(f"Waiting for NCCL_READY marker at {nccl_ready_file}")
             sync_wait_for_path(nccl_ready_file, interval=0.1, log_interval=10)
-            self.logger.info(
-                f"Inference workers ready for NCCL broadcast (run {idx}) after {time.perf_counter() - start:.2f}s"
-            )
+            self.logger.debug(f"Inference workers ready for NCCL broadcast (run {idx})")

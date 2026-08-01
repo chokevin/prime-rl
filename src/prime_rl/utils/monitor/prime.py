@@ -1,34 +1,29 @@
+from __future__ import annotations
+
 import asyncio
 import io
 import json
-import math
 import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
-import verifiers as vf
 from prime_cli.core.config import Config as PrimeConfig
 from transformers.tokenization_utils import PreTrainedTokenizer
+from verifiers.v1.push import trace_to_sample
 
+from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.shared import PrimeMonitorConfig
-from prime_rl.utils.config import BaseConfig
 from prime_rl.utils.logger import get_logger
-from prime_rl.utils.monitor.base import Monitor, sample_items_for_logging
+from prime_rl.utils.monitor.base import Monitor, drop_non_finite_json_values, sample_items_for_logging
 
-
-def _json(val: Any) -> str:
-    """JSON-serialize dicts/lists, pass strings through, default to empty string for None."""
-    if isinstance(val, str):
-        return val
-    if val is None:
-        return ""
-    return json.dumps(val)
+if TYPE_CHECKING:
+    from prime_rl.orchestrator.types import Rollout
 
 
 _SAMPLE_SCHEMA = pa.schema(
@@ -56,46 +51,13 @@ _SAMPLE_SCHEMA = pa.schema(
 )
 
 
-_DROPPED_JSON_VALUE = object()
-
-
-def _drop_non_finite_json_values(value: Any, dropped_paths: list[str], path: str = "") -> Any:
-    if isinstance(value, float) and not math.isfinite(value):
-        dropped_paths.append(path)
-        return _DROPPED_JSON_VALUE
-
-    if isinstance(value, dict):
-        return {
-            key: sanitized_item
-            for key, item in value.items()
-            if (
-                sanitized_item := _drop_non_finite_json_values(
-                    item,
-                    dropped_paths,
-                    f"{path}.{key}" if path else str(key),
-                )
-            )
-            is not _DROPPED_JSON_VALUE
-        }
-
-    if isinstance(value, list):
-        return [
-            sanitized_item
-            for idx, item in enumerate(value)
-            if (sanitized_item := _drop_non_finite_json_values(item, dropped_paths, f"{path}[{idx}]"))
-            is not _DROPPED_JSON_VALUE
-        ]
-
-    return value
-
-
 class PrimeMonitor(Monitor):
     """Logs to Prime Intellect API."""
 
     def _sanitize_json_payload(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Drop non-finite floats before sending JSON payloads to the public API."""
         dropped_paths: list[str] = []
-        sanitized_payload = _drop_non_finite_json_values(payload, dropped_paths)
+        sanitized_payload = drop_non_finite_json_values(payload, dropped_paths)
         if not dropped_paths:
             return payload
 
@@ -112,7 +74,7 @@ class PrimeMonitor(Monitor):
         config: PrimeMonitorConfig | None,
         output_dir: Path | None = None,
         tokenizer: PreTrainedTokenizer | None = None,
-        run_config: BaseConfig | None = None,
+        run_config: OrchestratorConfig | None = None,
         keep_full_history: bool = True,
     ):
         self.config = config
@@ -185,7 +147,7 @@ class PrimeMonitor(Monitor):
             if config.log_extras.distributions:
                 self.last_log_distributions_step = -1
 
-    def _register_run(self, config: PrimeMonitorConfig, run_config: BaseConfig | None) -> str | None:
+    def _register_run(self, config: PrimeMonitorConfig, run_config: OrchestratorConfig | None) -> str | None:
         """Register an external run with the platform. Returns run_id on success, None on failure."""
         prime_config = None
         team_id = config.team_id
@@ -197,22 +159,23 @@ class PrimeMonitor(Monitor):
         if frontend_url is None:
             frontend_url = prime_config.frontend_url
 
-        model = getattr(run_config, "model", None) if run_config else None
-        environments = getattr(run_config, "env", None) if run_config else None
-        wandb = getattr(run_config, "wandb", None) if run_config else None
-
-        payload: dict = {
-            "base_model": model.name if model else "unknown",
-            "max_steps": getattr(run_config, "max_steps", None) or 0,
+        payload: dict[str, Any] = {
+            "base_model": run_config.model.name if run_config else "unknown",
+            "max_steps": (run_config.max_steps if run_config else None) or 0,
         }
+        if run_config:
+            if run_config.batch_size is not None:
+                payload["batch_size"] = run_config.batch_size
+            payload["rollouts_per_example"] = run_config.group_size
+            payload["seq_len"] = run_config.seq_len
+            payload["environments"] = [{"id": env.env_id} for env in run_config.train.source]
+            payload["run_config"] = run_config.model_dump(exclude_none=True, mode="json")
+            if run_config.wandb:
+                payload["wandb_project"] = run_config.wandb.project
         if config.run_name:
             payload["name"] = config.run_name
         if team_id:
             payload["team_id"] = team_id
-        if environments:
-            payload["environments"] = [{"id": env.id} for env in environments if hasattr(env, "id")]
-        if wandb and getattr(wandb, "project", None):
-            payload["wandb_project"] = wandb.project
 
         try:
             response = httpx.post(
@@ -285,7 +248,7 @@ class PrimeMonitor(Monitor):
             },
         )
 
-    def log_samples(self, rollouts: list[vf.RolloutOutput], step: int) -> None:
+    def log_samples(self, rollouts: list[Rollout], step: int) -> None:
         """Logs rollouts to Prime Intellect API using presigned URLs for direct R2 upload."""
         if not self.is_master:
             return
@@ -328,36 +291,29 @@ class PrimeMonitor(Monitor):
             f"Initiated samples upload at step {step} to Prime Intellect API in {time.perf_counter() - start_time:.2f}s"
         )
 
-    def _rollouts_to_parquet_bytes(self, rollouts: list[vf.RolloutOutput], step: int) -> bytes | None:
-        """Convert rollouts directly to Parquet bytes for upload."""
+    def _rollouts_to_parquet_bytes(self, rollouts: list[Rollout], step: int) -> bytes | None:
+        """Convert rollouts to Parquet bytes for upload. One row per rollout. The conversation
+        is the unit (no prompt/completion split — meaningless mid-branch): `completion` is the
+        last branch's messages and `trajectory` is one message list per branch. Shares
+        `verifiers.v1.push.trace_to_sample` with verifiers' eval `--push`, so a training-run
+        sample and an eval sample land on the platform identically; the RFT-only columns
+        (run/step/advantage/problem_id/env_name) are layered on here."""
         now = datetime.now(timezone.utc)
         rows = []
 
         for sample_id, rollout in enumerate(rollouts):
-            prompt = rollout.get("prompt")
-            completion = rollout.get("completion")
-            trajectory = rollout.get("trajectory") or []
-            if prompt is None or completion is None or not trajectory:
+            sample = trace_to_sample(rollout, rollout_number=sample_id + 1, episode_id=rollout.episode_id or None)
+            trajectory = sample["trajectory"]
+            if not trajectory:  # no branches (e.g. a rollout that errored before any message)
                 continue
+            advantage = rollout.scalar_advantage()
+            trajectory = [{**branch, "advantage": advantage} for branch in trajectory]
 
-            example_id = rollout.get("example_id")
+            example_id = sample["example_id"]
             try:
                 problem_id = int(example_id) if example_id is not None else sample_id
             except (TypeError, ValueError):
                 problem_id = sample_id
-
-            trajectory_data = [
-                {
-                    "prompt": ts["prompt"],
-                    "completion": ts["completion"],
-                    "reward": ts.get("reward"),
-                    "advantage": ts.get("advantage"),
-                    "extras": ts.get("extras", {}),
-                    "num_input_tokens": len(ts["tokens"]["prompt_ids"]) if ts.get("tokens") else None,
-                    "num_output_tokens": len(ts["tokens"]["completion_ids"]) if ts.get("tokens") else None,
-                }
-                for ts in trajectory
-            ]
 
             rows.append(
                 {
@@ -366,19 +322,19 @@ class PrimeMonitor(Monitor):
                     "tag": "",
                     "problem_id": problem_id,
                     "sample_id": sample_id,
-                    "prompt": json.dumps(prompt),
-                    "completion": json.dumps(completion),
-                    "trajectory": json.dumps(trajectory_data),
-                    "answer": rollout.get("answer") or "",
-                    "env_name": rollout.get("env_name") or "",
-                    "task": rollout.get("task") or "",
-                    "info": _json(rollout.get("info")),
-                    "reward": rollout.get("reward"),
-                    "advantage": rollout.get("advantage"),
-                    "metrics": _json(rollout.get("metrics")),
-                    "timing": _json(rollout.get("timing")),
-                    "num_input_tokens": 0,
-                    "num_output_tokens": 0,
+                    "prompt": "",
+                    "completion": json.dumps(sample["completion"]),
+                    "trajectory": json.dumps(trajectory),
+                    "answer": "",
+                    "env_name": rollout.env_name,
+                    "task": json.dumps(sample["task"]),
+                    "info": json.dumps(rollout.info),
+                    "reward": sample["reward"],
+                    "advantage": advantage,
+                    "metrics": json.dumps(sample["metrics"]),
+                    "timing": json.dumps(sample["timing"]),
+                    "num_input_tokens": trajectory[-1]["num_input_tokens"],
+                    "num_output_tokens": trajectory[-1]["num_output_tokens"],
                     "created_at": now,
                 }
             )
@@ -491,7 +447,7 @@ class PrimeMonitor(Monitor):
                 await asyncio.sleep(delay)
         return False
 
-    def log_eval_samples(self, rollouts: list[vf.RolloutOutput], env_name: str, step: int) -> None:
+    def log_eval_samples(self, rollouts: list[Rollout], env_name: str, step: int) -> None:
         pass
 
     def log_distributions(self, distributions: dict[str, list[float]], step: int) -> None:

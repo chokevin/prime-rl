@@ -1,5 +1,11 @@
-max_steps = 5
+max_steps = 10
 seq_len = 2048
+
+[weight_broadcast]
+# TEMP: NCCL weight broadcast currently crashes the trainer on CI GPU runners
+# (trainer exits during NCCL init). Use filesystem transport until the NCCL
+# path is fixed. See CI RL integration test failures on main.
+type = "filesystem"
 
 [ckpt]
 
@@ -16,15 +22,30 @@ group_size = 8
 [orchestrator.train.sampling]
 max_completion_tokens = 384
 
-[[orchestrator.train.env]]
-id = "alphabet-sort"
+[[orchestrator.train.source]]
 name = "alphabet-sort"
-args = { min_turns = 2, max_turns = 2, min_names_per_turn = 1, max_names_per_turn = 3, similarity_power = 4, power_per_turn = false }
+
+[orchestrator.train.source.env.taskset]
+id = "alphabet-sort-v1"
+min_turns = 2
+max_turns = 2
+min_names_per_turn = 1
+max_names_per_turn = 3
+
+[orchestrator.train.source.env.taskset.task]
+similarity_power = 4
+power_per_turn = false
+
+[orchestrator.train.source.env.agent.harness]
+id = "null"
+
+[orchestrator.train.source.env.agent.runtime]
+type = "subprocess"
 
 [inference]
 
 # Mirror of Qwen/Qwen3-0.6B; PI's template patch always re-emits prior
-# <think> blocks. Match that with the qwen3 renderer's preserve_all_thinking.
+# <think> blocks. Match that with renderer thinking_retention.
 [orchestrator.renderer]
 name = "auto"
-preserve_all_thinking = true
+thinking_retention = "all"

@@ -9,10 +9,17 @@ from threading import Event, Thread
 import tomli_w
 
 from prime_rl.configs.sft import SFTConfig
-from prime_rl.utils.config import cli
+from prime_rl.utils.config import cli, to_toml_dict
 from prime_rl.utils.logger import setup_logger
 from prime_rl.utils.pathing import format_log_message, get_config_dir, get_log_dir, validate_output_dir
-from prime_rl.utils.process import cleanup_processes, cleanup_threads, monitor_process, set_proc_title
+from prime_rl.utils.process import (
+    DEFAULT_COMMON_ENV_VARS,
+    DEFAULT_TRAINER_ENV_VARS,
+    cleanup_processes,
+    cleanup_threads,
+    monitor_process,
+    set_proc_title,
+)
 
 SFT_TOML = "sft.toml"
 SFT_SBATCH = "sft.sbatch"
@@ -21,9 +28,8 @@ SFT_SBATCH = "sft.sbatch"
 def write_config(config: SFTConfig, config_path: Path, exclude: set[str] | None = None) -> None:
     """Write resolved config to disk, excluding launcher-only fields."""
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_dict = config.model_dump(exclude=exclude, exclude_none=True, mode="json")
     with open(config_path, "wb") as f:
-        tomli_w.dump(config_dict, f)
+        tomli_w.dump(to_toml_dict(config, exclude=exclude), f)
 
 
 def write_slurm_script(config: SFTConfig, config_path: Path, script_path: Path) -> None:
@@ -35,6 +41,12 @@ def write_slurm_script(config: SFTConfig, config_path: Path, script_path: Path) 
 
     env = Environment(loader=FileSystemLoader(config.slurm.template_path.parent), keep_trailing_newline=True)
     template = env.get_template(config.slurm.template_path.name)
+
+    trainer_env_vars = {
+        **DEFAULT_COMMON_ENV_VARS,
+        **DEFAULT_TRAINER_ENV_VARS,
+        **config.env_vars,
+    }
 
     if config.deployment.type == "single_node":
         script = template.render(
@@ -48,6 +60,7 @@ def write_slurm_script(config: SFTConfig, config_path: Path, script_path: Path) 
             **config.slurm.template_vars,
             config_path=config_path,
             output_dir=config.output_dir,
+            trainer_env_vars=trainer_env_vars,
             num_nodes=config.deployment.num_nodes,
             gpus_per_node=config.deployment.gpus_per_node,
             ranks_filter=",".join(map(str, config.log.ranks_filter)),
@@ -143,8 +156,9 @@ def sft_local(config: SFTConfig):
                 trainer_cmd,
                 env={
                     **os.environ,
-                    "PYTHONUNBUFFERED": "1",
-                    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                    **DEFAULT_COMMON_ENV_VARS,
+                    **DEFAULT_TRAINER_ENV_VARS,
+                    **config.env_vars,
                 },
                 stdout=log_file,
                 stderr=log_file,

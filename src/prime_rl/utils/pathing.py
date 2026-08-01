@@ -1,5 +1,4 @@
 import asyncio
-import os
 import shutil
 import time
 from pathlib import Path
@@ -45,16 +44,16 @@ def format_log_message(
             log_lines.append(f"{i2}{'All nodes:':<{col - 1}}tail -F {log_dir}/inference/node_*.log")
     if train_env_names:
         env_log_dir = log_dir / "envs"
-        log_lines.append(f"{i1}{'Envs:':<{col}}tail -F {env_log_dir}/*/*/*.log")
-        log_lines.append(f"{i2}{'Train:':<{col - 1}}tail -F {env_log_dir}/train/*/*.log")
+        log_lines.append(f"{i1}{'Envs:':<{col}}tail -F {env_log_dir}/*/*.log")
+        log_lines.append(f"{i2}{'Train:':<{col - 1}}tail -F {env_log_dir}/train/*.log")
         for name in train_env_names:
             short = name if len(name) <= max_name else name[: max_name - 3] + "..."
-            log_lines.append(f"{i3}{f'{short}:':<{col - 2}}tail -F {env_log_dir}/train/{name}/*.log")
+            log_lines.append(f"{i3}{f'{short}:':<{col - 2}}tail -F {env_log_dir}/train/{name}.log")
         if eval_env_names:
-            log_lines.append(f"{i2}{'Eval:':<{col - 1}}tail -F {env_log_dir}/eval/*/*.log")
+            log_lines.append(f"{i2}{'Eval:':<{col - 1}}tail -F {env_log_dir}/eval/*.log")
             for name in eval_env_names:
                 short = name if len(name) <= max_name else name[: max_name - 3] + "..."
-                log_lines.append(f"{i3}{f'{short}:':<{col - 2}}tail -F {env_log_dir}/eval/{name}/*.log")
+                log_lines.append(f"{i3}{f'{short}:':<{col - 2}}tail -F {env_log_dir}/eval/{name}.log")
     return "Logs:\n" + "\n".join(log_lines)
 
 
@@ -72,6 +71,13 @@ def get_weights_dir(output_dir: Path) -> Path:
 
 def get_rollout_dir(output_dir: Path) -> Path:
     return output_dir / "rollouts"
+
+
+def get_trace_path(output_dir: Path, step: int, kind: str, subset: str) -> Path:
+    """Where one trace file lives: ``rollouts/step_{n}/{train,eval}/{all,effective}/traces.jsonl``.
+    ``all`` is appended per rollout the moment it completes; ``effective`` is written at once
+    per finalized train batch / eval epoch."""
+    return get_step_path(get_rollout_dir(output_dir), step) / kind / subset / "traces.jsonl"
 
 
 def get_eval_dir(output_dir: Path) -> Path:
@@ -151,7 +157,7 @@ def validate_output_dir(output_dir: Path, *, resuming: bool, clean: bool, ckpt_o
 
 
 def clean_future_steps(output_dir: Path, resume_step: int) -> None:
-    """Remove stale rollouts and broadcasts past ``resume_step``.
+    """Remove stale rollouts, broadcasts, and traces past ``resume_step``.
 
     Pass ``resume_step=-1`` to wipe every step directory (fresh runs).
     """
@@ -173,109 +179,29 @@ def clean_future_steps(output_dir: Path, resume_step: int) -> None:
             shutil.rmtree(get_step_path(directory, step))
 
 
-def durable_touch(path: Path) -> None:
-    """Create a marker file and force the marker plus newly-created parent dirs to disk."""
-    mkdir_fsync_targets = _missing_directory_fsync_targets(path.parent)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(f"{time.time_ns()}\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, path)
-
-    for directory in _dedupe_paths([path.parent, *mkdir_fsync_targets]):
-        try:
-            _fsync_directory(directory)
-        except OSError as e:
-            get_logger().warning(f"Could not fsync marker directory `{directory}` after creating `{path}`: {e}")
-
-
-def _missing_directory_fsync_targets(directory: Path) -> list[Path]:
-    targets: list[Path] = []
-    current = directory
-    while not current.exists():
-        parent = current.parent
-        targets.append(parent)
-        if parent == current:
-            break
-        current = parent
-    return targets
-
-
-def _dedupe_paths(paths: list[Path]) -> list[Path]:
-    deduped: list[Path] = []
-    seen: set[Path] = set()
-    for path in paths:
-        if path in seen:
-            continue
-        seen.add(path)
-        deduped.append(path)
-    return deduped
-
-
-def _fsync_directory(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _entry_named(directory: Path, name: str) -> Path | None:
-    try:
-        for entry in directory.iterdir():
-            if entry.name == name:
-                return entry
-    except (FileNotFoundError, NotADirectoryError):
-        return None
-    return None
-
-
-def _visible_path(path: Path) -> Path | None:
-    if path.exists():
-        return path
-
-    parent = path.parent
-    if parent == path:
-        return None
-    visible_parent = _visible_path(parent)
-    if visible_parent is None:
-        return None
-    return _entry_named(visible_parent, path.name)
-
-
-def _path_visible(path: Path) -> bool:
-    return _visible_path(path) is not None
-
-
-def sync_wait_for_path(path: Path, interval: float = 1, log_interval: float = 10) -> None:
+def sync_wait_for_path(path: Path, interval: int = 1, log_interval: int = 10) -> None:
     logger = get_logger()
-    start = time.perf_counter()
-    next_log_time = log_interval
+    wait_time = 0
     logger.debug(f"Waiting for path `{path}`")
     while True:
-        if _path_visible(path):
-            logger.debug(f"Found path `{path}` after {time.perf_counter() - start:.2f}s")
+        if path.exists():
+            logger.debug(f"Found path `{path}`")
             break
-        wait_time = time.perf_counter() - start
-        if wait_time >= next_log_time:
-            logger.debug(f"Waiting for path `{path}` for {wait_time:.2f} seconds")
-            next_log_time += log_interval
+        if wait_time % log_interval == 0 and wait_time > 0:  # Every log_interval seconds
+            logger.debug(f"Waiting for path `{path}` for {wait_time} seconds")
         time.sleep(interval)
+        wait_time += interval
 
 
-async def wait_for_path(path: Path, interval: float = 1, log_interval: float = 10) -> None:
+async def wait_for_path(path: Path, interval: int = 1, log_interval: int = 10) -> None:
     logger = get_logger()
-    start = time.perf_counter()
-    next_log_time = log_interval
+    wait_time = 0
     logger.debug(f"Waiting for path `{path}`")
     while True:
-        if _path_visible(path):
-            logger.debug(f"Found path `{path}` after {time.perf_counter() - start:.2f}s")
+        if path.exists():
+            logger.debug(f"Found path `{path}`")
             break
-        wait_time = time.perf_counter() - start
-        if wait_time >= next_log_time:
-            logger.debug(f"Waiting for path `{path}` for {wait_time:.2f} seconds")
-            next_log_time += log_interval
+        if wait_time % log_interval == 0 and wait_time > 0:  # Every log_interval seconds
+            logger.debug(f"Waiting for path `{path}` for {wait_time} seconds")
         await asyncio.sleep(interval)
+        wait_time += interval

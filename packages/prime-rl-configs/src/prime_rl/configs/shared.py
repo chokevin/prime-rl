@@ -2,9 +2,29 @@ import os
 from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
 
-from pydantic import Field, model_validator
+from pydantic import AfterValidator, Field, model_validator
 
 from prime_rl.utils.config import BaseConfig
+
+# Launcher-managed env vars that a component's `env_vars` must not set: GPU partitioning
+# and the single shared W&B run. The launcher always sets these last, so allowing them in
+# `env_vars` would be a silent no-op (or, on multi-node, a footgun) — reject them instead.
+PROTECTED_ENV_VARS = frozenset(
+    {"CUDA_VISIBLE_DEVICES", "WANDB_SHARED_MODE", "WANDB_SHARED_RUN_ID", "WANDB_SHARED_LABEL"}
+)
+
+
+def reject_protected_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
+    clobbered = sorted(PROTECTED_ENV_VARS & env_vars.keys())
+    if clobbered:
+        raise ValueError(
+            f"env_vars cannot set launcher-managed vars {clobbered} — set by the launcher, not overridable"
+        )
+    return env_vars
+
+
+EnvVars: TypeAlias = Annotated[dict[str, str], AfterValidator(reject_protected_env_vars)]
+"""A per-component `env_vars` mapping, validated to not clobber `PROTECTED_ENV_VARS`."""
 
 
 class SlurmConfig(BaseConfig):
@@ -35,6 +55,12 @@ class SlurmConfig(BaseConfig):
     pre_run_command: str | None = None
     """Shell command to run on the head node after cd, .env sourcing, and venv activation. Useful for cleanup like ``sudo pkill -f vllm``; wrap with ``srun bash -c '...'`` to fan out to all nodes."""
 
+    cleanup_grace_period: int = Field(3600, ge=0)
+    """Seconds to wait before tearing down a multi-node RL job that hit a non-zero exit, letting in-flight checkpoints flush. Set to 0 to tear down immediately."""
+
+    shared_fs: bool = True
+    """Whether the project filesystem (including the venv) is shared across nodes (e.g. NFS). When True, a single ``uv sync`` on the batch node suffices. Set to False when the venv is node-local (e.g. ``UV_PROJECT_ENVIRONMENT`` on ``/tmp``) so ``uv sync`` runs on every node via srun."""
+
     @property
     def template_vars(self) -> dict:
         """Common template variables for all SLURM templates."""
@@ -47,6 +73,8 @@ class SlurmConfig(BaseConfig):
             "account": self.account,
             "time": self.time,
             "pre_run_command": self.pre_run_command,
+            "cleanup_grace_period": self.cleanup_grace_period,
+            "shared_fs": self.shared_fs,
         }
 
     @model_validator(mode="after")
@@ -66,7 +94,7 @@ class VLMConfig(BaseConfig):
     """Dotted attribute path to the language model module (e.g. ``model.language_model``)."""
 
     freeze_vision_encoder: bool = True
-    """Freeze the vision encoder. When False, it is trainable and FSDP-sharded per-block. No effect with LoRA (LoRA freezes all non-adapter parameters)."""
+    """Freeze the vision encoder parameters during training."""
 
 
 class BaseModelConfig(BaseConfig):
@@ -78,10 +106,6 @@ class BaseModelConfig(BaseConfig):
 
     vlm: "VLMConfig | None" = None
     """VLM configuration. Setting this enables vision-language model support."""
-
-    @property
-    def is_vlm(self) -> bool:
-        return self.vlm is not None
 
 
 class ElasticConfig(BaseConfig):
@@ -96,12 +120,6 @@ class ElasticConfig(BaseConfig):
 
 
 class ClientConfig(BaseConfig):
-    timeout: int = 1200
-    """Request timeout in seconds."""
-
-    connect_timeout: float = 30.0
-    """TCP connect timeout in seconds for inference API requests."""
-
     wait_for_ready_timeout: int = 1800
     """Seconds to wait at startup for the inference pool to become ready. Applies to both the static health check and elastic DNS-based discovery."""
 
@@ -122,9 +140,6 @@ class ClientConfig(BaseConfig):
 
     skip_model_check: bool = False
     """Skip checking that the model is available in the inference pool. Useful for external APIs or keys that do not expose ``/models``."""
-
-    dp_rank_count: int = Field(1, ge=1)
-    """Number of data-parallel ranks behind each base URL. When > 1, each URL is expanded into ``dp_rank_count`` logical clients pinned via the ``X-data-parallel-rank`` header, so every request within a rollout hits the same DP engine and reuses KV cache. Auto-set from the inference config when using the RL entrypoint."""
 
     admin_base_url: list[str] | None = None
     """Separate base URLs for admin operations (weight updates, health checks). When set, admin clients bypass routers and hit each server directly — used in disaggregated P/D deployments where the router must not handle admin traffic."""
@@ -153,6 +168,9 @@ class LogConfig(BaseConfig):
 
     log_data: bool = False
     """Log the first data sample at startup."""
+
+    interval: float = Field(10.0, gt=0)
+    """Interval (seconds) for periodic logs across components."""
 
 
 class TrainerLogConfig(LogConfig):
@@ -198,6 +216,18 @@ class WandbConfig(BaseConfig):
 class WandbWithExtrasConfig(WandbConfig):
     log_extras: LogExtrasConfig | None = LogExtrasConfig()
     """Extras logging configuration. If None, no extras are logged."""
+
+
+class FileMonitorConfig(BaseConfig):
+    """Enable the local JSONL metric sink (``<output_dir>/metrics.jsonl``).
+
+    Present (non-None) enables it, mirroring the ``prime_monitor`` pattern. Metrics
+    are the same scalars sent to W&B; useful for self-hosted dashboards or when W&B
+    is disabled.
+    """
+
+    filename: str = "metrics.jsonl"
+    """Name of the JSONL file written under the component's ``output_dir``."""
 
 
 class PrimeMonitorConfig(BaseConfig):
@@ -254,45 +284,4 @@ class ZMQTransportConfig(BaseTransportConfig):
     """High-water mark (max in-flight messages per ZMQ socket)."""
 
 
-class RayTransportConfig(BaseTransportConfig):
-    """Configures Ray actor based transport for training examples."""
-
-    type: Literal["ray"] = "ray"
-    address: Annotated[
-        str | None,
-        Field(
-            description=(
-                "Ray cluster address used by trainer/orchestrator role workers. "
-                "Use 'auto' to attach to the active local cluster."
-            )
-        ),
-    ] = "auto"
-    namespace: Annotated[str, Field(description="Ray namespace for the shared transport actor.")] = "prime-rl"
-    actor_name: Annotated[str, Field(description="Name of the Ray actor that stores rollout batches.")] = (
-        "prime-rl-transport"
-    )
-    max_queued_items: Annotated[
-        int,
-        Field(
-            ge=1,
-            description=(
-                "Maximum queued training or micro-batch payloads per sender (per data_rank for "
-                "micro-batches, per sender_id for training batches) before senders fail with backpressure."
-            ),
-        ),
-    ] = 64
-    reclaim_stale_actor: Annotated[
-        bool,
-        Field(
-            description=(
-                "If true, the Ray-native launcher will kill any pre-existing transport actor with the "
-                "same actor_name/namespace before creating its own. Default false: fail loudly on collision. "
-                "Use only on dedicated/per-run RayClusters; on shared clusters, prefer unique actor_name."
-            ),
-        ),
-    ] = False
-
-
-TransportConfig: TypeAlias = Annotated[
-    FileSystemTransportConfig | ZMQTransportConfig | RayTransportConfig, Field(discriminator="type")
-]
+TransportConfig: TypeAlias = Annotated[FileSystemTransportConfig | ZMQTransportConfig, Field(discriminator="type")]
