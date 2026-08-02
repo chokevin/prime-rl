@@ -225,6 +225,37 @@ directory to find them.
 `identity_hash()` is unaffected by `freeze-finalize` (it only changes
 `baseline_mean_headroom_ok` and `created_at`, both excluded from the hash).
 
+## Artifact manifest
+
+Every exact filename any target writes, and the `storage.output` directory it lands
+under. Nothing here is discovered by listing a directory (see the note above and W1's
+storage proof) — fetch each by its exact name with `--artifact <file>`.
+
+| Target | `storage.output` | Exact artifact(s) | Purpose |
+|---|---|---|---|
+| `smoke` | `.../prime-rl-math-7b-h200/smoke` | *(directory)* `configs/*.toml`, `logs/*.log` | `rl --dry-run`'s own resolved-config dump; verify via `tau run logs`/`status`, not `--artifact` (see above) |
+| `freeze-manifest` | `.../prime-rl-math-7b-h200/manifest` | `draft-manifest.json`, `frozen-eval-manifest.json` | unfrozen draft (pass 1) and the immutable frozen manifest (pass 2) `tau/eval_tools/manifest.py` reads/writes |
+| `eval-baseline` | `.../prime-rl-math-7b-h200/eval-baseline` | `rewards.json`, `inference.log` | baseline per-example rewards (`RewardRecord`) `tau/eval_tools/compare.py` consumes |
+| `eval-post` | `.../prime-rl-math-7b-h200/eval-post` | `rewards.json`, `comparison.json`, `inference.log` | post-training rewards + the `ComparisonResult` (delta, bootstrap CI, pass/fail) |
+| `train` | `.../prime-rl-math-7b-h200/train` | `configs/*.toml`, `logs/{trainer,orchestrator,inference}.log`, `checkpoints/step_N/`, `weights/step_N/adapter/`, `metrics.jsonl` | prime-rl's own `rl` entrypoint layout (see `docs/training.md`) — `weights/step_N/adapter/` is what `eval-post.yaml`'s `PRIME_RL_LORA_ADAPTER_PATH` must point at |
+
+Explicit-file fetch while the run's Workload/Job still exists (the proven, reliable path):
+
+```bash
+tau run get <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admin \
+  --artifact rewards.json
+```
+
+Fallback once the Job/Workload has been deleted (`tau run get <job-name>` then has
+nothing to resolve the recorded output path from) — explicit `--path` plus `--pvc`,
+proven by W1's storage probe after its Job was cancelled:
+
+```bash
+tau run get <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admin \
+  --path /data/pretraining-data/prime-rl-math-7b-h200/eval-post/rewards.json \
+  --pvc blob-training
+```
+
 ## Operator commands
 
 **Before every submit:** replace `REPLACE_WITH_EXACT_COMMIT_SHA` in the target's
