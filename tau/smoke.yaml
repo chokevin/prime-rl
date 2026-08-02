@@ -1,0 +1,40 @@
+# CPU-only config smoke test: `tau run smoke`.
+#
+# Validates the full 7B training TOML (model/renderer/LoRA/taskset/eval wiring) via
+# `uv run rl --dry-run`, which resolves + validates the merged config and writes
+# per-process TOMLs under $TAU_OUTPUT_DIR/configs/ without starting the trainer,
+# orchestrator, inference server, or downloading the model. No GPU, no H200 node
+# selector — see tau/README.md's proof ladder for why this target intentionally omits
+# them (this cluster's only proven ResourceFlavor is the H200 series; this target is a
+# `tau run validate` / `--dry-run=client` check, not meant to actually be scheduled
+# without also picking a real CPU-capable node selector for this cluster).
+name: prime-rl-math-7b-h200-smoke
+engine: job
+entrypoint: scripts/run-prime-rl.sh
+
+runtime:
+  image: RENDER_REQUIRED__see_tau/render_image.py
+  env:
+    WANDB_MODE: offline
+    PRIME_RL_RUN_MODE: smoke
+    PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
+    # Operator must set this to the exact commit being validated before submitting —
+    # see tau/README.md's "Before every submit" step. Never leave this pointing at a
+    # branch name: the overlay fetch verifies an exact SHA.
+    PRIME_RL_REPO_SHA: REPLACE_WITH_EXACT_COMMIT_SHA
+    PRIME_RL_CONFIG_REL: configs/tau/math-7b-h200/train.toml
+
+compute:
+  gpus: 0
+  cpu_request: "2"
+  cpu_limit: "4"
+  memory_request: 4Gi
+  memory_limit: 8Gi
+
+policy:
+  workspace: pretraining-data
+  queue: jobqueue
+
+storage:
+  data_pvc: blob-training
+  output: /data/pretraining-data/prime-rl-math-7b-h200/smoke

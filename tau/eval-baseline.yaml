@@ -1,0 +1,49 @@
+# 1 H200: frozen-eval baseline replay: `tau run eval-baseline`.
+#
+# Starts a bare `uv run inference` server for the un-fine-tuned base model, replays the
+# frozen (or draft, for the very first pre-freeze measurement) eval manifest against it,
+# and writes rewards.json under this target's own output directory. See
+# tau/eval-post.yaml for the paired post-training run and comparison.
+#
+# PRIME_RL_MANIFEST_PATH starts pointed at draft-manifest.json for the very first
+# baseline measurement (used to decide whether this tuple is even eligible to freeze —
+# see tau/freeze-manifest.yaml). Because FrozenEvalManifest.identity_hash() excludes
+# `baseline_mean_headroom_ok` and `created_at`, this same rewards.json stays valid for
+# the paired comparison after freeze-finalize writes frozen-eval-manifest.json — the
+# baseline eval does not need to be re-run post-freeze.
+name: prime-rl-math-7b-h200-eval-baseline
+engine: job
+entrypoint: scripts/run-prime-rl.sh
+
+runtime:
+  image: RENDER_REQUIRED__see_tau/render_image.py
+  env:
+    WANDB_MODE: offline
+    PRIME_RL_RUN_MODE: eval
+    PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
+    PRIME_RL_REPO_SHA: REPLACE_WITH_EXACT_COMMIT_SHA
+    PRIME_RL_MODEL_NAME: Qwen/Qwen2.5-7B-Instruct
+    PRIME_RL_EVAL_LABEL: baseline
+    PRIME_RL_MANIFEST_PATH: /data/pretraining-data/prime-rl-math-7b-h200/manifest/draft-manifest.json
+    PRIME_RL_BASELINE_REWARDS_PATH: /data/pretraining-data/prime-rl-math-7b-h200/eval-baseline/rewards.json
+    PRIME_RL_HEALTH_TIMEOUT_S: "1800"
+    HF_HOME: /data/pretraining-data/prime-rl-math-7b-h200/hf-cache
+
+compute:
+  gpus: 1
+  cpu_request: "8"
+  cpu_limit: "16"
+  memory_request: 64Gi
+  memory_limit: 128Gi
+
+policy:
+  workspace: pretraining-data
+  queue: jobqueue
+  topology: single-node-nvlink
+  node_selector:
+    agentpool: h200pool
+    kueue.azure.com/gpu-series: nd-h200-v5
+
+storage:
+  data_pvc: blob-training
+  output: /data/pretraining-data/prime-rl-math-7b-h200/eval-baseline

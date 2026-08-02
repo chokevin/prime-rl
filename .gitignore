@@ -203,4 +203,8 @@ debug_I2_zero_band
 
 outputs/
 
+# Rendered Tau configs (real image digest substituted in) -- never commit these, the
+# digest lives in tau/image.pin.json and templates are rendered on demand.
+tau/.rendered/
+
 third_party/

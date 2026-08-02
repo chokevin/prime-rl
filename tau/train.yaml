@@ -1,0 +1,49 @@
+# 2 H200 (1 trainer + 1 inference): bounded RL training: `tau run train`.
+#
+# Runs configs/tau/math-7b-h200/train.toml via prime-rl's `rl` entrypoint, which
+# supervises the trainer, orchestrator, and inference server as one process group.
+# Refuses to start (tau/scripts/run-prime-rl.sh's `train` mode) unless
+# tau/freeze-manifest.yaml has already written frozen-eval-manifest.json — the
+# in-training startup/periodic/final eval against math500-v1 (configured in the TOML)
+# is a monitoring signal only; the frozen manifest is what tau/eval-baseline.yaml and
+# tau/eval-post.yaml replay for the paired comparison that is the actual hill-climb
+# proof.
+#
+# PRIME_RL_MAX_STEPS overrides the TOML's placeholder max_steps once real H200
+# throughput is measured (see tau/README.md's proof ladder) — leave unset to use the
+# TOML's own value for an initial smoke-sized run.
+name: prime-rl-math-7b-h200-train
+engine: job
+entrypoint: scripts/run-prime-rl.sh
+
+runtime:
+  image: RENDER_REQUIRED__see_tau/render_image.py
+  env:
+    WANDB_MODE: offline
+    PRIME_RL_RUN_MODE: train
+    PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
+    PRIME_RL_REPO_SHA: REPLACE_WITH_EXACT_COMMIT_SHA
+    PRIME_RL_CONFIG_REL: configs/tau/math-7b-h200/train.toml
+    PRIME_RL_MANIFEST_DIR: /data/pretraining-data/prime-rl-math-7b-h200/manifest
+    HF_HOME: /data/pretraining-data/prime-rl-math-7b-h200/hf-cache
+    # PRIME_RL_MAX_STEPS: "50"
+    # PRIME_RL_CLEAN_OUTPUT_DIR: "1"
+
+compute:
+  gpus: 2
+  cpu_request: "16"
+  cpu_limit: "32"
+  memory_request: 128Gi
+  memory_limit: 256Gi
+
+policy:
+  workspace: pretraining-data
+  queue: jobqueue
+  topology: single-node-nvlink
+  node_selector:
+    agentpool: h200pool
+    kueue.azure.com/gpu-series: nd-h200-v5
+
+storage:
+  data_pvc: blob-training
+  output: /data/pretraining-data/prime-rl-math-7b-h200/train

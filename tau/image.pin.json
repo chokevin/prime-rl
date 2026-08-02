@@ -1,0 +1,11 @@
+{
+  "_comment": "Immutable base image pin for the Tau targets in this directory. Resolved from the public ghcr.io/primeintellect-ai/prime-rl registry (see resolution_command). Never hand-edit digest/source_commit to a placeholder or 'latest' -- tau/render_image.py refuses to render templates from a malformed pin file.",
+  "image_repo": "ghcr.io/primeintellect-ai/prime-rl",
+  "digest": "sha256:d701d000174052a70ad060197e71915e83e0f2b1fedef956c60b3038cf2b992f",
+  "amd64_manifest_digest": "sha256:f31a04ff019c9a2e1fe749c50d793866fbf6284dd60d619daed1dcee6976dccf",
+  "source_commit": "bbb90a1b4",
+  "resolved_from_tag": "commit-bbb90a1b4",
+  "resolved_at": "2026-08-02T22:20:30Z",
+  "notes": "commit-bbb90a1b4 is the upstream commit this branch's parent sync commit (cddc430f2, 'chore: sync fork to upstream main') was synced from -- the base image's baked /app source tree matches this repo's HEAD tree modulo the tau/ and configs/tau/ additions made on this branch. H200 nodes are linux/amd64 (Standard_ND96isr_H200_v5); the multi-arch index digest resolves the correct platform automatically, amd64_manifest_digest is recorded for manual cross-checking only.",
+  "resolution_command": "TOKEN=$(curl -s 'https://ghcr.io/token?service=ghcr.io&scope=repository:primeintellect-ai/prime-rl:pull' | python3 -c \"import sys,json;print(json.load(sys.stdin)['token'])\"); curl -sI -H \"Authorization: Bearer $TOKEN\" -H 'Accept: application/vnd.oci.image.index.v1+json' 'https://ghcr.io/v2/primeintellect-ai/prime-rl/manifests/commit-bbb90a1b4' | grep -i docker-content-digest"
+}
