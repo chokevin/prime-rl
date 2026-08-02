@@ -21,6 +21,7 @@ EXPECTED_FIELDS: Mapping[SourceKind, frozenset[str]] = {
     "math": frozenset({"problem", "level", "type", "solution"}),
     "aime": frozenset({"problem", "answer"}),
 }
+VERIFIED_SOURCE_LICENSES = frozenset({"MIT", "CC-BY-NC-SA-4.0"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +166,8 @@ def source_manifest_from_dict(raw: Mapping[str, Any]) -> SourceManifest:
         for key in required_strings:
             if not isinstance(raw_source.get(key), str) or not raw_source[key]:
                 raise TypeError(f"source field {key!r} must be a non-empty string")
+        if raw_source["license"] not in VERIFIED_SOURCE_LICENSES:
+            raise ValueError(f"active source {raw_source['id']!r} has unverified license {raw_source['license']!r}")
         revision = raw_source["revision"]
         if len(revision) != 40 or any(char not in "0123456789abcdef" for char in revision):
             raise ValueError(f"source revision must be a full lowercase commit SHA, got {revision!r}")

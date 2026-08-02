@@ -16,7 +16,7 @@ def source_manifest() -> SourceManifest:
                     "kind": "math",
                     "dataset": "fixture/math",
                     "revision": "a" * 40,
-                    "license": "mit",
+                    "license": "MIT",
                     "attribution": "Fixture rows for offline tests.",
                     "fields": ["problem", "level", "type", "solution"],
                     "partitions": {"train": "train", "eval": "test"},

@@ -111,34 +111,6 @@
       ]
     },
     {
-      "id": "aime_2024",
-      "kind": "aime",
-      "dataset": "HuggingFaceH4/aime_2024",
-      "revision": "2fe88a2f1091d5048c0f36abc874fb997b3dd99a",
-      "license": "No license declared in the pinned dataset card",
-      "attribution": "AIME 2024 I/II; public mirror derived from AI-MO/aimo-validation-aime. This package loads the mirror at runtime and does not redistribute rows.",
-      "fields": [
-        "id",
-        "problem",
-        "solution",
-        "answer",
-        "url",
-        "year"
-      ],
-      "partitions": {
-        "eval": "train"
-      },
-      "configs": [
-        {
-          "name": "default",
-          "counts": {
-            "train": 30
-          }
-        }
-      ],
-      "excluded_rows": []
-    },
-    {
       "id": "aime_2025",
       "kind": "aime",
       "dataset": "MathArena/aime_2025",
@@ -165,5 +137,22 @@
       "excluded_rows": []
     }
   ],
-  "blocked_sources": []
+  "blocked_sources": [
+    {
+      "id": "aime_2024",
+      "dataset": "HuggingFaceH4/aime_2024",
+      "revision": "2fe88a2f1091d5048c0f36abc874fb997b3dd99a",
+      "verified_schema": [
+        "id",
+        "problem",
+        "solution",
+        "answer",
+        "url",
+        "year"
+      ],
+      "verified_split": "train",
+      "verified_count": 30,
+      "reason": "The pinned dataset card declares no license. The upstream mirror's self-declared license does not verify rights to the original AIME problem text."
+    }
+  ]
 }

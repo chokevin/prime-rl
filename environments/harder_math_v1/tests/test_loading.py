@@ -117,12 +117,19 @@ def test_packaged_manifest_has_verified_source_pins_licenses_and_exclusions() ->
     assert sum(config.counts["train"] for config in source.configs) == 7500
     assert sum(config.counts["test"] for config in source.configs) == 5000
     assert len(source.excluded_rows) == 5
-    assert sources["aime_2024"].revision == "2fe88a2f1091d5048c0f36abc874fb997b3dd99a"
-    assert sources["aime_2024"].license == "No license declared in the pinned dataset card"
+    assert "aime_2024" not in sources
     assert sources["aime_2025"].revision == "c94da77eb22bbd6439e62a323bec18493a421302"
     assert sources["aime_2025"].license == "CC-BY-NC-SA-4.0"
-    assert manifest.blocked_sources == ()
+    assert [entry["id"] for entry in manifest.blocked_sources] == ["aime_2024"]
     assert Path(__file__).parents[1].joinpath("harder_math_v1/schemas/tier_curve.v1.json").is_file()
+
+
+def test_active_source_requires_verified_license(source_manifest) -> None:
+    raw = copy.deepcopy(source_manifest.raw)
+    raw["sources"][0]["license"] = "No license declared"
+
+    with pytest.raises(ValueError, match="has unverified license"):
+        source_manifest_from_dict(raw)
 
 
 def test_aime_fixture_normalization_is_eval_only_hard() -> None:

@@ -20,20 +20,18 @@ are excluded: two have no Level 1-5 tier, two have empty boxed gold answers,
 and one duplicates a published test problem. Any excluded-row drift fails
 loading.
 
-The evaluation-only hard tier also loads two verified public mirrors:
+The evaluation-only hard tier also loads
+[`MathArena/aime_2025`](https://huggingface.co/datasets/MathArena/aime_2025)
+at `c94da77eb22bbd6439e62a323bec18493a421302` (30 rows). Its pinned
+card declares CC BY-NC-SA 4.0, attributes the dataset to MathArena, and states
+that its AIME 2025 questions were extracted, converted to LaTeX, and verified.
+The upstream split happens to be named `train`, but the source is mapped only
+to this package's `eval` partition and can never enter RL training.
 
-- [`HuggingFaceH4/aime_2024`](https://huggingface.co/datasets/HuggingFaceH4/aime_2024)
-  at `2fe88a2f1091d5048c0f36abc874fb997b3dd99a` (30 rows). The
-  pinned card declares no license and attributes its AIME 2024 I/II rows to
-  `AI-MO/aimo-validation-aime`. Use is subject to source terms; this package
-  performs runtime loading and does not redistribute the problem text.
-- [`MathArena/aime_2025`](https://huggingface.co/datasets/MathArena/aime_2025)
-  at `c94da77eb22bbd6439e62a323bec18493a421302` (30 rows). Its pinned
-  card declares CC BY-NC-SA 4.0, attributes the dataset to MathArena, and states
-  that the questions were extracted, converted to LaTeX, and verified.
-
-Both upstream splits happen to be named `train`, but these sources are mapped
-only to this package's `eval` partition and can never enter RL training.
+The pinned `HuggingFaceH4/aime_2024` revision, schema, and count were verified,
+but its dataset card declares no license. It is recorded under
+`blocked_sources` and is not loaded rather than guessing that a mirror license
+applies to the original AIME problem text.
 
 ## Taskset contract
 
@@ -43,7 +41,7 @@ The distribution and taskset ID are `harder-math-v1`; the import package is
 | Config | Upstream rows | Included difficulty |
 |---|---|---|
 | `partition = "train"` | MATH `train` only (7,495 eligible rows) | RL-eligible |
-| `partition = "eval"` | MATH `test` + AIME 2024/2025 (5,060 rows) | Evaluation-only |
+| `partition = "eval"` | MATH `test` + AIME 2025 (5,030 rows) | Evaluation-only |
 | `tier = "base"` | Either partition | Levels 1-2 |
 | `tier = "core"` | Either partition | Levels 3-4 |
 | `tier = "hard"` | MATH Level 5; eval also includes AIME | Highest tier |
@@ -85,7 +83,7 @@ fallback.
 ## Cache and offline use
 
 The first load needs Hugging Face access to populate the `datasets` cache.
-Prewarm all three active pinned revisions before a disconnected run. Set
+Prewarm both active pinned revisions before a disconnected run. Set
 `HF_HUB_OFFLINE=1` and `HF_DATASETS_OFFLINE=1` to force cache-only replay;
 missing cache entries or source/schema/count drift fail loudly.
 
