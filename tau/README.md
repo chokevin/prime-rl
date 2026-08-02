@@ -185,6 +185,8 @@ python3 tau/render_image.py
 # 1. Build the draft manifest (CPU-only) — proves train/eval disjointness up front.
 #    (PRIME_RL_RUN_MODE=freeze-draft is the default in the committed YAML.)
 tau run --config tau/.rendered/freeze-manifest.yaml --context aks-ai-runtime-eastus2-admin
+tau run get prime-rl-math-7b-h200-freeze-manifest -n pretraining-data \
+  --context aks-ai-runtime-eastus2-admin --artifact draft-manifest.json
 
 # 2. Measure the baseline against the draft manifest (1 GPU).
 tau run --config tau/.rendered/eval-baseline.yaml --context aks-ai-runtime-eastus2-admin
@@ -196,6 +198,8 @@ tau run get prime-rl-math-7b-h200-eval-baseline -n pretraining-data \
 #    then re-render).
 python3 tau/render_image.py
 tau run --config tau/.rendered/freeze-manifest.yaml --context aks-ai-runtime-eastus2-admin
+tau run get prime-rl-math-7b-h200-freeze-manifest -n pretraining-data \
+  --context aks-ai-runtime-eastus2-admin --artifact frozen-eval-manifest.json
 
 # 4. Train (2 GPU) — the wrapper refuses to start without frozen-eval-manifest.json.
 tau run --config tau/.rendered/train.yaml --context aks-ai-runtime-eastus2-admin
@@ -204,8 +208,18 @@ tau run --config tau/.rendered/train.yaml --context aks-ai-runtime-eastus2-admin
 #    PRIME_RL_LORA_ADAPTER_PATH to the trained checkpoint step, re-render, then:
 tau run --config tau/.rendered/eval-post.yaml --context aks-ai-runtime-eastus2-admin
 tau run get prime-rl-math-7b-h200-eval-post -n pretraining-data \
+  --context aks-ai-runtime-eastus2-admin --artifact rewards.json
+tau run get prime-rl-math-7b-h200-eval-post -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact comparison.json
 ```
+
+Every fetch above names an explicit `--artifact <file>` rather than listing the output
+directory: W1's storage proof found directory listing on `blob-training` unreliable
+(exact-file write/fetch/re-fetch passed; listing did not), so every script in this
+implementation writes its results to a fixed, predictable filename inside its own
+`storage.output` (`draft-manifest.json`, `frozen-eval-manifest.json`, `rewards.json`,
+`comparison.json`, `inference.log`) specifically so callers never have to list a
+directory to find them.
 
 `eval-baseline`'s rewards stay valid after freezing without a rerun:
 `identity_hash()` is unaffected by `freeze-finalize` (it only changes
@@ -237,10 +251,19 @@ Submit / monitor / fetch / cancel:
 tau run --config tau/.rendered/<target>.yaml --context aks-ai-runtime-eastus2-admin
 tau run status <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admin --watch
 tau run logs <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admin -f
-tau run get <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admin
-tau run get <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admin --artifact rewards.json
+tau run get <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admin --artifact <name>
 tau run cancel <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admin
 ```
+
+Always pass `--artifact <name>` — W1's storage proof on `blob-training` found exact-file
+write/fetch/re-fetch reliable but directory listing (the no-`--artifact` form of
+`tau run get`) unreliable. Every script here writes to a fixed, known filename per
+target (see the proof ladder above for the exact names: `draft-manifest.json`,
+`frozen-eval-manifest.json`, `rewards.json`, `comparison.json`), so no command in this
+doc ever needs to list a directory to find its output. The one exception is `smoke`,
+which writes a *directory* of per-process resolved TOMLs (`rl --dry-run`'s own
+behavior, not this repo's choice) — verify it via `tau run logs`/`tau run status`
+instead of fetching an artifact (the wrapper logs `smoke OK: ...` on success).
 
 `<job-name>` equals each YAML's `name:` field (`prime-rl-math-7b-h200-{smoke,freeze-manifest,eval-baseline,eval-post,train}`).
 Never submit the bare `tau/<target>.yaml` template directly — it still carries the
