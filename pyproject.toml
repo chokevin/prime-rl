@@ -123,11 +123,11 @@ override-dependencies = [
     "openenv-core",
 ]
 
-# Environment packages (research-environments + verifiers) are auto-discovered as
-# workspace members, so new envs need no per-package registration. Install them
-# with `uv sync --all-packages`.
+# Environment packages (repo-local, research-environments, and verifiers) are
+# auto-discovered as workspace members. Install them with `uv sync --all-packages`.
 [tool.uv.workspace]
 members = [
+    "environments/*",
     "deps/research-environments/environments/*/*",
     "deps/verifiers/environments/*",
 ]

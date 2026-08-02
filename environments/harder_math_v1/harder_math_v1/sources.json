@@ -1,0 +1,169 @@
+{
+  "schema_version": "harder-math-source-manifest.v1",
+  "sources": [
+    {
+      "id": "hendrycks_math",
+      "kind": "math",
+      "dataset": "EleutherAI/hendrycks_math",
+      "revision": "21a5633873b6a120296cce3e2df9d5550074f4a3",
+      "license": "MIT",
+      "attribution": "Hendrycks et al., Measuring Mathematical Problem Solving With the MATH Dataset (NeurIPS 2021); https://github.com/hendrycks/math",
+      "fields": [
+        "problem",
+        "level",
+        "type",
+        "solution"
+      ],
+      "partitions": {
+        "train": "train",
+        "eval": "test"
+      },
+      "configs": [
+        {
+          "name": "algebra",
+          "counts": {
+            "train": 1744,
+            "test": 1187
+          }
+        },
+        {
+          "name": "counting_and_probability",
+          "counts": {
+            "train": 771,
+            "test": 474
+          }
+        },
+        {
+          "name": "geometry",
+          "counts": {
+            "train": 870,
+            "test": 479
+          }
+        },
+        {
+          "name": "intermediate_algebra",
+          "counts": {
+            "train": 1295,
+            "test": 903
+          }
+        },
+        {
+          "name": "number_theory",
+          "counts": {
+            "train": 869,
+            "test": 540
+          }
+        },
+        {
+          "name": "prealgebra",
+          "counts": {
+            "train": 1205,
+            "test": 871
+          }
+        },
+        {
+          "name": "precalculus",
+          "counts": {
+            "train": 746,
+            "test": 546
+          }
+        }
+      ],
+      "excluded_rows": [
+        {
+          "config": "geometry",
+          "upstream_split": "train",
+          "upstream_index": 258,
+          "source_sha256": "cec25e04812379824d0c6179de472af8fd2afd96ea1d319fab3c90bab47ea891",
+          "level": "Level ?",
+          "reason": "The pinned row has no supported Level 1-5 tier."
+        },
+        {
+          "config": "geometry",
+          "upstream_split": "train",
+          "upstream_index": 317,
+          "source_sha256": "8ea9adb8bea1ef00d639b1dbb511861b184620da9c998df59fcd04b21e9b2519",
+          "level": "Level ?",
+          "reason": "The pinned row has no supported Level 1-5 tier."
+        },
+        {
+          "config": "geometry",
+          "upstream_split": "train",
+          "upstream_index": 433,
+          "source_sha256": "99c855104d48fe4f1969cccc6896355b0fc58ba68b40b8c3f479e21ddcaaf8c6",
+          "content_sha256": "42a1c1967e2b9372a621279448233714ef9e954e3c3899ba1fae37243012e074",
+          "reason": "Exact prompt/gold duplicate of precalculus test index 202; retain only the published evaluation row."
+        },
+        {
+          "config": "number_theory",
+          "upstream_split": "train",
+          "upstream_index": 661,
+          "source_sha256": "be783869e840a98880c3a3f69d6f55369a43c1bb99137ad41fbf0a4966e8bd0a",
+          "reason": "The pinned solution has an empty boxed answer, so no gold can be extracted without guessing."
+        },
+        {
+          "config": "number_theory",
+          "upstream_split": "train",
+          "upstream_index": 663,
+          "source_sha256": "0f4cf8fa238e4932b28321da3e5702e00d2f69df007bf491f44c54a304f216cb",
+          "reason": "The pinned solution has an empty boxed answer, so no gold can be extracted without guessing."
+        }
+      ]
+    },
+    {
+      "id": "aime_2024",
+      "kind": "aime",
+      "dataset": "HuggingFaceH4/aime_2024",
+      "revision": "2fe88a2f1091d5048c0f36abc874fb997b3dd99a",
+      "license": "No license declared in the pinned dataset card",
+      "attribution": "AIME 2024 I/II; public mirror derived from AI-MO/aimo-validation-aime. This package loads the mirror at runtime and does not redistribute rows.",
+      "fields": [
+        "id",
+        "problem",
+        "solution",
+        "answer",
+        "url",
+        "year"
+      ],
+      "partitions": {
+        "eval": "train"
+      },
+      "configs": [
+        {
+          "name": "default",
+          "counts": {
+            "train": 30
+          }
+        }
+      ],
+      "excluded_rows": []
+    },
+    {
+      "id": "aime_2025",
+      "kind": "aime",
+      "dataset": "MathArena/aime_2025",
+      "revision": "c94da77eb22bbd6439e62a323bec18493a421302",
+      "license": "CC-BY-NC-SA-4.0",
+      "attribution": "MathArena AIME 2025 dataset; https://matharena.ai/; Dekoninck et al., Beyond Benchmarks: MathArena as an Evaluation Platform for Mathematics with LLMs (2026).",
+      "fields": [
+        "problem_idx",
+        "problem",
+        "answer",
+        "problem_type"
+      ],
+      "partitions": {
+        "eval": "train"
+      },
+      "configs": [
+        {
+          "name": "default",
+          "counts": {
+            "train": 30
+          }
+        }
+      ],
+      "excluded_rows": []
+    }
+  ],
+  "blocked_sources": []
+}

@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://primeintellect.ai/schemas/tier-curve.v1.json",
+  "title": "Harder Math Tier Curve v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "package_name",
+    "package_version",
+    "package_commit",
+    "catalog_digest",
+    "source_manifest_digest",
+    "source_revisions",
+    "model",
+    "model_revision",
+    "decoding",
+    "renderer",
+    "grader",
+    "taskset_config",
+    "settings_digest",
+    "ordered_records",
+    "tiers",
+    "base_minus_hard",
+    "hardness_gate"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "tier-curve.v1"
+    },
+    "package_name": {
+      "const": "harder-math-v1"
+    },
+    "package_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "package_commit": {
+      "type": "string",
+      "minLength": 1
+    },
+    "catalog_digest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "source_manifest_digest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "source_revisions": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{40}$"
+      }
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model_revision": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decoding": {
+      "type": "object"
+    },
+    "renderer": {
+      "type": "object"
+    },
+    "grader": {
+      "type": "object"
+    },
+    "taskset_config": {
+      "type": "object"
+    },
+    "settings_digest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "ordered_records": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "$ref": "#/$defs/record"
+      }
+    },
+    "tiers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "base",
+        "core",
+        "hard"
+      ],
+      "properties": {
+        "base": {
+          "$ref": "#/$defs/tier"
+        },
+        "core": {
+          "$ref": "#/$defs/tier"
+        },
+        "hard": {
+          "$ref": "#/$defs/tier"
+        }
+      }
+    },
+    "base_minus_hard": {
+      "type": "number",
+      "minimum": -1,
+      "maximum": 1
+    },
+    "hardness_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["threshold", "passed"],
+      "properties": {
+        "threshold": {
+          "const": 0.15
+        },
+        "passed": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_id",
+        "content_sha256",
+        "partition",
+        "tier",
+        "reward",
+        "failure"
+      ],
+      "properties": {
+        "record_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "content_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "partition": {
+          "const": "eval"
+        },
+        "tier": {
+          "enum": [
+            "base",
+            "core",
+            "hard"
+          ]
+        },
+        "reward": {
+          "enum": [
+            0.0,
+            1.0
+          ]
+        },
+        "failure": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "tier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count",
+        "mean",
+        "confidence_interval_95",
+        "failures"
+      ],
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mean": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "confidence_interval_95": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          ],
+          "items": false
+        },
+        "failures": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}
