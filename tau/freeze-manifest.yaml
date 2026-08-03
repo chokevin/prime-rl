@@ -1,8 +1,9 @@
 # Freeze (or draft) the held-out eval manifest: `tau run freeze-manifest`.
 #
-# CPU-only: securely materializes the exact model and training dataset as regular files,
-# records full file/content and ordered ID/prompt/answer identities, loads all math500-v1
-# rows, proves zero train/eval overlap, and writes the manifest that train strictly validates.
+# CPU-only on W1-proven system nodes: securely materializes the exact model and training
+# dataset as regular files, records full file/content and ordered ID/prompt/answer
+# identities, loads all math500-v1 rows, proves zero train/eval overlap, and writes the
+# manifest that train strictly validates. It requests zero GPUs and no H200 placement.
 #
 # Two-phase (see tau/eval_tools/live/freeze_manifest_live.py's docstring): run once with
 # PRIME_RL_RUN_MODE=freeze-draft, measure the baseline mean via tau/eval-baseline.yaml against
@@ -41,6 +42,9 @@ compute:
 policy:
   workspace: pretraining-data
   queue: jobqueue
+  topology: independent
+  node_selector:
+    kubernetes.azure.com/mode: system
 
 storage:
   data_pvc: blob-training

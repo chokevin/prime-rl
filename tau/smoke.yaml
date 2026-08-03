@@ -3,11 +3,8 @@
 # Validates the full 7B training TOML (model/renderer/LoRA/taskset/eval wiring) via
 # `uv run rl --dry-run`, which resolves + validates the merged config and writes
 # per-process TOMLs under $TAU_OUTPUT_DIR/configs/ without starting the trainer,
-# orchestrator, inference server, or downloading the model. No GPU, no H200 node
-# selector — see tau/README.md's proof ladder for why this target intentionally omits
-# them (this cluster's only proven ResourceFlavor is the H200 series; this target is a
-# `tau run validate` / `--dry-run=client` check, not meant to actually be scheduled
-# without also picking a real CPU-capable node selector for this cluster).
+# orchestrator, inference server, or downloading the model. It requests zero GPUs and
+# uses the W1-proven independent placement on system CPU nodes, with no H200 selector.
 name: prime-rl-math-7b-h200-smoke
 engine: job
 entrypoint: scripts/run-prime-rl.sh
@@ -36,6 +33,9 @@ compute:
 policy:
   workspace: pretraining-data
   queue: jobqueue
+  topology: independent
+  node_selector:
+    kubernetes.azure.com/mode: system
 
 storage:
   data_pvc: blob-training

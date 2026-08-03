@@ -15,8 +15,8 @@ scope was static config/scripts/tests only — see the parent `/goal` plan's W4b
 tau/
   image.pin.json        # single source of truth for the pinned image digest
   render_image.py        # substitutes the digest into tau/*.yaml -> tau/.rendered/ (gitignored)
-  smoke.yaml            # CPU-only config validation (`tau run smoke`)
-  freeze-manifest.yaml  # CPU-only: build/finalize the frozen eval manifest (`tau run freeze-manifest`)
+  smoke.yaml            # system-CPU config validation, zero GPU (`tau run smoke`)
+  freeze-manifest.yaml  # system CPU, zero GPU: build/finalize the frozen eval manifest
   eval-baseline.yaml    # 1 H200: frozen-eval replay against the base model (`tau run eval-baseline`)
   eval-post.yaml        # 1 H200: frozen-eval replay against base+LoRA, then compare (`tau run eval-post`)
   train.yaml            # 2 H200 (1 trainer + 1 inference): bounded RL training (`tau run train`)
@@ -52,10 +52,13 @@ pretraining-data` explicitly instead (see the W1 Tau/cluster memo).
 ## Cluster contract this assumes (from W1)
 
 `TauWorkspace/pretraining-data` → namespace `pretraining-data`, `LocalQueue/jobqueue`,
-`PVC/blob-training` mounted at `/data`, output root `/data/pretraining-data`, H200
-node selectors `agentpool=h200pool` + `kueue.azure.com/gpu-series=nd-h200-v5`,
+`PVC/blob-training` mounted at `/data`, and output root `/data/pretraining-data`.
+The zero-GPU smoke and manifest targets use the W1-proven `policy.topology:
+independent` with `kubernetes.azure.com/mode=system`, admitting on system CPU
+nodes without H200 selectors or tolerations. GPU targets use H200 node selectors
+`agentpool=h200pool` + `kueue.azure.com/gpu-series=nd-h200-v5` and
 `policy.topology: single-node-nvlink` (required — the H200 `ResourceFlavor` is
-TAS-only), 2 GPUs for training / 1 for eval.
+TAS-only), with 2 GPUs for training / 1 for eval.
 
 ## Image and overlay strategy
 
@@ -241,13 +244,13 @@ validation and entrypoint mirroring cannot be skipped.
 # 0. Render the checked-in immutable source and image pins.
 uv run --no-sync python tau/render_image.py
 
-# 1. Smoke the resolved config and fetch the fixed success evidence.
+# 1. Smoke the resolved config on a system CPU node (zero GPU) and fetch evidence.
 tau run --config tau/.rendered/smoke.yaml --context aks-ai-runtime-eastus2-admin
 tau run get prime-rl-math-7b-h200-smoke -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact smoke-result.json
 
-# 2. Build the draft manifest (CPU-only) — materializes the model and proves
-#    train/eval disjointness up front.
+# 2. Build the draft manifest on a system CPU node (zero GPU) — materializes the
+#    model and proves train/eval disjointness up front.
 #    (PRIME_RL_RUN_MODE=freeze-draft is the default in the committed YAML.)
 tau run --config tau/.rendered/freeze-manifest.yaml --context aks-ai-runtime-eastus2-admin
 tau run get prime-rl-math-7b-h200-freeze-manifest -n pretraining-data \
