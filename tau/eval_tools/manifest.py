@@ -143,10 +143,36 @@ def _assert_no_symlink_components(path: Path) -> Path:
 
 def _canonical_child(path: Path, parent: Path) -> Path:
     canonical_parent = _assert_no_symlink_components(parent)
-    canonical_path = _assert_no_symlink_components(path)
-    if canonical_path == canonical_parent or not canonical_path.is_relative_to(canonical_parent):
+    canonical_path = _canonical_descendant_or_self(path, canonical_parent)
+    if canonical_path == canonical_parent:
         raise ValueError(f"{canonical_path} must be a strict child of {canonical_parent}")
     return canonical_path
+
+
+def _canonical_descendant_or_self(path: Path, parent: Path) -> Path:
+    canonical_parent = _assert_no_symlink_components(parent)
+    canonical_path = _assert_no_symlink_components(path)
+    if not canonical_path.is_relative_to(canonical_parent):
+        raise ValueError(f"{canonical_path} must be a descendant of or equal to {canonical_parent}")
+    return canonical_path
+
+
+def _mkdir_canonical_descendant_or_self(path: Path, parent: Path) -> Path:
+    canonical_parent = _assert_no_symlink_components(parent)
+    absolute = Path(os.path.abspath(path))
+    if not absolute.is_relative_to(canonical_parent):
+        raise ValueError(f"{absolute} must be a descendant of or equal to {canonical_parent}")
+    current = canonical_parent
+    for part in absolute.relative_to(canonical_parent).parts:
+        candidate = current / part
+        try:
+            os.mkdir(candidate)
+        except FileExistsError:
+            pass
+        current = _canonical_descendant_or_self(candidate, canonical_parent)
+        if not current.is_dir():
+            raise NotADirectoryError(f"snapshot destination parent component is not a directory: {current}")
+    return current
 
 
 def build_file_manifest(root: Path) -> FileManifest:
@@ -198,10 +224,10 @@ def validate_file_manifest(root: Path, expected: FileManifest) -> None:
 def materialize_regular_snapshot(source: Path, cache_root: Path, destination: Path) -> FileManifest:
     cache_root = _assert_no_symlink_components(cache_root)
     source = _canonical_child(source, cache_root)
-    destination_parent = destination.parent
-    destination_parent.mkdir(parents=True, exist_ok=True)
-    destination_parent = _canonical_child(destination_parent, cache_root)
     destination = Path(os.path.abspath(destination))
+    if destination == cache_root or not destination.is_relative_to(cache_root):
+        raise ValueError(f"{destination} must be a strict child of {cache_root}")
+    destination_parent = _mkdir_canonical_descendant_or_self(destination.parent, cache_root)
     if destination.parent != destination_parent:
         raise ValueError("trusted snapshot destination must be a direct child of its verified parent")
     staging = destination.with_name(f".{destination.name}.materializing")
@@ -224,7 +250,8 @@ def materialize_regular_snapshot(source: Path, cache_root: Path, destination: Pa
             records.append(FileRecord(path=relative, size=target.stat().st_size, sha256=_sha256_file(target)))
     source_manifest = FileManifest.from_records(records)
 
-    if destination.exists():
+    if os.path.lexists(destination):
+        destination = _canonical_child(destination, cache_root)
         validate_file_manifest(destination, source_manifest)
         return source_manifest
     if os.path.lexists(staging):

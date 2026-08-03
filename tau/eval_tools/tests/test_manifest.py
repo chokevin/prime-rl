@@ -371,6 +371,86 @@ def test_snapshot_materialization_rejects_symlink_escape(tmp_path):
         materialize_regular_snapshot(source, cache_root, destination)
 
 
+def _nested_snapshot(cache_root):
+    source = cache_root / "model-cache" / "models--Qwen--Qwen2.5-7B-Instruct" / "snapshots" / MODEL_REVISION
+    (source / "weights").mkdir(parents=True)
+    (source / "config.json").write_bytes(b'{"model_type":"qwen2"}')
+    (source / "weights" / "model.safetensors").write_bytes(b"exact-weights")
+    return source
+
+
+@pytest.mark.parametrize("destination_name", ["model", "training-dataset"])
+def test_snapshot_materialization_accepts_direct_child_destination(tmp_path, destination_name):
+    run_root = tmp_path / "prime-rl-run-test"
+    source = _nested_snapshot(run_root)
+    source_manifest = build_file_manifest(source)
+    destination = run_root / destination_name
+
+    materialized = materialize_regular_snapshot(source, run_root, destination)
+
+    assert materialized == source_manifest
+    assert (destination / "config.json").read_bytes() == b'{"model_type":"qwen2"}'
+    assert (destination / "weights" / "model.safetensors").read_bytes() == b"exact-weights"
+    assert build_file_manifest(destination) == source_manifest
+
+
+def test_snapshot_materialization_rejects_destination_root(tmp_path):
+    run_root = tmp_path / "prime-rl-run-test"
+    source = _nested_snapshot(run_root)
+
+    with pytest.raises(ValueError, match="strict child"):
+        materialize_regular_snapshot(source, run_root, run_root)
+
+
+def test_snapshot_materialization_rejects_destination_outside_root_before_mkdir(tmp_path):
+    run_root = tmp_path / "prime-rl-run-test"
+    source = _nested_snapshot(run_root)
+    outside_parent = tmp_path / "outside"
+
+    with pytest.raises(ValueError, match="strict child"):
+        materialize_regular_snapshot(source, run_root, outside_parent / "model")
+
+    assert not outside_parent.exists()
+
+
+def test_snapshot_materialization_rejects_symlinked_destination_parent_before_mkdir(tmp_path):
+    run_root = tmp_path / "prime-rl-run-test"
+    source = _nested_snapshot(run_root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (run_root / "linked").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        materialize_regular_snapshot(source, run_root, run_root / "linked" / "nested" / "model")
+
+    assert not (outside / "nested").exists()
+
+
+def test_snapshot_materialization_rejects_symlinked_destination(tmp_path):
+    run_root = tmp_path / "prime-rl-run-test"
+    source = _nested_snapshot(run_root)
+    outside = tmp_path / "outside-model"
+    outside.mkdir()
+    (run_root / "model").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        materialize_regular_snapshot(source, run_root, run_root / "model")
+
+
+def test_snapshot_materialization_preserves_stale_direct_child_staging(tmp_path):
+    run_root = tmp_path / "prime-rl-run-test"
+    source = _nested_snapshot(run_root)
+    staging = run_root / ".model.materializing"
+    staging.mkdir()
+    marker = staging / "preserve"
+    marker.write_text("stale")
+
+    with pytest.raises(FileExistsError, match="staging path"):
+        materialize_regular_snapshot(source, run_root, run_root / "model")
+
+    assert marker.read_text() == "stale"
+
+
 def test_private_training_materialization_is_path_bound_and_immutable(tmp_path):
     run_root = tmp_path / "prime-rl-run-test"
     dataset = run_root / "training-dataset"
