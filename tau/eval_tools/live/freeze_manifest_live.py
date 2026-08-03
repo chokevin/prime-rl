@@ -25,15 +25,15 @@ tau/scripts/run-prime-rl.sh in freeze mode):
 
     uv run --no-sync python -m tau.eval_tools.live.freeze_manifest_live draft \\
         --model-name Qwen/Qwen2.5-7B-Instruct \\
-        --out /data/pretraining-data/prime-rl-math-7b-h200/manifest/draft-manifest.json \\
+        --out /data/pretraining-data/prime-rl-math-7b-h200/generations/<source-sha>/manifest/draft-manifest.json \\
         --temperature 0.0 --seed 0
 
     # ... run the baseline eval against the draft, then:
 
     uv run --no-sync python -m tau.eval_tools.live.freeze_manifest_live finalize \\
-        --draft /data/pretraining-data/prime-rl-math-7b-h200/manifest/draft-manifest.json \\
-        --baseline-rewards /data/pretraining-data/prime-rl-math-7b-h200/eval-baseline/rewards.json \\
-        --out /data/pretraining-data/prime-rl-math-7b-h200/manifest/frozen-eval-manifest.json
+        --draft /data/pretraining-data/prime-rl-math-7b-h200/generations/<source-sha>/manifest/draft-manifest.json \\
+        --baseline-rewards /data/pretraining-data/prime-rl-math-7b-h200/generations/<source-sha>/eval-baseline/rewards.json \\
+        --out /data/pretraining-data/prime-rl-math-7b-h200/generations/<source-sha>/manifest/frozen-eval-manifest.json
 """
 
 from __future__ import annotations

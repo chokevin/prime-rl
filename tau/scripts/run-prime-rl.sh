@@ -200,11 +200,19 @@ cd /app
 export PYTHONPATH="$OVERLAY_DIR"
 export HF_HOME="${RUN_ROOT}/hf-home"
 
-uv run --no-sync python -m tau.eval_tools.output_paths \
+GENERATION_ROOT="$(uv run --no-sync python -m tau.eval_tools.output_paths \
     --mode "$PRIME_RL_RUN_MODE" \
     --output-dir "$TAU_OUTPUT_DIR" \
-    --eval-label "${PRIME_RL_EVAL_LABEL:-}"
-log "prepared exact mode-bound output directory ${TAU_OUTPUT_DIR}"
+    --source-revision "$resolved_sha" \
+    --eval-label "${PRIME_RL_EVAL_LABEL:-}" \
+    --manifest-dir "${PRIME_RL_MANIFEST_DIR:-}" \
+    --manifest-path "${PRIME_RL_MANIFEST_PATH:-}" \
+    --baseline-rewards-path "${PRIME_RL_BASELINE_REWARDS_PATH:-}" \
+    --training-result-path "${PRIME_RL_TRAINING_RESULT_PATH:-}" \
+    --training-output-dir "${PRIME_RL_TRAINING_OUTPUT_DIR:-}" \
+    --lora-adapter-path "${PRIME_RL_LORA_ADAPTER_PATH:-}" \
+    --comparison-output-path "${PRIME_RL_COMPARISON_OUTPUT_PATH:-}")"
+log "prepared source generation ${GENERATION_ROOT} and mode output ${TAU_OUTPUT_DIR}"
 
 # --- Step 2: child-process lifecycle helpers -----------------------------------------
 # Backgrounding the long-running child + trapping here (rather than running it in the
@@ -290,7 +298,7 @@ freeze-finalize)
         --baseline-rewards "$PRIME_RL_BASELINE_REWARDS_PATH" \
         --config "$config_path" \
         --config-rel "$PRIME_RL_CONFIG_REL" \
-        --output-dir "/data/pretraining-data/prime-rl-math-7b-h200/train" \
+        --output-dir "${GENERATION_ROOT}/train" \
         --max-steps "$PRIME_RL_MAX_STEPS" \
         --out "${PRIME_RL_MANIFEST_DIR}/frozen-eval-manifest.json"
     ;;

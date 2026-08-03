@@ -15,11 +15,11 @@ Usage (inside the container, cwd=/app, baked venv active; the calling wrapper sc
 owns starting/stopping the inference server and passes its base URL):
 
     uv run --no-sync python -m tau.eval_tools.live.run_frozen_eval_live \\
-        --manifest /data/pretraining-data/prime-rl-math-7b-h200/manifest/frozen-eval-manifest.json \\
+        --manifest /data/pretraining-data/prime-rl-math-7b-h200/generations/<source-sha>/manifest/frozen-eval-manifest.json \\
         --base-url http://localhost:8000/v1 \\
         --served-model-name Qwen/Qwen2.5-7B-Instruct \\
         --label baseline \\
-        --output /data/pretraining-data/prime-rl-math-7b-h200-eval-baseline/rewards.json
+        --output /data/pretraining-data/prime-rl-math-7b-h200/generations/<source-sha>/eval-baseline/rewards.json
 
 For the post-training eval, pass `--lora-name` (the adapter loaded via
 `prime_rl.utils.client.load_lora_adapter` by the calling wrapper) so completions are

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 from tau.eval_tools.fs_safety import open_directory_nofollow
 
-_OUTPUT_PREFIX = Path("pretraining-data/prime-rl-math-7b-h200")
+_OUTPUT_PREFIX = Path("pretraining-data/prime-rl-math-7b-h200/generations")
+_SOURCE_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _MODE_OUTPUTS = {
     "smoke": "smoke",
     "freeze-draft": "manifest",
@@ -21,12 +24,62 @@ _EVAL_OUTPUTS = {
 }
 
 
+@dataclass(frozen=True)
+class EvidenceGeneration:
+    root: Path
+    smoke: Path
+    manifest: Path
+    eval_baseline: Path
+    train: Path
+    eval_post: Path
+
+    @property
+    def draft_manifest(self) -> Path:
+        return self.manifest / "draft-manifest.json"
+
+    @property
+    def frozen_manifest(self) -> Path:
+        return self.manifest / "frozen-eval-manifest.json"
+
+    @property
+    def baseline_rewards(self) -> Path:
+        return self.eval_baseline / "rewards.json"
+
+    @property
+    def training_result(self) -> Path:
+        return self.train / "training-result.json"
+
+    @property
+    def final_adapter(self) -> Path:
+        return self.train / "final-adapter"
+
+
+def evidence_generation(
+    source_revision: str,
+    *,
+    data_root: Path = Path("/data"),
+) -> EvidenceGeneration:
+    if not _SOURCE_REVISION_RE.fullmatch(source_revision):
+        raise ValueError("source revision must be a full lowercase 40-character commit SHA")
+    root = Path(os.path.abspath(data_root)) / _OUTPUT_PREFIX / source_revision
+    return EvidenceGeneration(
+        root=root,
+        smoke=root / "smoke",
+        manifest=root / "manifest",
+        eval_baseline=root / "eval-baseline",
+        train=root / "train",
+        eval_post=root / "eval-post",
+    )
+
+
 def expected_output_path(
     mode: str,
+    source_revision: str,
     *,
     eval_label: str | None = None,
     data_root: Path = Path("/data"),
 ) -> Path:
+    generation = evidence_generation(source_revision, data_root=data_root)
     eval_label = eval_label or None
     if mode == "eval":
         if eval_label not in _EVAL_OUTPUTS:
@@ -39,17 +92,122 @@ def expected_output_path(
             leaf = _MODE_OUTPUTS[mode]
         except KeyError:
             raise ValueError(f"unsupported PRIME_RL_RUN_MODE: {mode}") from None
-    return Path(os.path.abspath(data_root)) / _OUTPUT_PREFIX / leaf
+    return generation.root / leaf
+
+
+def _validate_exact_path(name: str, supplied: str | Path | None, expected: Path, *, required: bool) -> None:
+    if supplied is None or os.fspath(supplied) == "":
+        if required:
+            raise ValueError(f"{name} must be set to exactly {expected}")
+        return
+    raw = os.fspath(supplied)
+    path = Path(raw)
+    if not path.is_absolute() or raw != str(path) or ".." in path.parts:
+        raise ValueError(f"{name} must be an absolute canonical path: {raw}")
+    if path != expected:
+        raise ValueError(f"{name} is {path}, expected exactly {expected}")
+
+
+def validate_generation_references(
+    mode: str,
+    source_revision: str,
+    *,
+    eval_label: str | None = None,
+    manifest_dir: str | Path | None = None,
+    manifest_path: str | Path | None = None,
+    baseline_rewards_path: str | Path | None = None,
+    training_result_path: str | Path | None = None,
+    training_output_dir: str | Path | None = None,
+    lora_adapter_path: str | Path | None = None,
+    comparison_output_path: str | Path | None = None,
+    data_root: Path = Path("/data"),
+) -> EvidenceGeneration:
+    generation = evidence_generation(source_revision, data_root=data_root)
+    expected_output_path(mode, source_revision, eval_label=eval_label, data_root=data_root)
+    eval_label = eval_label or None
+
+    _validate_exact_path(
+        "PRIME_RL_MANIFEST_DIR",
+        manifest_dir,
+        generation.manifest,
+        required=mode in {"freeze-draft", "freeze-finalize", "train"},
+    )
+    expected_manifest = generation.draft_manifest if eval_label == "baseline" else generation.frozen_manifest
+    _validate_exact_path(
+        "PRIME_RL_MANIFEST_PATH",
+        manifest_path,
+        expected_manifest,
+        required=mode == "eval",
+    )
+    _validate_exact_path(
+        "PRIME_RL_BASELINE_REWARDS_PATH",
+        baseline_rewards_path,
+        generation.baseline_rewards,
+        required=mode == "freeze-finalize" or (mode == "eval" and eval_label == "post"),
+    )
+    _validate_exact_path(
+        "PRIME_RL_TRAINING_RESULT_PATH",
+        training_result_path,
+        generation.training_result,
+        required=mode == "eval" and eval_label == "post",
+    )
+    _validate_exact_path(
+        "PRIME_RL_TRAINING_OUTPUT_DIR",
+        training_output_dir,
+        generation.train,
+        required=mode == "eval" and eval_label == "post",
+    )
+    _validate_exact_path(
+        "PRIME_RL_LORA_ADAPTER_PATH",
+        lora_adapter_path,
+        generation.final_adapter,
+        required=mode == "eval" and eval_label == "post",
+    )
+    if comparison_output_path is not None and os.fspath(comparison_output_path) != "":
+        raw_comparison = os.fspath(comparison_output_path)
+        comparison = Path(raw_comparison)
+        if (
+            not comparison.is_absolute()
+            or raw_comparison != str(comparison)
+            or ".." in comparison.parts
+            or comparison.parent != generation.eval_post
+            or comparison.name in {"", ".", ".."}
+        ):
+            raise ValueError(
+                f"PRIME_RL_COMPARISON_OUTPUT_PATH must be a canonical named file directly under {generation.eval_post}"
+            )
+    return generation
 
 
 def prepare_output_directory(
     mode: str,
     output_dir: str | Path,
+    source_revision: str,
     *,
     eval_label: str | None = None,
+    manifest_dir: str | Path | None = None,
+    manifest_path: str | Path | None = None,
+    baseline_rewards_path: str | Path | None = None,
+    training_result_path: str | Path | None = None,
+    training_output_dir: str | Path | None = None,
+    lora_adapter_path: str | Path | None = None,
+    comparison_output_path: str | Path | None = None,
     data_root: Path = Path("/data"),
 ) -> Path:
-    expected = expected_output_path(mode, eval_label=eval_label, data_root=data_root)
+    validate_generation_references(
+        mode,
+        source_revision,
+        eval_label=eval_label,
+        manifest_dir=manifest_dir,
+        manifest_path=manifest_path,
+        baseline_rewards_path=baseline_rewards_path,
+        training_result_path=training_result_path,
+        training_output_dir=training_output_dir,
+        lora_adapter_path=lora_adapter_path,
+        comparison_output_path=comparison_output_path,
+        data_root=data_root,
+    )
+    expected = expected_output_path(mode, source_revision, eval_label=eval_label, data_root=data_root)
     raw_output = os.fspath(output_dir)
     supplied = Path(raw_output)
     if not supplied.is_absolute() or raw_output != str(supplied) or ".." in supplied.parts:
@@ -89,13 +247,30 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Prepare the exact mode-bound Tau output directory")
     parser.add_argument("--mode", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--source-revision", required=True)
     parser.add_argument("--eval-label", default="")
+    parser.add_argument("--manifest-dir", default="")
+    parser.add_argument("--manifest-path", default="")
+    parser.add_argument("--baseline-rewards-path", default="")
+    parser.add_argument("--training-result-path", default="")
+    parser.add_argument("--training-output-dir", default="")
+    parser.add_argument("--lora-adapter-path", default="")
+    parser.add_argument("--comparison-output-path", default="")
     args = parser.parse_args(argv)
-    prepare_output_directory(
+    prepared = prepare_output_directory(
         args.mode,
         args.output_dir,
+        args.source_revision,
         eval_label=args.eval_label,
+        manifest_dir=args.manifest_dir,
+        manifest_path=args.manifest_path,
+        baseline_rewards_path=args.baseline_rewards_path,
+        training_result_path=args.training_result_path,
+        training_output_dir=args.training_output_dir,
+        lora_adapter_path=args.lora_adapter_path,
+        comparison_output_path=args.comparison_output_path,
     )
+    print(prepared.parent)
 
 
 if __name__ == "__main__":

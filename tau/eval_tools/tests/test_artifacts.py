@@ -60,11 +60,13 @@ from tau.eval_tools.manifest import (
     build_file_manifest,
     build_manifest,
 )
+from tau.eval_tools.output_paths import evidence_generation
 
 SOURCE_REVISION = "a" * 40
 VERIFIERS_REVISION = "b" * 40
 TASKSETS_REVISION = "c" * 40
 MODEL_REVISION = "d" * 40
+TEST_GENERATION = evidence_generation(SOURCE_REVISION)
 MODEL_FILES = FileManifest.from_records(
     [
         FileRecord(path="config.json", size=2, sha256="1" * 64),
@@ -75,7 +77,7 @@ DATASET_FILES = FileManifest.from_records([FileRecord(path="data/train.parquet",
 RL_CONFIG = RLConfigIdentity(
     source_config_rel="configs/tau/math-7b-h200/train.toml",
     source_toml_sha256="4" * 64,
-    output_dir="/data/pretraining-data/prime-rl-math-7b-h200/train",
+    output_dir=str(TEST_GENERATION.train),
     max_steps=50,
     canonical_resolved_sha256="3" * 64,
 )
@@ -1702,7 +1704,7 @@ def test_run_specific_config_binds_only_private_materializations():
         raw,
         model_path=Path("/tmp/prime-rl-run-test/model"),
         dataset_path=Path("/tmp/prime-rl-run-test/training-dataset"),
-        output_dir=Path("/data/pretraining-data/prime-rl-math-7b-h200/train"),
+        output_dir=TEST_GENERATION.train,
         max_steps=50,
     )
     assert raw["model"]["name"] == "/tmp/prime-rl-run-test/model"
