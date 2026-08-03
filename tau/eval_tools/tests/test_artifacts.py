@@ -1,6 +1,7 @@
 import hashlib
 import inspect
 import json
+import os
 import signal
 import stat
 import tomllib
@@ -9,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+import tau.eval_tools.artifacts as artifacts_module
+import tau.eval_tools.live.training_supervisor_live as supervisor_module
 from tau.eval_tools.artifacts import (
     TrainingCompletionAttestation,
     TrainingResult,
@@ -24,10 +27,13 @@ from tau.eval_tools.artifacts import (
 from tau.eval_tools.hashing import hash_text
 from tau.eval_tools.json_io import DuplicateKeyError, load_json_with_sha256
 from tau.eval_tools.live.training_supervisor_live import (
+    SupervisorCancelled,
     create_attempt_directory,
+    recover_publish,
     run_training_attempt,
     supervise_prepared_attempt,
 )
+from tau.eval_tools.live.training_supervisor_live import main as supervisor_main
 from tau.eval_tools.live.validate_training_data_live import (
     PRIVATE_DATASET_SENTINEL,
     PRIVATE_MODEL_SENTINEL,
@@ -324,13 +330,77 @@ def test_publish_training_result_recovers_adapter_install_and_partial_json_stage
     staging = paths.publication_staging
     staging.mkdir()
     (staging / "publication.json").write_text('{"status":"pub')
-    paths.completion_staging.write_text('{"status":"succ')
+    paths.completion_staging.write_bytes(paths.completion.read_bytes())
 
     recovered = publish_training_result(**kwargs, recovery=True)
 
     assert recovered == TrainingResult.load(tmp_path / "training-result.json")
     assert not staging.exists()
     assert not paths.completion_staging.exists()
+
+
+def test_recovery_promotes_valid_fsynced_completion_stage(tmp_path, exact_config_validator):
+    manifest = _manifest()
+    _evidence(tmp_path, manifest, exact_config_validator(manifest))
+    paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
+    paths.completion.rename(paths.completion_staging)
+    with paths.completion_staging.open("rb") as staged:
+        os.fsync(staged.fileno())
+
+    result = publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+
+    assert result.attempt_id == ATTEMPT_1
+    assert paths.completion.is_file()
+    assert not paths.completion_staging.exists()
+
+
+def test_recovery_removes_malformed_completion_stage_without_other_changes(tmp_path, exact_config_validator):
+    manifest = _manifest()
+    _evidence(tmp_path, manifest, exact_config_validator(manifest))
+    paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
+    paths.completion.unlink()
+    paths.completion_staging.write_text('{"status":"succ')
+    preflight_before = paths.preflight.read_bytes()
+    config_before = paths.resolved_config.read_bytes()
+
+    with pytest.raises(ValueError, match="staged completion attestation is incomplete or invalid"):
+        publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+
+    assert not paths.completion_staging.exists()
+    assert paths.preflight.read_bytes() == preflight_before
+    assert paths.resolved_config.read_bytes() == config_before
+    assert not paths.publication.exists()
+    assert not (tmp_path / "training-result.json").exists()
+
+
+def test_recovery_removes_matching_stage_only_after_validating_final(tmp_path, exact_config_validator):
+    manifest = _manifest()
+    _evidence(tmp_path, manifest, exact_config_validator(manifest))
+    paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
+    paths.completion_staging.write_bytes(paths.completion.read_bytes())
+
+    result = publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+
+    assert result.attempt_id == ATTEMPT_1
+    assert paths.completion.is_file()
+    assert not paths.completion_staging.exists()
+
+
+def test_recovery_rejects_mismatched_final_and_completion_stage(tmp_path, exact_config_validator):
+    manifest = _manifest()
+    _evidence(tmp_path, manifest, exact_config_validator(manifest))
+    paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
+    staged = json.loads(paths.completion.read_text())
+    staged["rl_pid"] += 1
+    paths.completion_staging.write_text(json.dumps(staged))
+
+    with pytest.raises(ValueError, match="does not match finalized completion"):
+        publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+
+    assert paths.completion.is_file()
+    assert paths.completion_staging.is_file()
+    assert not paths.publication.exists()
+    assert not (tmp_path / "training-result.json").exists()
 
 
 def test_publication_recovery_rejects_malformed_final_and_normal_cross_attempt_reuse(tmp_path, exact_config_validator):
@@ -540,6 +610,116 @@ def test_supervisor_cancellation_forwards_to_rl_process_group_without_attestatio
     assert not paths.completion.exists()
     assert not paths.publication.exists()
     assert not (tmp_path / "training-result.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("phase", "signum", "expected_exit"),
+    [
+        ("checkpoint", signal.SIGINT, 130),
+        ("publication", signal.SIGTERM, 143),
+    ],
+)
+def test_supervisor_post_wait_cancellation_aborts_entire_transaction(
+    tmp_path,
+    exact_config_validator,
+    monkeypatch,
+    phase,
+    signum,
+    expected_exit,
+):
+    manifest = _manifest()
+    preflight, paths = _evidence(
+        tmp_path,
+        manifest,
+        exact_config_validator(manifest),
+        write_completion=False,
+    )
+    captured = _install_fake_popen(monkeypatch, tmp_path, return_code=0)
+
+    if phase == "checkpoint":
+        original_select = supervisor_module.select_final_adapter
+
+        def cancel_during_checkpoint(*args, **kwargs):
+            signal.raise_signal(signum)
+            return original_select(*args, **kwargs)
+
+        monkeypatch.setattr(supervisor_module, "select_final_adapter", cancel_during_checkpoint)
+    else:
+        original_rename = artifacts_module._rename_noreplace
+
+        def cancel_during_publication(source, destination):
+            original_rename(source, destination)
+            if Path(destination).name == "final-adapter":
+                signal.raise_signal(signum)
+
+        monkeypatch.setattr(artifacts_module, "_rename_noreplace", cancel_during_publication)
+
+    with pytest.raises(SupervisorCancelled) as cancellation:
+        supervise_prepared_attempt(manifest=manifest, preflight=preflight)
+
+    assert cancellation.value.exit_code == expected_exit
+    assert captured["signals"] == []
+    assert not paths.completion.exists()
+    assert not paths.completion_staging.exists()
+    assert not paths.publication.exists()
+    assert not paths.publication_staging.exists()
+    assert not (tmp_path / "training-result.json").exists()
+    assert not (tmp_path / "final-adapter").exists()
+
+
+@pytest.mark.parametrize(("signum", "expected_exit"), [(signal.SIGINT, 130), (signal.SIGTERM, 143)])
+def test_supervisor_cli_maps_cancellation_to_conventional_exit(monkeypatch, signum, expected_exit):
+    def cancel_run(**_kwargs):
+        raise SupervisorCancelled(signum)
+
+    monkeypatch.setattr(supervisor_module, "run_training_attempt", cancel_run)
+    status = supervisor_main(
+        [
+            "run",
+            "--manifest",
+            "manifest.json",
+            "--config",
+            "train.toml",
+            "--output-dir",
+            "output",
+        ]
+    )
+    assert status == expected_exit
+
+
+def test_recovery_cancellation_during_completion_promotion_stops_publication(
+    tmp_path,
+    exact_config_validator,
+    monkeypatch,
+):
+    manifest = _manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest.save(manifest_path)
+    _evidence(tmp_path, manifest, exact_config_validator(manifest))
+    paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
+    paths.completion.rename(paths.completion_staging)
+    original_rename = artifacts_module._rename_noreplace
+
+    def cancel_during_completion_promotion(source, destination):
+        if Path(source) == paths.completion_staging:
+            signal.raise_signal(signal.SIGTERM)
+        original_rename(source, destination)
+
+    monkeypatch.setattr(artifacts_module, "_rename_noreplace", cancel_during_completion_promotion)
+
+    with pytest.raises(SupervisorCancelled) as cancellation:
+        recover_publish(
+            manifest_path=manifest_path,
+            artifact_output_dir=tmp_path,
+            attempt_id=ATTEMPT_1,
+        )
+
+    assert cancellation.value.exit_code == 143
+    assert paths.completion.is_file()
+    assert not paths.completion_staging.exists()
+    assert not paths.publication.exists()
+    assert not (tmp_path / "training-result.json").exists()
+    assert not (tmp_path / "final-adapter").exists()
 
 
 def test_training_wrapper_backgrounds_waits_and_propagates_supervisor_status():

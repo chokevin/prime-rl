@@ -7,6 +7,9 @@ import os
 import re
 import shutil
 import stat
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +34,25 @@ ATTEMPT_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{16}$")
 SOURCE_CONFIG_REL = "configs/tau/math-7b-h200/train.toml"
 LINUX_RENAME_NOREPLACE = 1
 DARWIN_RENAME_EXCL = 4
+_CANCELLATION_CHECK: ContextVar[Callable[[], None] | None] = ContextVar(
+    "training_cancellation_check",
+    default=None,
+)
+
+
+@contextmanager
+def _cancellation_scope(check: Callable[[], None]) -> Iterator[None]:
+    token = _CANCELLATION_CHECK.set(check)
+    try:
+        yield
+    finally:
+        _CANCELLATION_CHECK.reset(token)
+
+
+def _check_cancelled() -> None:
+    check = _CANCELLATION_CHECK.get()
+    if check is not None:
+        check()
 
 
 @dataclass(frozen=True)
@@ -608,6 +630,7 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
 def _write_json_staged_noreplace(*, final_path: Path, staging_path: Path, payload: dict) -> None:
     final_path = Path(final_path)
     staging_path = Path(staging_path)
+    _check_cancelled()
     if final_path.parent != staging_path.parent:
         if final_path.parent.stat().st_dev != staging_path.parent.stat().st_dev:
             raise RuntimeError("JSON staging and destination must be on the same filesystem")
@@ -618,9 +641,25 @@ def _write_json_staged_noreplace(*, final_path: Path, staging_path: Path, payloa
             raise ValueError(f"refusing to clean unsafe JSON staging path: {staging_path}")
         staging_path.unlink()
         fsync_directory(staging_path.parent)
+    _check_cancelled()
     write_json_exclusive(staging_path, payload)
+    _check_cancelled()
     _rename_noreplace(staging_path, final_path)
     fsync_directory(final_path.parent)
+    _check_cancelled()
+
+
+def _fsync_regular_file(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"staged evidence must be a regular file: {path}")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _load_attempt_evidence(
@@ -630,6 +669,7 @@ def _load_attempt_evidence(
     attempt_id: str,
     expected_step: int,
     expected_rank: int,
+    completion_path: Path | None = None,
 ) -> tuple[
     AttemptPaths,
     TrainingPreflight,
@@ -648,7 +688,7 @@ def _load_attempt_evidence(
         raise ValueError("attempt run output must be the fixed canonical directory")
     preflight_payload, preflight_sha256 = load_json_with_sha256(paths.preflight)
     preflight = TrainingPreflight.model_validate(preflight_payload)
-    attestation, attestation_sha256 = TrainingCompletionAttestation.load(paths.completion)
+    attestation, attestation_sha256 = TrainingCompletionAttestation.load(completion_path or paths.completion)
     if preflight.attempt_id != attempt_id or attestation.attempt_id != attempt_id:
         raise ValueError("attempt evidence IDs do not match the requested attempt")
     output_dir = Path(output_dir).resolve(strict=True)
@@ -700,8 +740,11 @@ def _load_attempt_evidence(
     ):
         raise ValueError("completion paths do not match preflight and fixed attempt layout")
     expected_argv = ["uv", "run", "--no-sync", "rl", "@", preflight.private_config_path]
-    if attestation.command_argv != expected_argv or Path(attestation.executable).name != "uv":
+    executable = Path(attestation.executable)
+    if attestation.command_argv != expected_argv or not executable.is_absolute() or executable.name != "uv":
         raise ValueError("completion command does not attest the exact trusted RL invocation")
+    if datetime.fromisoformat(attestation.ended_at) < datetime.fromisoformat(attestation.started_at):
+        raise ValueError("completion process end time precedes its start time")
     if attestation.source_step != expected_step:
         raise ValueError("completion source step does not match the fixed final step")
     expected_stable = paths.run_output / "weights" / f"step_{expected_step}" / "STABLE"
@@ -728,6 +771,90 @@ def _load_attempt_evidence(
     )
 
 
+def _load_or_recover_attempt_evidence(
+    *,
+    output_dir: Path,
+    manifest: FrozenEvalManifest,
+    attempt_id: str,
+    expected_step: int,
+    expected_rank: int,
+    recovery: bool,
+) -> tuple[
+    AttemptPaths,
+    TrainingPreflight,
+    str,
+    TrainingCompletionAttestation,
+    str,
+    RLConfigIdentity,
+    str,
+]:
+    paths = attempt_paths(output_dir, attempt_id, require_existing=True)
+    final_exists = os.path.lexists(paths.completion)
+    stage_exists = os.path.lexists(paths.completion_staging)
+
+    if final_exists:
+        final_evidence = _load_attempt_evidence(
+            output_dir=output_dir,
+            manifest=manifest,
+            attempt_id=attempt_id,
+            expected_step=expected_step,
+            expected_rank=expected_rank,
+        )
+        _check_cancelled()
+        if stage_exists:
+            staged_evidence = _load_attempt_evidence(
+                output_dir=output_dir,
+                manifest=manifest,
+                attempt_id=attempt_id,
+                expected_step=expected_step,
+                expected_rank=expected_rank,
+                completion_path=paths.completion_staging,
+            )
+            _check_cancelled()
+            if staged_evidence[3] != final_evidence[3] or staged_evidence[4] != final_evidence[4]:
+                raise ValueError("staged completion attestation does not match finalized completion evidence")
+            _check_cancelled()
+            _remove_owned_json_staging(
+                paths.completion_staging,
+                expected_name=".completion.json.stage",
+            )
+        return final_evidence
+
+    if not stage_exists or not recovery:
+        return _load_attempt_evidence(
+            output_dir=output_dir,
+            manifest=manifest,
+            attempt_id=attempt_id,
+            expected_step=expected_step,
+            expected_rank=expected_rank,
+        )
+
+    _check_cancelled()
+    try:
+        staged_evidence = _load_attempt_evidence(
+            output_dir=output_dir,
+            manifest=manifest,
+            attempt_id=attempt_id,
+            expected_step=expected_step,
+            expected_rank=expected_rank,
+            completion_path=paths.completion_staging,
+        )
+    except Exception as error:
+        _remove_owned_json_staging(
+            paths.completion_staging,
+            expected_name=".completion.json.stage",
+        )
+        _check_cancelled()
+        raise ValueError("staged completion attestation is incomplete or invalid") from error
+    _check_cancelled()
+    _fsync_regular_file(paths.completion_staging)
+    _check_cancelled()
+    _rename_noreplace(paths.completion_staging, paths.completion)
+    fsync_directory(paths.directory)
+    _check_cancelled()
+    return staged_evidence
+
+
 def publish_training_result(
     *,
     output_dir: Path,
@@ -738,12 +865,7 @@ def publish_training_result(
     recovery: bool = False,
 ) -> TrainingResult:
     output_dir = Path(output_dir).resolve(strict=True)
-    candidate_paths = attempt_paths(output_dir, attempt_id, require_existing=True)
-    if candidate_paths.completion.exists():
-        _remove_owned_json_staging(
-            candidate_paths.completion_staging,
-            expected_name=".completion.json.stage",
-        )
+    _check_cancelled()
     (
         paths,
         preflight,
@@ -752,13 +874,15 @@ def publish_training_result(
         attestation_sha256,
         config_identity,
         resolved_config_sha256,
-    ) = _load_attempt_evidence(
+    ) = _load_or_recover_attempt_evidence(
         output_dir=output_dir,
         manifest=manifest,
         attempt_id=attempt_id,
         expected_step=expected_step,
         expected_rank=expected_rank,
+        recovery=recovery,
     )
+    _check_cancelled()
     result_path = output_dir / "training-result.json"
     final_adapter = output_dir / "final-adapter"
     staging = paths.publication_staging
@@ -774,23 +898,29 @@ def publish_training_result(
             expected_step=expected_step,
             expected_rank=expected_rank,
         )
+        _check_cancelled()
         _remove_owned_staging(staging, attempt_id)
+        _check_cancelled()
         return result
     existing_publication = None
     publication_sha256 = None
     if os.path.lexists(paths.publication):
         existing_publication, publication_sha256 = TrainingPublicationEvidence.load(paths.publication)
+    _check_cancelled()
     _remove_owned_staging(staging, attempt_id)
+    _check_cancelled()
     step, source_adapter, source_digest = select_final_adapter(
         paths.run_output / "weights",
         expected_step=expected_step,
         expected_rank=expected_rank,
     )
+    _check_cancelled()
     if step != attestation.source_step or source_adapter != Path(attestation.source_adapter_path):
         raise ValueError("selected stable adapter does not match successful RL completion attestation")
     source_manifest = build_file_manifest(source_adapter)
     if source_manifest != attestation.source_adapter_files or source_manifest.aggregate_sha256 != source_digest:
         raise RuntimeError("source adapter changed after successful process attestation")
+    _check_cancelled()
     if os.path.lexists(final_adapter):
         if not recovery:
             raise FileExistsError(
@@ -799,6 +929,7 @@ def publish_training_result(
         published_digest = validate_adapter_directory(final_adapter, expected_rank=expected_rank)
         if published_digest != source_digest:
             raise ValueError("incomplete final adapter does not match the fixed stable source checkpoint")
+        _check_cancelled()
     else:
         if existing_publication is not None:
             raise ValueError("publication evidence exists but its final adapter is missing")
@@ -807,15 +938,19 @@ def publish_training_result(
             raise RuntimeError("publication staging and destination must be on the same filesystem")
         staged_adapter = staging / "final-adapter"
         copy_adapter_exclusive(source_adapter, staged_adapter)
+        _check_cancelled()
         staged_digest = validate_adapter_directory(staged_adapter, expected_rank=expected_rank)
         if staged_digest != source_digest:
             raise RuntimeError(f"staged adapter digest {staged_digest} does not match source digest {source_digest}")
+        _check_cancelled()
         _rename_noreplace(staged_adapter, final_adapter)
         fsync_directory(output_dir)
+        _check_cancelled()
         published_digest = validate_adapter_directory(final_adapter, expected_rank=expected_rank)
     if published_digest != source_digest:
         raise RuntimeError(f"published adapter digest {published_digest} does not match source digest {source_digest}")
     published_manifest = build_file_manifest(final_adapter)
+    _check_cancelled()
     publication = TrainingPublicationEvidence(
         created_at=datetime.now(timezone.utc).isoformat(),
         attempt_id=attempt_id,
@@ -843,7 +978,9 @@ def publish_training_result(
             staging_path=staging / paths.publication.name,
             payload=publication.model_dump(),
         )
+        _check_cancelled()
         _, publication_sha256 = load_json_with_sha256(paths.publication)
+        _check_cancelled()
     if publication_sha256 is None:
         raise RuntimeError("publication evidence digest was not established")
     result = TrainingResult(
@@ -868,6 +1005,7 @@ def publish_training_result(
         adapter_files=published_manifest,
         lora_rank=expected_rank,
     )
+    _check_cancelled()
     if not os.path.lexists(staging):
         staging.mkdir()
     staged_result = staging / result_path.name

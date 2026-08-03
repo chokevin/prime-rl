@@ -203,7 +203,9 @@ step override. The handoff never enumerates a storage directory.
   canonical config validator, recomputes its identity, verifies all attempt evidence,
   and writes fixed `training-result.json` last. Completion, publication, and result JSON
   are fsynced in attempt-owned staging before atomic no-replace installation; normal code
-  never streams bytes into their final names.
+  never streams bytes into their final names. The supervisor's INT/TERM handlers remain
+  installed across materialization, RL execution, checkpoint verification, attestation,
+  publication, and result installation.
 
 ### Proof ladder (in order)
 
@@ -287,7 +289,11 @@ It derives exact paths from the supplied ID, strict-verifies the existing prefli
 canonical resolved TOML, real-process attestation, STABLE marker, and adapter hashes,
 then removes only that attempt's stale staging and completes atomic publication without
 launching RL. This includes the adapter-installed/publication-not-yet-installed
-interruption point. A malformed final publication fails rather than being replaced. A
+interruption point. It also accepts an fsynced `.completion.json.stage` only when
+`completion.json` is absent and the staged attestation passes the same full validation,
+then atomically promotes it without replacement. A malformed stage is removed and fails;
+when both names exist, the strict-valid final wins only if the stage matches exactly.
+A malformed final publication fails rather than being replaced. A
 different attempt can reuse an exactly matching installed adapter only through this
 explicit recovery command; normal training fails. A mismatched/reused ID fails, and an
 existing fixed `training-result.json` prevents a normal training rerun.
@@ -295,9 +301,12 @@ existing fixed `training-result.json` prevents a normal training rerun.
 `tau run cancel` sends TERM to the shell entrypoint. During training the shell has the
 supervisor in `CHILD_PID`, forwards TERM/INT, waits, and propagates status 143/130. The
 supervisor owns a new RL process group, forwards the same signal to that entire group,
-waits/reaps it, and treats cancellation as failure even if the child reports zero. No
-completion attestation, publication, or result is written for a cancelled/nonzero run;
-the next normal submission receives a fresh attempt ID.
+waits/reaps it, and keeps the handlers active through all post-wait validation and
+publication. A signal at any point before the fixed result is complete aborts as 143/130,
+cleans only the current attempt's staging/success evidence (including a content-verified
+adapter installed by that attempt), and cannot create later publication or result evidence.
+Cancellation remains failure even if the child reports zero; the next normal submission
+receives a fresh attempt ID.
 
 Every fetch above names an explicit `--artifact <file>` rather than listing the output
 directory: W1's storage proof found directory listing on `blob-training` unreliable
@@ -429,7 +438,7 @@ output):
   field-by-field against `packages/prime-rl-configs/src/prime_rl/configs/{rl,orchestrator,trainer}.py`.
 - `PYTHONPATH=.:src uv run --no-project` with editable `prime-rl-configs`,
   `verifiers`, `math-env-v1`, and `math500-v1`, then
-  `pytest -q tau/eval_tools/tests` — 96 tests covering content manifests,
+  `pytest -q tau/eval_tools/tests` — 105 tests covering content manifests,
   path/symlink rejection, ordered train identity, immutable attempt/process evidence,
   a non-mocked real-`RLConfig` TOML round trip, fixed bootstrap, cancellation, and
   retry/recovery-safe atomic publication.

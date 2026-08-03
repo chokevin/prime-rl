@@ -9,14 +9,22 @@ import shutil
 import signal
 import subprocess
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 from tau.eval_tools.artifacts import (
     SOURCE_CONFIG_REL,
     TrainingCompletionAttestation,
     TrainingPreflight,
+    TrainingPublicationEvidence,
+    TrainingResult,
+    _cancellation_scope,
+    _check_cancelled,
+    _remove_owned_json_staging,
+    _remove_owned_staging,
     _write_json_staged_noreplace,
     attempt_paths,
     publish_training_result,
@@ -58,6 +66,54 @@ class RLProcessResult:
 PRIVATE_RUN_ROOT_RE = re.compile(r"^prime-rl-run-[0-9a-f]{32}$")
 
 
+class SupervisorCancelled(InterruptedError):
+    def __init__(self, signum: int):
+        self.signum = signum
+        self.exit_code = 128 + signum
+        super().__init__(f"training transaction cancelled by signal {signum}")
+
+
+@dataclass
+class _CancellationState:
+    signum: int | None = None
+    process: object | None = None
+
+    def handle_signal(self, signum: int, _frame: object) -> None:
+        if self.signum is None:
+            self.signum = signum
+        process = self.process
+        if process is not None and process.poll() is None:
+            try:
+                _signal_process_group(process.pid, signum)
+            except ProcessLookupError:
+                pass
+
+    def check(self) -> None:
+        if self.signum is not None:
+            raise SupervisorCancelled(self.signum)
+
+    def forward_pending(self) -> None:
+        if self.signum is not None and self.process is not None and self.process.poll() is None:
+            try:
+                _signal_process_group(self.process.pid, self.signum)
+            except ProcessLookupError:
+                pass
+
+
+@contextmanager
+def _supervisor_cancellation() -> Iterator[_CancellationState]:
+    state = _CancellationState()
+    previous_handlers = {
+        signum: signal.signal(signum, state.handle_signal) for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        with _cancellation_scope(state.check):
+            yield state
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
 def generate_attempt_id() -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{timestamp}-{secrets.token_hex(8)}"
@@ -67,39 +123,22 @@ def _signal_process_group(pid: int, signum: int) -> None:
     os.killpg(pid, signum)
 
 
-def _run_rl_process(argv: Sequence[str]) -> RLProcessResult:
+def _run_rl_process(argv: Sequence[str], cancellation: _CancellationState) -> RLProcessResult:
     argv = tuple(argv)
     executable = shutil.which(argv[0])
     if executable is None:
         raise FileNotFoundError(f"trusted RL executable is unavailable: {argv[0]}")
     executable = str(Path(executable).resolve(strict=True))
     started_at = datetime.now(timezone.utc).isoformat()
-    previous_handlers: dict[int, object] = {}
-    cancelled_signal = None
+    cancellation.check()
     process = None
-
-    def forward_signal(signum, _frame):
-        nonlocal cancelled_signal
-        cancelled_signal = signum
-        if process is not None and process.poll() is None:
-            try:
-                _signal_process_group(process.pid, signum)
-            except ProcessLookupError:
-                pass
-
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        previous_handlers[signum] = signal.signal(signum, forward_signal)
     try:
         process = subprocess.Popen(argv, start_new_session=True)
-        if cancelled_signal is not None and process.poll() is None:
-            try:
-                _signal_process_group(process.pid, cancelled_signal)
-            except ProcessLookupError:
-                pass
+        cancellation.process = process
+        cancellation.forward_pending()
         return_code = process.wait()
     finally:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
+        cancellation.process = None
     if process is None:
         raise RuntimeError("RL process was not started")
     ended_at = datetime.now(timezone.utc).isoformat()
@@ -110,7 +149,7 @@ def _run_rl_process(argv: Sequence[str]) -> RLProcessResult:
         started_at=started_at,
         ended_at=ended_at,
         return_code=return_code,
-        cancelled_signal=cancelled_signal,
+        cancelled_signal=cancellation.signum,
     )
 
 
@@ -173,17 +212,21 @@ def prepare_training_attempt(
     run_root: Path,
     attempt_id: str,
 ) -> TrainingPreflight:
+    _check_cancelled()
     if manifest.rl_config is None:
         raise ValueError("training requires a finalized RL config identity")
     artifact_output_dir = Path(artifact_output_dir).resolve(strict=True)
     paths = attempt_paths(artifact_output_dir, attempt_id, require_existing=True)
     run_root = validate_run_root(run_root)
     model_path = materialize_model(manifest.model, run_root)
+    _check_cancelled()
     validate_model_materialization(manifest.model, model_path, run_root)
     dataset_path = materialize_training_dataset(manifest, run_root)
+    _check_cancelled()
     _reload_and_verify_examples(manifest)
     records = _reload_training_records(manifest, dataset_path)
     validate_training_prompt_hashes(manifest, records)
+    _check_cancelled()
     private_config_path = run_root / "resolved-train.toml"
     _, resolved_bytes, config_identity = resolve_effective_rl_config(
         source_config_path,
@@ -197,10 +240,13 @@ def prepare_training_attempt(
     )
     if config_identity != manifest.rl_config:
         raise ValueError("attempt resolved config identity does not match frozen manifest")
+    _check_cancelled()
     _write_bytes_exclusive(private_config_path, resolved_bytes)
     private_config_path.chmod(0o444)
+    _check_cancelled()
     _write_bytes_exclusive(paths.resolved_config, resolved_bytes)
     paths.resolved_config.chmod(0o444)
+    _check_cancelled()
     preflight = write_training_preflight(
         output_path=paths.preflight,
         attempt_id=attempt_id,
@@ -213,6 +259,7 @@ def prepare_training_attempt(
         private_config_path=private_config_path,
         resolved_config_path=paths.resolved_config,
     )
+    _check_cancelled()
     validate_training_prompt_hashes(manifest, _reload_training_records(manifest, dataset_path))
     marker = run_root / "training-inputs-complete.json"
     write_json_exclusive(
@@ -225,6 +272,7 @@ def prepare_training_attempt(
             "resolved_config_sha256": preflight.resolved_config_sha256,
         },
     )
+    _check_cancelled()
     marker.chmod(0o444)
     fsync_directory(run_root)
     run_root.chmod(0o555)
@@ -240,6 +288,7 @@ def _write_completion_from_process(
     expected_step: int,
     expected_rank: int,
 ) -> TrainingCompletionAttestation:
+    _check_cancelled()
     paths = attempt_paths(preflight.artifact_output_dir, preflight.attempt_id, require_existing=True)
     expected_argv = ("uv", "run", "--no-sync", "rl", "@", preflight.private_config_path)
     if process_result.argv != expected_argv:
@@ -258,6 +307,7 @@ def _write_completion_from_process(
     loaded_preflight = TrainingPreflight.model_validate(preflight_payload)
     if loaded_preflight != preflight:
         raise ValueError("preflight changed while RL was running")
+    _check_cancelled()
     _, resolved_bytes, config_identity = validate_resolved_rl_config(
         paths.resolved_config,
         manifest,
@@ -286,6 +336,7 @@ def _write_completion_from_process(
         or hashlib.sha256(resolved_bytes).hexdigest() != preflight.resolved_config_sha256
     ):
         raise ValueError("post-process private/durable config bytes or identity changed")
+    _check_cancelled()
     validate_model_materialization(
         manifest.model,
         Path(preflight.model_path),
@@ -295,11 +346,13 @@ def _write_completion_from_process(
         manifest,
         _reload_training_records(manifest, Path(preflight.dataset_path)),
     )
+    _check_cancelled()
     _, source_adapter, _ = select_final_adapter(
         paths.run_output / "weights",
         expected_step=expected_step,
         expected_rank=expected_rank,
     )
+    _check_cancelled()
     stable_marker = source_adapter.parent / "STABLE"
     attestation = TrainingCompletionAttestation(
         attempt_id=preflight.attempt_id,
@@ -332,12 +385,93 @@ def _write_completion_from_process(
     return attestation
 
 
+def _cleanup_cancelled_attempt(preflight: TrainingPreflight) -> None:
+    paths = attempt_paths(preflight.artifact_output_dir, preflight.attempt_id, require_existing=True)
+    result_path = Path(preflight.artifact_output_dir) / "training-result.json"
+    final_adapter = Path(preflight.artifact_output_dir) / "final-adapter"
+    owned_adapter_files = None
+    if os.path.lexists(result_path):
+        result = TrainingResult.load(result_path)
+        if result.attempt_id != preflight.attempt_id:
+            raise ValueError("refusing to remove another attempt's training result during cancellation")
+        owned_adapter_files = result.adapter_files
+        result_path.unlink()
+        fsync_directory(result_path.parent)
+    if os.path.lexists(paths.publication):
+        publication, _ = TrainingPublicationEvidence.load(paths.publication)
+        if publication.attempt_id != preflight.attempt_id:
+            raise ValueError("refusing to remove another attempt's publication during cancellation")
+        owned_adapter_files = publication.final_adapter_files
+        paths.publication.unlink()
+        fsync_directory(paths.directory)
+    if os.path.lexists(paths.completion):
+        completion, _ = TrainingCompletionAttestation.load(paths.completion)
+        if completion.attempt_id != preflight.attempt_id:
+            raise ValueError("refusing to remove another attempt's completion during cancellation")
+        if owned_adapter_files is None:
+            owned_adapter_files = completion.source_adapter_files
+        paths.completion.unlink()
+        fsync_directory(paths.directory)
+    if os.path.lexists(final_adapter) and owned_adapter_files is not None:
+        if final_adapter.is_symlink() or not final_adapter.is_dir():
+            raise ValueError("refusing to remove unsafe cancelled final adapter")
+        if build_file_manifest(final_adapter) != owned_adapter_files:
+            raise ValueError("refusing to remove final adapter not owned by the cancelled attempt")
+        for current, directories, files in os.walk(final_adapter):
+            current_path = Path(current)
+            for name in [*directories, *files]:
+                if (current_path / name).is_symlink():
+                    raise ValueError("refusing to remove symlinked cancelled final adapter")
+            current_path.chmod(0o700)
+        shutil.rmtree(final_adapter)
+        fsync_directory(final_adapter.parent)
+    _remove_owned_json_staging(
+        paths.completion_staging,
+        expected_name=".completion.json.stage",
+    )
+    _remove_owned_staging(paths.publication_staging, preflight.attempt_id)
+
+
+def _cleanup_recovery_staging(output_dir: Path, attempt_id: str) -> None:
+    paths = attempt_paths(output_dir, attempt_id, require_existing=True)
+    _remove_owned_json_staging(
+        paths.completion_staging,
+        expected_name=".completion.json.stage",
+    )
+    _remove_owned_staging(paths.publication_staging, attempt_id)
+
+
 def supervise_prepared_attempt(
     *,
     manifest: FrozenEvalManifest,
     preflight: TrainingPreflight,
     expected_rank: int = 16,
 ) -> object:
+    with _supervisor_cancellation() as cancellation:
+        try:
+            return _supervise_prepared_attempt(
+                manifest=manifest,
+                preflight=preflight,
+                cancellation=cancellation,
+                expected_rank=expected_rank,
+            )
+        except SupervisorCancelled as error:
+            try:
+                _cleanup_cancelled_attempt(preflight)
+            except Exception as cleanup_error:
+                error.add_note(f"cancelled-attempt cleanup failed: {cleanup_error}")
+                raise error from cleanup_error
+            raise
+
+
+def _supervise_prepared_attempt(
+    *,
+    manifest: FrozenEvalManifest,
+    preflight: TrainingPreflight,
+    cancellation: _CancellationState,
+    expected_rank: int,
+) -> object:
+    cancellation.check()
     if manifest.rl_config is None:
         raise ValueError("training supervision requires the frozen RL config identity")
     if Path(preflight.artifact_output_dir, "training-result.json").exists():
@@ -357,6 +491,7 @@ def supervise_prepared_attempt(
         logical_output_dir=Path(manifest.rl_config.output_dir),
         max_steps=manifest.rl_config.max_steps,
     )
+    cancellation.check()
     _, durable_bytes, durable_identity = validate_resolved_rl_config(
         paths.resolved_config,
         manifest,
@@ -375,13 +510,10 @@ def supervise_prepared_attempt(
         or hashlib.sha256(private_bytes).hexdigest() != preflight.resolved_config_sha256
     ):
         raise ValueError("private RL launch config does not match durable preflight/config identity")
+    cancellation.check()
     command = ("uv", "run", "--no-sync", "rl", "@", preflight.private_config_path)
-    process_result = _run_rl_process(command)
-    if process_result.cancelled_signal is not None:
-        raise InterruptedError(
-            f"rl process {process_result.pid} was cancelled by signal {process_result.cancelled_signal}; "
-            "no completion attestation or result was written"
-        )
+    process_result = _run_rl_process(command, cancellation)
+    cancellation.check()
     if process_result.return_code != 0:
         raise RuntimeError(
             f"rl process {process_result.pid} exited with status {process_result.return_code}; "
@@ -390,6 +522,7 @@ def supervise_prepared_attempt(
     metrics_path = Path(preflight.attempt_output_dir) / "metrics.jsonl"
     if metrics_path.is_symlink() or not metrics_path.is_file() or metrics_path.stat().st_size == 0:
         raise FileNotFoundError("successful RL process did not produce the configured attempt metrics.jsonl")
+    cancellation.check()
     _write_completion_from_process(
         manifest=manifest,
         preflight=preflight,
@@ -397,6 +530,7 @@ def supervise_prepared_attempt(
         expected_step=manifest.rl_config.max_steps,
         expected_rank=expected_rank,
     )
+    cancellation.check()
     return publish_training_result(
         output_dir=Path(preflight.artifact_output_dir),
         manifest=manifest,
@@ -412,40 +546,65 @@ def run_training_attempt(
     source_config_path: Path,
     artifact_output_dir: Path,
 ) -> object:
-    artifact_output_dir = Path(artifact_output_dir).resolve(strict=True)
-    if (artifact_output_dir / "training-result.json").exists():
-        raise FileExistsError("training-result.json already exists; training is already complete")
-    manifest = FrozenEvalManifest.load(manifest_path)
-    if manifest.state != "finalized" or manifest.rl_config is None:
-        raise ValueError("training supervisor requires a finalized manifest")
-    validate_manifest_contract(
-        manifest,
-        expected_source_revision=manifest.source_revision,
-        expected_verifiers_revision=manifest.verifiers_revision,
-        expected_tasksets_revision=manifest.eval_taskset.taskset_revision,
-        expected_model_name=manifest.model.name,
-        expected_model_revision=manifest.model.revision,
-        require_finalized=True,
-    )
-    attempt_id = generate_attempt_id()
-    create_attempt_directory(artifact_output_dir, attempt_id)
-    print(f"[training-supervisor] attempt_id={attempt_id}", flush=True)
-    run_root = create_private_run_root()
-    try:
-        preflight = prepare_training_attempt(
-            manifest=manifest,
-            source_config_path=source_config_path,
-            artifact_output_dir=artifact_output_dir,
-            run_root=run_root,
-            attempt_id=attempt_id,
+    with _supervisor_cancellation() as cancellation:
+        artifact_output_dir = Path(artifact_output_dir).resolve(strict=True)
+        cancellation.check()
+        if (artifact_output_dir / "training-result.json").exists():
+            raise FileExistsError("training-result.json already exists; training is already complete")
+        manifest = FrozenEvalManifest.load(manifest_path)
+        cancellation.check()
+        if manifest.state != "finalized" or manifest.rl_config is None:
+            raise ValueError("training supervisor requires a finalized manifest")
+        validate_manifest_contract(
+            manifest,
+            expected_source_revision=manifest.source_revision,
+            expected_verifiers_revision=manifest.verifiers_revision,
+            expected_tasksets_revision=manifest.eval_taskset.taskset_revision,
+            expected_model_name=manifest.model.name,
+            expected_model_revision=manifest.model.revision,
+            require_finalized=True,
         )
-        return supervise_prepared_attempt(
-            manifest=manifest,
-            preflight=preflight,
-        )
-    finally:
-        if os.path.lexists(run_root):
-            remove_private_run_root(run_root)
+        cancellation.check()
+        attempt_id = generate_attempt_id()
+        create_attempt_directory(artifact_output_dir, attempt_id)
+        print(f"[training-supervisor] attempt_id={attempt_id}", flush=True)
+        cancellation.check()
+        run_root = create_private_run_root()
+        preflight = None
+        try:
+            cancellation.check()
+            preflight = prepare_training_attempt(
+                manifest=manifest,
+                source_config_path=source_config_path,
+                artifact_output_dir=artifact_output_dir,
+                run_root=run_root,
+                attempt_id=attempt_id,
+            )
+            cancellation.check()
+            return _supervise_prepared_attempt(
+                manifest=manifest,
+                preflight=preflight,
+                cancellation=cancellation,
+                expected_rank=16,
+            )
+        except SupervisorCancelled as error:
+            try:
+                if preflight is not None:
+                    _cleanup_cancelled_attempt(preflight)
+                else:
+                    paths = attempt_paths(artifact_output_dir, attempt_id, require_existing=True)
+                    _remove_owned_json_staging(
+                        paths.completion_staging,
+                        expected_name=".completion.json.stage",
+                    )
+                    _remove_owned_staging(paths.publication_staging, attempt_id)
+            except Exception as cleanup_error:
+                error.add_note(f"cancelled-attempt cleanup failed: {cleanup_error}")
+                raise error from cleanup_error
+            raise
+        finally:
+            if os.path.lexists(run_root):
+                remove_private_run_root(run_root)
 
 
 def recover_publish(
@@ -454,17 +613,28 @@ def recover_publish(
     artifact_output_dir: Path,
     attempt_id: str,
 ) -> object:
-    manifest = FrozenEvalManifest.load(manifest_path)
-    if manifest.state != "finalized" or manifest.rl_config is None:
-        raise ValueError("publication recovery requires a finalized manifest")
-    return publish_training_result(
-        output_dir=artifact_output_dir,
-        manifest=manifest,
-        attempt_id=attempt_id,
-        expected_step=manifest.rl_config.max_steps,
-        expected_rank=16,
-        recovery=True,
-    )
+    with _supervisor_cancellation() as cancellation:
+        try:
+            cancellation.check()
+            manifest = FrozenEvalManifest.load(manifest_path)
+            cancellation.check()
+            if manifest.state != "finalized" or manifest.rl_config is None:
+                raise ValueError("publication recovery requires a finalized manifest")
+            return publish_training_result(
+                output_dir=artifact_output_dir,
+                manifest=manifest,
+                attempt_id=attempt_id,
+                expected_step=manifest.rl_config.max_steps,
+                expected_rank=16,
+                recovery=True,
+            )
+        except SupervisorCancelled as error:
+            try:
+                _cleanup_recovery_staging(artifact_output_dir, attempt_id)
+            except Exception as cleanup_error:
+                error.add_note(f"recovery staging cleanup failed: {cleanup_error}")
+                raise error from cleanup_error
+            raise
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -479,18 +649,22 @@ def main(argv: list[str] | None = None) -> int:
     recover_parser.add_argument("--output-dir", required=True)
     recover_parser.add_argument("--attempt-id", required=True)
     args = parser.parse_args(argv)
-    if args.command == "run":
-        run_training_attempt(
-            manifest_path=Path(args.manifest),
-            source_config_path=Path(args.config),
-            artifact_output_dir=Path(args.output_dir),
-        )
-    else:
-        recover_publish(
-            manifest_path=Path(args.manifest),
-            artifact_output_dir=Path(args.output_dir),
-            attempt_id=args.attempt_id,
-        )
+    try:
+        if args.command == "run":
+            run_training_attempt(
+                manifest_path=Path(args.manifest),
+                source_config_path=Path(args.config),
+                artifact_output_dir=Path(args.output_dir),
+            )
+        else:
+            recover_publish(
+                manifest_path=Path(args.manifest),
+                artifact_output_dir=Path(args.output_dir),
+                attempt_id=args.attempt_id,
+            )
+    except SupervisorCancelled as error:
+        print(f"[training-supervisor] {error}", flush=True)
+        return error.exit_code
     return 0
 
 
