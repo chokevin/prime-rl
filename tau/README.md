@@ -76,7 +76,7 @@ The manifest's `org.opencontainers.image.revision` annotation is
 `bbb90a1b4132c351cbe8b0ed1fa808dde99f0318` — exactly this branch's merge-base commit (the
 sync branch's tree is byte-identical to upstream `bbb90a1b4`; see the `/goal` plan's
 Baseline section). The immutable runtime overlay is
-`3cca467804ba0dd5aa473b0b8ecdda04bb900ffa`. That commit contains the complete Tau
+`847fea4b2757e5198f27ebcdd52f194359e2e2fb`. That commit contains the complete Tau
 wrapper/eval tooling and the workspace-locked `environments/harder_math_v1` package.
 Its dependency set matches the pinned image: `harder-math-v1` uses only `datasets` and
 `verifiers`, which are already present. The later integration commit changes only
@@ -218,15 +218,20 @@ step override. The handoff never enumerates a storage directory.
   `STABLE` checkpoint. Publication re-parses the durable resolved TOML through the full
   canonical config validator, recomputes its identity, verifies all attempt evidence,
   and writes fixed `training-result.json` last. Completion, publication, and result JSON
-  are fsynced in attempt-owned staging before atomic no-replace installation; normal code
-  never streams bytes into their final names. The supervisor's INT/TERM handlers remain
+  are fsynced in attempt-owned staging before one no-follow, directory-relative,
+  atomic-no-replace promotion. The promotion binds the validated stage inode, bytes,
+  digest, and parsed object to a strict-reopened final before callbacks or return.
+  A swapped or unreadable installed entry is atomically inode-checked into preserved
+  quarantine, leaving the fixed path retryable; a pre-existing immutable final is never
+  quarantined. Normal code never streams bytes into final names. The supervisor's
+  INT/TERM handlers remain
   installed across materialization, RL execution, checkpoint verification, attestation,
   publication, and result installation.
 
 ### Proof ladder (in order)
 
 Before any of this, confirm every target pins
-`3cca467804ba0dd5aa473b0b8ecdda04bb900ffa`, then render the image pin with
+`847fea4b2757e5198f27ebcdd52f194359e2e2fb`, then render the image pin with
 `uv run --no-sync python tau/render_image.py`. The base model and training dataset
 revisions are already immutable pins. Every command below points at
 `tau/.rendered/<target>.yaml`, never the bare `tau/<target>.yaml` template, so pin
@@ -399,7 +404,7 @@ tau run get <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admi
 ## Operator commands
 
 **Before every submit:** confirm all five checked-in templates pin the immutable runtime
-overlay `3cca467804ba0dd5aa473b0b8ecdda04bb900ffa`, then render. Do not replace it with the
+overlay `847fea4b2757e5198f27ebcdd52f194359e2e2fb`, then render. Do not replace it with the
 later integration/pin commit: that would be a self-reference and that commit changes no
 runtime code. The pinned `Qwen/Qwen2.5-7B-Instruct` revision is
 `a09a35458c702b33eeacc393d103063234e8bc28`. Every model-serving phase downloads that
@@ -477,7 +482,7 @@ Run all of the following before any submit:
   field-by-field against `packages/prime-rl-configs/src/prime_rl/configs/{rl,orchestrator,trainer}.py`.
 - `PYTHONPATH=.:src uv run --no-project` with editable `prime-rl-configs`,
   `verifiers`, `math-env-v1`, and `math500-v1`, then
-  `pytest -q tau/eval_tools/tests` — 141 tests covering content manifests,
+  `pytest -q tau/eval_tools/tests` — 148 tests covering content manifests,
   path/symlink rejection, ordered train identity, immutable attempt/process evidence,
   a non-mocked real-`RLConfig` TOML round trip, locked-HF snapshot symlink cleanup,
   fixed bootstrap, cancellation, and retry/recovery-safe atomic publication.
@@ -490,7 +495,7 @@ Run all of the following before any submit:
 - No Tau job has been submitted (no `--dry-run=server`, no real submit). This session's
   scope (W4b) was static config/scripts/tests; live cluster execution is W5–W8.
 - The previously reproduced local runtime blockers are covered at source commit
-  `3cca467804ba0dd5aa473b0b8ecdda04bb900ffa`: cleanup was exercised against a real
+  `847fea4b2757e5198f27ebcdd52f194359e2e2fb`: cleanup was exercised against a real
   locked-`huggingface-hub==1.16.1` snapshot with symlinks, and fixed JSON evidence has
   interruption/race/retry coverage. This does not prove the end-to-end job.
 - The full `tau/eval_tools/live/*.py` phases have never been executed against the real
