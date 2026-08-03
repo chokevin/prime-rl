@@ -25,13 +25,13 @@ runtime:
     WANDB_MODE: offline
     PRIME_RL_RUN_MODE: train
     PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
-    PRIME_RL_REPO_SHA: 0cc69460234c61b1ee4da1c9f0601aa8aa3da26e
+    PRIME_RL_REPO_SHA: e38f54c1e9025cffefed3efe30b94f8e24203c78
     PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
     PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
     PRIME_RL_MODEL_NAME: Qwen/Qwen2.5-7B-Instruct
     PRIME_RL_MODEL_REVISION: a09a35458c702b33eeacc393d103063234e8bc28
     PRIME_RL_CONFIG_REL: configs/tau/math-7b-h200/train.toml
-    PRIME_RL_MANIFEST_DIR: /data/pretraining-data/prime-rl-math-7b-h200/generations/0cc69460234c61b1ee4da1c9f0601aa8aa3da26e/manifest
+    PRIME_RL_MANIFEST_DIR: /data/pretraining-data/prime-rl-math-7b-h200/generations/e38f54c1e9025cffefed3efe30b94f8e24203c78/manifest
 
 compute:
   gpus: 2
@@ -50,4 +50,4 @@ policy:
 
 storage:
   data_pvc: blob-training
-  output: /data/pretraining-data/prime-rl-math-7b-h200/generations/0cc69460234c61b1ee4da1c9f0601aa8aa3da26e/train
+  output: /data/pretraining-data/prime-rl-math-7b-h200/generations/e38f54c1e9025cffefed3efe30b94f8e24203c78/train
