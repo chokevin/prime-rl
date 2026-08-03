@@ -28,8 +28,11 @@ from tau.eval_tools.hashing import hash_text
 from tau.eval_tools.json_io import DuplicateKeyError, load_json_with_sha256
 from tau.eval_tools.live.training_supervisor_live import (
     SupervisorCancelled,
+    capture_private_run_root,
     create_attempt_directory,
+    create_private_run_root,
     recover_publish,
+    remove_private_run_root,
     run_training_attempt,
     supervise_prepared_attempt,
 )
@@ -767,6 +770,167 @@ def test_supervisor_cancellation_forwards_to_rl_process_group_without_attestatio
     assert not paths.completion.exists()
     assert not paths.publication.exists()
     assert not (tmp_path / "training-result.json").exists()
+
+
+def _make_hf_snapshot_cache(run_root: Path, external_target: Path) -> None:
+    import huggingface_hub
+    from huggingface_hub.file_download import _create_symlink
+
+    assert huggingface_hub.__version__ == "1.16.1"
+    cache = run_root / "model-cache/models--hf-internal-testing--tiny-random-gpt2"
+    blobs = cache / "blobs"
+    snapshot = cache / "snapshots/1234567890abcdef"
+    blobs.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    (blobs / "config-digest").write_text('{"model_type":"gpt2"}')
+    (blobs / "weights-digest").write_bytes(b"locked model weights")
+    _create_symlink(str(blobs / "config-digest"), str(snapshot / "config.json"))
+    _create_symlink(str(blobs / "weights-digest"), str(snapshot / "model.safetensors"))
+    _create_symlink(str(external_target), str(snapshot / "external-tokenizer.json"))
+    assert all(path.is_symlink() for path in snapshot.iterdir())
+
+
+def test_private_cleanup_unlinks_hf_snapshot_symlinks_without_following_targets(tmp_path):
+    external_target = tmp_path / "external-tokenizer.json"
+    external_target.write_text("must survive")
+    run_root = create_private_run_root()
+    token = capture_private_run_root(run_root)
+    _make_hf_snapshot_cache(run_root, external_target)
+
+    remove_private_run_root(token)
+
+    assert not run_root.exists()
+    assert external_target.read_text() == "must survive"
+
+
+def test_private_cleanup_rejects_symlink_root_and_preserves_external_target(tmp_path):
+    external_target = tmp_path / "external"
+    external_target.mkdir()
+    (external_target / "keep").write_text("must survive")
+    run_root = create_private_run_root()
+    token = capture_private_run_root(run_root)
+    displaced = run_root.with_name(f"{run_root.name}-displaced")
+    run_root.rename(displaced)
+    run_root.symlink_to(external_target, target_is_directory=True)
+    try:
+        with pytest.raises(ValueError, match="no longer a directory"):
+            remove_private_run_root(token)
+        assert (external_target / "keep").read_text() == "must survive"
+        assert displaced.is_dir()
+    finally:
+        run_root.unlink(missing_ok=True)
+        displaced.rmdir()
+
+
+def test_private_cleanup_rejects_root_swap_during_removal(tmp_path, monkeypatch):
+    external_target = tmp_path / "external"
+    external_target.mkdir()
+    (external_target / "keep").write_text("must survive")
+    run_root = create_private_run_root()
+    token = capture_private_run_root(run_root)
+    (run_root / "owned").write_text("remove only this")
+    displaced = run_root.with_name(f"{run_root.name}-displaced")
+
+    def swap_root(path):
+        path.rename(displaced)
+        path.symlink_to(external_target, target_is_directory=True)
+
+    monkeypatch.setattr(supervisor_module, "_before_private_root_remove", swap_root)
+    try:
+        with pytest.raises(RuntimeError, match="changed before removal"):
+            remove_private_run_root(token)
+        assert (external_target / "keep").read_text() == "must survive"
+        assert not (displaced / "owned").exists()
+    finally:
+        run_root.unlink(missing_ok=True)
+        displaced.rmdir()
+
+
+@pytest.mark.parametrize(
+    ("error", "match"),
+    [
+        (SupervisorCancelled(signal.SIGTERM), "cancelled by signal"),
+        (RuntimeError("materialization failed"), "materialization failed"),
+    ],
+)
+def test_training_failure_and_cancellation_remove_hf_private_cache(
+    tmp_path,
+    monkeypatch,
+    error,
+    match,
+):
+    manifest_path = tmp_path / "manifest.json"
+    _manifest().save(manifest_path)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    external_target = tmp_path / "external-tokenizer.json"
+    external_target.write_text("must survive")
+    captured = {}
+    monkeypatch.setattr(supervisor_module, "generate_attempt_id", lambda: ATTEMPT_1)
+    monkeypatch.setattr(supervisor_module, "validate_manifest_contract", lambda *_args, **_kwargs: None)
+
+    def fail_prepare(**kwargs):
+        captured["run_root"] = kwargs["run_root"]
+        _make_hf_snapshot_cache(kwargs["run_root"], external_target)
+        raise error
+
+    monkeypatch.setattr(supervisor_module, "prepare_training_attempt", fail_prepare)
+    with pytest.raises(type(error), match=match):
+        run_training_attempt(
+            manifest_path=manifest_path,
+            source_config_path=tmp_path / "unused.toml",
+            artifact_output_dir=output_dir,
+        )
+
+    assert not captured["run_root"].exists()
+    assert external_target.read_text() == "must survive"
+
+
+def test_cleanup_diagnostic_does_not_invalidate_durable_success(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    manifest_path = tmp_path / "manifest.json"
+    _manifest().save(manifest_path)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    external_target = tmp_path / "external"
+    external_target.mkdir()
+    sentinel = object()
+    captured = {}
+    monkeypatch.setattr(supervisor_module, "generate_attempt_id", lambda: ATTEMPT_1)
+    monkeypatch.setattr(supervisor_module, "validate_manifest_contract", lambda *_args, **_kwargs: None)
+
+    def prepare(**kwargs):
+        captured["run_root"] = kwargs["run_root"]
+        return object()
+
+    def complete(**_kwargs):
+        (output_dir / "training-result.json").write_text("{}")
+        return sentinel
+
+    def swap_root(path):
+        displaced = path.with_name(f"{path.name}-displaced")
+        captured["displaced"] = displaced
+        path.rename(displaced)
+        path.symlink_to(external_target, target_is_directory=True)
+
+    monkeypatch.setattr(supervisor_module, "prepare_training_attempt", prepare)
+    monkeypatch.setattr(supervisor_module, "_supervise_prepared_attempt", complete)
+    monkeypatch.setattr(supervisor_module, "_before_private_root_remove", swap_root)
+    monkeypatch.setattr(TrainingResult, "load", classmethod(lambda _cls, _path: sentinel))
+    try:
+        result = run_training_attempt(
+            manifest_path=manifest_path,
+            source_config_path=tmp_path / "unused.toml",
+            artifact_output_dir=output_dir,
+        )
+        assert result is sentinel
+        assert "cleanup failed after durable success" in capsys.readouterr().err
+    finally:
+        captured["run_root"].unlink(missing_ok=True)
+        captured["displaced"].rmdir()
 
 
 @pytest.mark.parametrize(

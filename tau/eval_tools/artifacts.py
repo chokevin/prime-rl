@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ctypes
 import errno
 import hashlib
 import os
@@ -17,7 +16,15 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from tau.eval_tools.json_io import fsync_directory, load_json_with_sha256, parse_json_bytes, write_json_exclusive
+from tau.eval_tools.fs_safety import rename_entry_noreplace as _rename_entry_noreplace
+from tau.eval_tools.fs_safety import rename_noreplace as _rename_noreplace
+from tau.eval_tools.json_io import (
+    fsync_directory,
+    load_json_with_sha256,
+    parse_json_bytes,
+    write_bytes_exclusive,
+    write_json_exclusive,
+)
 from tau.eval_tools.manifest import (
     FileManifest,
     FrozenEvalManifest,
@@ -32,8 +39,6 @@ ADAPTER_CONFIG = "adapter_config.json"
 ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors",)
 ATTEMPT_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{16}$")
 SOURCE_CONFIG_REL = "configs/tau/math-7b-h200/train.toml"
-LINUX_RENAME_NOREPLACE = 1
-DARWIN_RENAME_EXCL = 4
 _CANCELLATION_CHECK: ContextVar[Callable[[], None] | None] = ContextVar(
     "training_cancellation_check",
     default=None,
@@ -508,12 +513,8 @@ def materialize_adapter_for_eval(
     make_tree_immutable(destination)
     validate_tree_immutable(destination, result.adapter_files)
     marker = run_root / "adapter-materialization-complete"
-    with marker.open("xb") as output:
-        output.write((result.adapter_sha256 + "\n").encode())
-        output.flush()
-        os.fsync(output.fileno())
+    write_bytes_exclusive(marker, (result.adapter_sha256 + "\n").encode())
     marker.chmod(0o444)
-    fsync_directory(run_root)
     return destination
 
 
@@ -614,48 +615,6 @@ def write_training_preflight(
     return result
 
 
-def _rename_entry_noreplace(directory_descriptor: int, source_name: str, destination_name: str) -> None:
-    if "/" in source_name or "/" in destination_name:
-        raise ValueError("directory-relative rename names must not contain path separators")
-    libc = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is not None:
-        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-        renameat2.restype = ctypes.c_int
-        result = renameat2(
-            directory_descriptor,
-            os.fsencode(source_name),
-            directory_descriptor,
-            os.fsencode(destination_name),
-            LINUX_RENAME_NOREPLACE,
-        )
-    else:
-        renameatx_np = getattr(libc, "renameatx_np", None)
-        if renameatx_np is None:
-            raise OSError(errno.ENOTSUP, "safe directory-relative no-replace rename is unavailable")
-        renameatx_np.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        renameatx_np.restype = ctypes.c_int
-        result = renameatx_np(
-            directory_descriptor,
-            os.fsencode(source_name),
-            directory_descriptor,
-            os.fsencode(destination_name),
-            DARWIN_RENAME_EXCL,
-        )
-    if result == 0:
-        return
-    error = ctypes.get_errno()
-    if error == errno.EEXIST:
-        raise FileExistsError(destination_name)
-    raise OSError(error, os.strerror(error), source_name)
-
-
 def _before_staging_quarantine(_path: Path) -> None:
     pass
 
@@ -746,37 +705,6 @@ def _quarantine_owned_staging(path: Path, *, expected_name: str) -> Path | None:
         if source_descriptor is not None:
             os.close(source_descriptor)
         os.close(parent_descriptor)
-
-
-def _rename_noreplace(source: Path, destination: Path) -> None:
-    if os.path.lexists(destination):
-        raise FileExistsError(destination)
-    libc = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is not None:
-        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-        renameat2.restype = ctypes.c_int
-        result = renameat2(
-            -100,
-            os.fsencode(source),
-            -100,
-            os.fsencode(destination),
-            LINUX_RENAME_NOREPLACE,
-        )
-    else:
-        renamex_np = getattr(libc, "renamex_np", None)
-        if renamex_np is not None:
-            renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-            renamex_np.restype = ctypes.c_int
-            result = renamex_np(os.fsencode(source), os.fsencode(destination), DARWIN_RENAME_EXCL)
-        else:
-            raise OSError(errno.ENOTSUP, "atomic no-replace rename is unavailable", destination)
-    if result == 0:
-        return
-    error = ctypes.get_errno()
-    if error == errno.EEXIST:
-        raise FileExistsError(destination)
-    raise OSError(error, os.strerror(error), destination)
 
 
 def _write_json_staged_noreplace(

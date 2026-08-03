@@ -8,6 +8,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from tau.eval_tools.artifacts import (
     AdapterPublicationState,
     TrainingCompletionAttestation,
     TrainingPreflight,
+    TrainingResult,
     _cancellation_scope,
     _check_cancelled,
     _quarantine_owned_staging,
@@ -29,7 +31,13 @@ from tau.eval_tools.artifacts import (
     select_final_adapter,
     write_training_preflight,
 )
-from tau.eval_tools.json_io import fsync_directory, load_json_with_sha256, write_json_exclusive
+from tau.eval_tools.fs_safety import DirectoryOwnershipToken, remove_owned_directory_tree
+from tau.eval_tools.json_io import (
+    fsync_directory,
+    load_json_with_sha256,
+    write_bytes_exclusive,
+    write_json_exclusive,
+)
 from tau.eval_tools.live.private_materialization_live import (
     materialize_model,
     materialize_training_dataset,
@@ -153,12 +161,7 @@ def _run_rl_process(argv: Sequence[str], cancellation: _CancellationState) -> RL
 
 
 def _write_bytes_exclusive(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("xb") as output:
-        output.write(payload)
-        output.flush()
-        os.fsync(output.fileno())
-    fsync_directory(path.parent)
+    write_bytes_exclusive(path, payload)
 
 
 def create_attempt_directory(output_dir: Path, attempt_id: str) -> Path:
@@ -187,20 +190,23 @@ def create_private_run_root() -> Path:
     raise FileExistsError("could not allocate a fresh private training run root")
 
 
-def remove_private_run_root(run_root: Path) -> None:
-    run_root = Path(run_root)
-    if run_root.is_symlink():
-        raise ValueError("refusing to remove a symlinked private run root")
-    canonical = run_root.resolve(strict=True)
-    if canonical.parent != Path("/tmp").resolve(strict=True) or not PRIVATE_RUN_ROOT_RE.fullmatch(canonical.name):
-        raise ValueError(f"refusing to remove unsafe private run root: {canonical}")
-    for current, directories, files in os.walk(canonical):
-        current_path = Path(current)
-        for name in [*directories, *files]:
-            if (current_path / name).is_symlink():
-                raise ValueError(f"refusing to remove private run root containing symlink: {current_path / name}")
-        current_path.chmod(0o700)
-    shutil.rmtree(canonical)
+def capture_private_run_root(run_root: Path) -> DirectoryOwnershipToken:
+    token = DirectoryOwnershipToken.capture(run_root)
+    tmp_root = Path("/tmp").resolve(strict=True)
+    if token.path.parent != tmp_root or not PRIVATE_RUN_ROOT_RE.fullmatch(token.path.name):
+        raise ValueError(f"refusing to capture unsafe private run root: {token.path}")
+    return token
+
+
+def _before_private_root_remove(_path: Path) -> None:
+    pass
+
+
+def remove_private_run_root(token: DirectoryOwnershipToken) -> None:
+    tmp_root = Path("/tmp").resolve(strict=True)
+    if token.path.parent != tmp_root or not PRIVATE_RUN_ROOT_RE.fullmatch(token.path.name):
+        raise ValueError(f"refusing to remove unsafe private run root: {token.path}")
+    remove_owned_directory_tree(token, before_root_remove=_before_private_root_remove)
 
 
 def prepare_training_attempt(
@@ -547,7 +553,10 @@ def run_training_attempt(
         print(f"[training-supervisor] attempt_id={attempt_id}", flush=True)
         cancellation.check()
         run_root = create_private_run_root()
+        run_root_token = capture_private_run_root(run_root)
         preflight = None
+        result = None
+        failure = None
         try:
             cancellation.check()
             preflight = prepare_training_attempt(
@@ -558,13 +567,15 @@ def run_training_attempt(
                 attempt_id=attempt_id,
             )
             cancellation.check()
-            return _supervise_prepared_attempt(
+            result = _supervise_prepared_attempt(
                 manifest=manifest,
                 preflight=preflight,
                 cancellation=cancellation,
                 expected_rank=16,
             )
+            return result
         except SupervisorCancelled as error:
+            failure = error
             try:
                 if preflight is not None:
                     _cleanup_cancelled_attempt(preflight, cancellation.adapter_publication)
@@ -579,13 +590,31 @@ def run_training_attempt(
                 error.add_note(f"cancelled-attempt cleanup failed: {cleanup_error}")
                 raise error from cleanup_error
             raise
-        except Exception:
+        except Exception as error:
+            failure = error
             if preflight is not None:
                 _cleanup_publication_staging(artifact_output_dir, attempt_id)
             raise
         finally:
-            if os.path.lexists(run_root):
-                remove_private_run_root(run_root)
+            try:
+                remove_private_run_root(run_root_token)
+            except Exception as cleanup_error:
+                if result is not None:
+                    durable_result = TrainingResult.load(artifact_output_dir / "training-result.json")
+                    if durable_result != result:
+                        raise RuntimeError(
+                            "private cleanup failed and durable success evidence does not match the returned result"
+                        ) from cleanup_error
+                    print(
+                        "[training-supervisor] private cleanup failed after durable success; "
+                        f"success evidence remains valid: {cleanup_error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                elif failure is not None:
+                    failure.add_note(f"private run-root cleanup failed: {cleanup_error}")
+                else:
+                    raise
 
 
 def recover_publish(
