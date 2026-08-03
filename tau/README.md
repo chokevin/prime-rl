@@ -220,7 +220,7 @@ tau run get prime-rl-math-7b-h200-eval-baseline -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact rewards.json
 
 # 4. Freeze the manifest, recording the measured baseline mean (edit
-#    tau/freeze-manifest.yaml: PRIME_RL_RUN_MODE=freeze-finalize, PRIME_RL_BASELINE_MEAN=<step 2's mean>,
+#    tau/freeze-manifest.yaml: PRIME_RL_RUN_MODE=freeze-finalize, PRIME_RL_BASELINE_MEAN=<step 3's mean>,
 #    then re-render).
 python3 tau/render_image.py
 tau run --config tau/.rendered/freeze-manifest.yaml --context aks-ai-runtime-eastus2-admin
