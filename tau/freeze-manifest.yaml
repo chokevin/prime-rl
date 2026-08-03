@@ -18,7 +18,7 @@ runtime:
     WANDB_MODE: offline
     PRIME_RL_RUN_MODE: freeze-draft # switch to freeze-finalize for the second pass
     PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
-    PRIME_RL_REPO_SHA: 9444b3dfe143abb1a9d8d392cfe60ad007e0bc1c
+    PRIME_RL_REPO_SHA: 3cca467804ba0dd5aa473b0b8ecdda04bb900ffa
     PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
     PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
     PRIME_RL_MODEL_NAME: Qwen/Qwen2.5-7B-Instruct

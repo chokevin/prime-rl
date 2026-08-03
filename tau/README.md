@@ -76,7 +76,7 @@ The manifest's `org.opencontainers.image.revision` annotation is
 `bbb90a1b4132c351cbe8b0ed1fa808dde99f0318` — exactly this branch's merge-base commit (the
 sync branch's tree is byte-identical to upstream `bbb90a1b4`; see the `/goal` plan's
 Baseline section). The immutable runtime overlay is
-`9444b3dfe143abb1a9d8d392cfe60ad007e0bc1c`. That commit contains the complete Tau
+`3cca467804ba0dd5aa473b0b8ecdda04bb900ffa`. That commit contains the complete Tau
 wrapper/eval tooling and the workspace-locked `environments/harder_math_v1` package.
 Its dependency set matches the pinned image: `harder-math-v1` uses only `datasets` and
 `verifiers`, which are already present. The later integration commit changes only
@@ -226,7 +226,7 @@ step override. The handoff never enumerates a storage directory.
 ### Proof ladder (in order)
 
 Before any of this, confirm every target pins
-`9444b3dfe143abb1a9d8d392cfe60ad007e0bc1c`, then render the image pin with
+`3cca467804ba0dd5aa473b0b8ecdda04bb900ffa`, then render the image pin with
 `uv run --no-sync python tau/render_image.py`. The base model and training dataset
 revisions are already immutable pins. Every command below points at
 `tau/.rendered/<target>.yaml`, never the bare `tau/<target>.yaml` template, so pin
@@ -276,6 +276,10 @@ tau run get prime-rl-math-7b-h200-train -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact training-result.json
 tau run get prime-rl-math-7b-h200-train -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact "attempts/${ATTEMPT_ID}/run-output/metrics.jsonl"
+# Only if supervisor logs report private cleanup failure after durable success:
+tau run get prime-rl-math-7b-h200-train -n pretraining-data \
+  --context aks-ai-runtime-eastus2-admin \
+  --artifact "attempts/${ATTEMPT_ID}/private-cleanup-diagnostic.json"
 
 # 6. Post-training eval + comparison (1 GPU) — consumes only the fixed verified
 #    all fixed training evidence, then copies train/final-adapter into job-private
@@ -339,6 +343,14 @@ for explicit hash-bound recovery, while a conflicting adapter fails closed. A ve
 adapter reused from an earlier attempt is likewise preserved. Cancellation remains failure
 even if the child reports zero; the next normal submission receives a fresh attempt ID.
 
+After `training-result.json` and its bound artifacts strict-reload successfully, failure to
+remove the job-private run root cannot invalidate that durable success. The supervisor
+atomically writes the attempt-scoped
+`attempts/<attempt-id>/private-cleanup-diagnostic.json` before logging the cleanup error.
+That optional artifact records diagnostics only; it does not alter or replace success
+evidence. If diagnostic persistence or stderr itself fails, exit remains zero and the
+already-verified success evidence remains immutable.
+
 Every fetch above names an explicit `--artifact <file>` rather than listing the output
 directory: W1's storage proof found directory listing on `blob-training` unreliable
 (exact-file write/fetch/re-fetch passed; listing did not), so every script in this
@@ -365,7 +377,7 @@ storage proof) — fetch each by its exact name with `--artifact <file>`.
 | `freeze-manifest` | `.../prime-rl-math-7b-h200/manifest` | `draft-manifest.json`, `frozen-eval-manifest.json` | unfrozen draft (pass 1) and the immutable frozen manifest (pass 2) `tau/eval_tools/manifest.py` reads/writes |
 | `eval-baseline` | `.../prime-rl-math-7b-h200/eval-baseline` | `rewards.json`, `inference.log` | baseline per-example rewards (`RewardRecord`) `tau/eval_tools/compare.py` consumes |
 | `eval-post` | `.../prime-rl-math-7b-h200/eval-post` | `rewards.json`, `comparison.json`, `inference.log` | post-training rewards + the `ComparisonResult` (delta, bootstrap CI, pass/fail) |
-| `train` | `.../prime-rl-math-7b-h200/train` | fixed `training-result.json` and `final-adapter/`; exact logged `attempts/<attempt-id>/{preflight.json,resolved-train.toml,completion.json,publication.json,run-output/metrics.jsonl}` | the trusted supervisor owns launch and attestation; attempt evidence binds the exact config/process/STABLE adapter, publication fsyncs and atomically installs without replacement, and writes the fixed result last |
+| `train` | `.../prime-rl-math-7b-h200/train` | fixed `training-result.json` and `final-adapter/`; exact logged `attempts/<attempt-id>/{preflight.json,resolved-train.toml,completion.json,publication.json,run-output/metrics.jsonl}`; optional `attempts/<attempt-id>/private-cleanup-diagnostic.json` | the trusted supervisor owns launch and attestation; attempt evidence binds the exact config/process/STABLE adapter, publication fsyncs and atomically installs without replacement, and writes the fixed result last; a post-success private-cleanup failure writes the optional diagnostic without changing success |
 
 Explicit-file fetch while the run's Workload/Job still exists (the proven, reliable path):
 
@@ -387,7 +399,7 @@ tau run get <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admi
 ## Operator commands
 
 **Before every submit:** confirm all five checked-in templates pin the immutable runtime
-overlay `9444b3dfe143abb1a9d8d392cfe60ad007e0bc1c`, then render. Do not replace it with the
+overlay `3cca467804ba0dd5aa473b0b8ecdda04bb900ffa`, then render. Do not replace it with the
 later integration/pin commit: that would be a self-reference and that commit changes no
 runtime code. The pinned `Qwen/Qwen2.5-7B-Instruct` revision is
 `a09a35458c702b33eeacc393d103063234e8bc28`. Every model-serving phase downloads that
@@ -465,7 +477,7 @@ Run all of the following before any submit:
   field-by-field against `packages/prime-rl-configs/src/prime_rl/configs/{rl,orchestrator,trainer}.py`.
 - `PYTHONPATH=.:src uv run --no-project` with editable `prime-rl-configs`,
   `verifiers`, `math-env-v1`, and `math500-v1`, then
-  `pytest -q tau/eval_tools/tests` — 131 tests covering content manifests,
+  `pytest -q tau/eval_tools/tests` — 141 tests covering content manifests,
   path/symlink rejection, ordered train identity, immutable attempt/process evidence,
   a non-mocked real-`RLConfig` TOML round trip, locked-HF snapshot symlink cleanup,
   fixed bootstrap, cancellation, and retry/recovery-safe atomic publication.
@@ -478,7 +490,7 @@ Run all of the following before any submit:
 - No Tau job has been submitted (no `--dry-run=server`, no real submit). This session's
   scope (W4b) was static config/scripts/tests; live cluster execution is W5–W8.
 - The previously reproduced local runtime blockers are covered at source commit
-  `9444b3dfe143abb1a9d8d392cfe60ad007e0bc1c`: cleanup was exercised against a real
+  `3cca467804ba0dd5aa473b0b8ecdda04bb900ffa`: cleanup was exercised against a real
   locked-`huggingface-hub==1.16.1` snapshot with symlinks, and fixed JSON evidence has
   interruption/race/retry coverage. This does not prove the end-to-end job.
 - The full `tau/eval_tools/live/*.py` phases have never been executed against the real
