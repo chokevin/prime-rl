@@ -21,12 +21,14 @@ name = "Qwen/Qwen2.5-7B-Instruct"
 project = "tau-math-7b-h200"
 name = "math-7b-h200-train"
 
+[file_monitor]
+
 [trainer.model.lora]
 rank = 16
 
 [trainer.ckpt.weights]
 # Write the raw LoRA adapter alongside merged weights so the standalone frozen eval
-# (tau/eval.yaml, PRIME_RL_EVAL_LABEL=post) can load just the adapter for inference.
+# (tau/eval-post.yaml, PRIME_RL_EVAL_LABEL=post) can load just the adapter for inference.
 save_adapter_separately = true
 
 [orchestrator]
@@ -42,6 +44,9 @@ name = "math-env"
 
 [orchestrator.train.source.env.taskset]
 id = "math-env-v1"
+dataset_name = "PrimeIntellect/Hendrycks-Math"
+dataset_subset = "default"
+dataset_split = "train"
 
 [orchestrator.train.source.env.taskset.task]
 # math-env-v1 defaults to an LLM reference-judge fallback for answers math-verify can't
@@ -62,7 +67,7 @@ type = "subprocess"
 # so this also runs as the in-run "startup" (base-model) eval at step 0. interval=25
 # with max_steps=50 above lands a periodic eval at step 25 and a final one at step 50;
 # adjust together if max_steps changes. This in-run eval is a monitoring signal only —
-# the frozen pre/post comparison in tau/eval.yaml + tau/eval_tools is the eval of
+# the frozen pre/post comparison in tau/eval-post.yaml + tau/eval_tools is the eval of
 # record for the hill-climb claim (see docs/model-env-selection memo's caveat that
 # aggregate training logs never substitute for the frozen paired eval).
 [orchestrator.eval]

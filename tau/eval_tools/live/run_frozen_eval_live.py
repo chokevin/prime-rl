@@ -30,12 +30,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tau.eval_tools.compare import RewardRecord
 from tau.eval_tools.hashing import hash_text
+from tau.eval_tools.json_io import write_json_exclusive
 from tau.eval_tools.manifest import FrozenEvalManifest
 
 
@@ -117,6 +118,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-concurrency", type=int, default=16)
     args = parser.parse_args(argv)
 
+    output_path = Path(args.output)
+    if output_path.exists():
+        raise FileExistsError(
+            f"{output_path} already exists; reward evidence is immutable. "
+            "Use comparison-only mode to retry comparison without rerunning evaluation."
+        )
+    if args.label == "baseline" and args.lora_name is not None:
+        raise ValueError("baseline evaluation must not request a LoRA adapter")
+    if args.label == "post" and args.lora_name is None:
+        raise ValueError("post evaluation requires --lora-name")
+
     manifest = FrozenEvalManifest.load(Path(args.manifest))
     triples = _reload_and_verify_examples(manifest)
     model_name = args.lora_name or args.served_model_name
@@ -131,15 +143,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
 
-    record = {
-        "manifest_identity_hash": manifest.identity_hash(),
-        "model_label": args.label,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "rewards": rewards,
-    }
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(record, indent=2) + "\n")
+    record = RewardRecord(
+        manifest_identity_hash=manifest.identity_hash(),
+        model_label=args.label,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        rewards=rewards,
+    )
+    write_json_exclusive(output_path, record.model_dump())
 
     mean_reward = sum(rewards.values()) / len(rewards) if rewards else 0.0
     print(f"ok: wrote {len(rewards)} {args.label} rewards (mean={mean_reward:.4f}) to {output_path}", file=sys.stderr)

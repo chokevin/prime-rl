@@ -22,6 +22,8 @@ runtime:
     # see tau/README.md's "Before every submit" step. Never leave this pointing at a
     # branch name: the overlay fetch verifies an exact SHA.
     PRIME_RL_REPO_SHA: REPLACE_WITH_EXACT_COMMIT_SHA
+    PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
+    PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
     PRIME_RL_CONFIG_REL: configs/tau/math-7b-h200/train.toml
 
 compute:

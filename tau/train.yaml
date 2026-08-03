@@ -2,16 +2,16 @@
 #
 # Runs configs/tau/math-7b-h200/train.toml via prime-rl's `rl` entrypoint, which
 # supervises the trainer, orchestrator, and inference server as one process group.
-# Refuses to start (tau/scripts/run-prime-rl.sh's `train` mode) unless
-# tau/freeze-manifest.yaml has already written frozen-eval-manifest.json — the
+# Refuses to start unless the finalized manifest, materialized base snapshot, and actual
+# reloaded training prompt identity all match. After successful RL it publishes one
+# verified fixed final-adapter and training-result.json handoff. The
 # in-training startup/periodic/final eval against math500-v1 (configured in the TOML)
 # is a monitoring signal only; the frozen manifest is what tau/eval-baseline.yaml and
 # tau/eval-post.yaml replay for the paired comparison that is the actual hill-climb
 # proof.
 #
-# PRIME_RL_MAX_STEPS overrides the TOML's placeholder max_steps once real H200
-# throughput is measured (see tau/README.md's proof ladder) — leave unset to use the
-# TOML's own value for an initial smoke-sized run.
+# PRIME_RL_MAX_STEPS is required: it bounds the run and names the exact final checkpoint
+# published after RL. Change it only after real H200 throughput is measured.
 name: prime-rl-math-7b-h200-train
 engine: job
 entrypoint: scripts/run-prime-rl.sh
@@ -23,11 +23,14 @@ runtime:
     PRIME_RL_RUN_MODE: train
     PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
     PRIME_RL_REPO_SHA: REPLACE_WITH_EXACT_COMMIT_SHA
+    PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
+    PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
+    PRIME_RL_MODEL_NAME: Qwen/Qwen2.5-7B-Instruct
+    PRIME_RL_MODEL_REVISION: a09a35458c702b33eeacc393d103063234e8bc28
     PRIME_RL_CONFIG_REL: configs/tau/math-7b-h200/train.toml
     PRIME_RL_MANIFEST_DIR: /data/pretraining-data/prime-rl-math-7b-h200/manifest
     HF_HOME: /data/pretraining-data/prime-rl-math-7b-h200/hf-cache
-    # PRIME_RL_MAX_STEPS: "50"
-    # PRIME_RL_CLEAN_OUTPUT_DIR: "1"
+    PRIME_RL_MAX_STEPS: "50"
 
 compute:
   gpus: 2

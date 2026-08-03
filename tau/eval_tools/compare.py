@@ -6,12 +6,14 @@ substitute for this — it is computed only from the two frozen per-example rewa
 
 from __future__ import annotations
 
-import json
+import math
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, field_validator
 
+from tau.eval_tools.json_io import load_json, write_json_exclusive
 from tau.eval_tools.manifest import FrozenEvalManifest
 
 #: The goal harness's fixed acceptance thresholds (see the parent plan's "Measured hill
@@ -30,18 +32,46 @@ class IdentityMismatchError(ValueError):
 class RewardRecord(BaseModel):
     """One `<label>-rewards.json` file written by `live/run_frozen_eval_live.py`."""
 
+    model_config = ConfigDict(extra="forbid")
+
     manifest_identity_hash: str
-    model_label: str
+    model_label: Literal["baseline", "post"]
     created_at: str
     rewards: dict[str, float]
     """Example id (as string, for JSON-object-key portability) -> binary reward."""
 
+    @field_validator("manifest_identity_hash")
+    @classmethod
+    def validate_manifest_identity_hash(cls, digest: str) -> str:
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError("manifest identity must be a lowercase SHA-256 hex digest")
+        return digest
+
+    @field_validator("rewards", mode="before")
+    @classmethod
+    def validate_rewards(cls, rewards):
+        if not isinstance(rewards, dict):
+            raise ValueError("rewards must be a JSON object keyed by example id")
+        for example_id, reward in rewards.items():
+            if not isinstance(example_id, str) or not example_id.isdigit() or str(int(example_id)) != example_id:
+                raise ValueError(f"reward example id {example_id!r} is not a canonical non-negative integer")
+            if isinstance(reward, bool) or not isinstance(reward, (int, float)):
+                raise ValueError(f"reward for example {example_id!r} must be numeric")
+            if not math.isfinite(reward) or float(reward) not in (0.0, 1.0):
+                raise ValueError(
+                    f"reward for example {example_id!r} is {reward!r}; "
+                    "the pinned math grader domain is exactly {0.0, 1.0}"
+                )
+        return rewards
+
     @classmethod
     def load(cls, path: Path) -> "RewardRecord":
-        return cls.model_validate_json(Path(path).read_text())
+        return cls.model_validate(load_json(path))
 
 
 class ComparisonResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     n: int
     baseline_mean: float
     post_mean: float
@@ -96,6 +126,10 @@ def compare_runs(
     the paired delta, bootstrap CI, and pass/fail gate."""
     identity = manifest.identity_hash()
     for label, record in (("baseline", baseline), ("post", post)):
+        if record.model_label != label:
+            raise IdentityMismatchError(
+                f"{label} input carries model_label={record.model_label!r}; refusing a swapped or mislabeled comparison"
+            )
         if record.manifest_identity_hash != identity:
             raise IdentityMismatchError(
                 f"{label} reward file's manifest_identity_hash "
@@ -152,6 +186,4 @@ def compare_from_paths(
 
 
 def write_result(result: ComparisonResult, path: Path) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(result.model_dump(), indent=2) + "\n")
+    write_json_exclusive(path, result.model_dump())

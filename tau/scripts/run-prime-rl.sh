@@ -32,8 +32,32 @@ die() {
 : "${TAU_OUTPUT_DIR:?TAU_OUTPUT_DIR not set by Tau}"
 : "${PRIME_RL_REPO_URL:?PRIME_RL_REPO_URL must be set (e.g. https://github.com/chokevin/prime-rl.git)}"
 : "${PRIME_RL_REPO_SHA:?PRIME_RL_REPO_SHA must be set to the exact commit to overlay}"
+: "${PRIME_RL_VERIFIERS_SHA:?PRIME_RL_VERIFIERS_SHA must pin deps/verifiers}"
+: "${PRIME_RL_TASKSETS_SHA:?PRIME_RL_TASKSETS_SHA must pin deps/research-environments}"
 
-OVERLAY_DIR="${PRIME_RL_OVERLAY_DIR:-/tmp/prime-rl-overlay}"
+[[ "$PRIME_RL_REPO_SHA" =~ ^[0-9a-f]{40}$ ]] || die "PRIME_RL_REPO_SHA must be a full lowercase 40-character commit SHA"
+[[ "$PRIME_RL_VERIFIERS_SHA" =~ ^[0-9a-f]{40}$ ]] || die "PRIME_RL_VERIFIERS_SHA must be a full lowercase 40-character commit SHA"
+[[ "$PRIME_RL_TASKSETS_SHA" =~ ^[0-9a-f]{40}$ ]] || die "PRIME_RL_TASKSETS_SHA must be a full lowercase 40-character commit SHA"
+
+CHILD_PID=""
+OVERLAY_DIR="$(mktemp -d /tmp/prime-rl-overlay.XXXXXX)"
+case "$OVERLAY_DIR" in
+/tmp/prime-rl-overlay.*) ;;
+*) die "mktemp returned unsafe overlay path ${OVERLAY_DIR}" ;;
+esac
+
+cleanup() {
+    if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+        log "stopping child process (pid ${CHILD_PID})"
+        kill -TERM "$CHILD_PID" 2>/dev/null || true
+        wait "$CHILD_PID" 2>/dev/null || true
+    fi
+    case "$OVERLAY_DIR" in
+    /tmp/prime-rl-overlay.*) rm -rf -- "$OVERLAY_DIR" ;;
+    *) log "refusing to remove unsafe overlay path ${OVERLAY_DIR}" ;;
+    esac
+}
+trap cleanup EXIT INT TERM
 
 # --- Step 1: immutable source overlay ------------------------------------------------
 # Fetch the exact pinned commit into a scratch checkout and verify it landed precisely
@@ -45,7 +69,6 @@ OVERLAY_DIR="${PRIME_RL_OVERLAY_DIR:-/tmp/prime-rl-overlay}"
 # see tau/README.md's "Image and overlay strategy" for the full argument and the
 # narrow, opt-in escape hatch below for a future dependency-adding commit).
 log "fetching ${PRIME_RL_REPO_URL}@${PRIME_RL_REPO_SHA} into ${OVERLAY_DIR}"
-rm -rf "$OVERLAY_DIR"
 git init --quiet "$OVERLAY_DIR"
 git -C "$OVERLAY_DIR" remote add origin "$PRIME_RL_REPO_URL"
 git -C "$OVERLAY_DIR" fetch --quiet --depth 1 origin "$PRIME_RL_REPO_SHA"
@@ -53,6 +76,16 @@ git -C "$OVERLAY_DIR" checkout --quiet --force FETCH_HEAD
 resolved_sha="$(git -C "$OVERLAY_DIR" rev-parse HEAD)"
 [ "$resolved_sha" = "$PRIME_RL_REPO_SHA" ] || die "overlay checkout resolved to ${resolved_sha}, expected ${PRIME_RL_REPO_SHA} — aborting rather than run an unverified tree"
 log "overlay verified at ${resolved_sha}"
+
+verify_gitlink() {
+    local path="$1" expected="$2" entry mode type actual
+    entry="$(git -C "$OVERLAY_DIR" ls-tree HEAD -- "$path")"
+    read -r mode type actual _ <<<"$entry"
+    [ "$mode" = "160000" ] && [ "$type" = "commit" ] || die "${path} is not a pinned gitlink at ${resolved_sha}"
+    [ "$actual" = "$expected" ] || die "${path} is pinned to ${actual}, expected ${expected}"
+}
+verify_gitlink deps/verifiers "$PRIME_RL_VERIFIERS_SHA"
+verify_gitlink deps/research-environments "$PRIME_RL_TASKSETS_SHA"
 
 # Optional narrow install of one repo-local environment package — forward-compatible
 # with a future harder-math environment (W4a/W9), not used by the primary
@@ -71,24 +104,23 @@ cd /app
 export PYTHONPATH="${OVERLAY_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 # --- Step 2: child-process lifecycle helpers -----------------------------------------
-CHILD_PID=""
-cleanup() {
-    if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
-        log "stopping child process (pid ${CHILD_PID})"
-        kill -TERM "$CHILD_PID" 2>/dev/null || true
-        wait "$CHILD_PID" 2>/dev/null || true
-    fi
-}
 # Backgrounding the long-running child + trapping here (rather than running it in the
 # foreground) is required, not decorative: bash defers a foreground command's signal
 # delivery until that command exits, so a SIGTERM sent to this script (Tau/Kubernetes
 # cancellation, or a resilience-triggered retry) would otherwise never reach us until
 # the child already finished on its own.
-trap cleanup EXIT INT TERM
-
 wait_for_health() {
     local url="$1" timeout_s="${2:-1800}" waited=0
     until curl -sf -o /dev/null "$url"; do
+        if [ -n "$CHILD_PID" ] && ! kill -0 "$CHILD_PID" 2>/dev/null; then
+            if wait "$CHILD_PID"; then
+                child_status=0
+            else
+                child_status=$?
+            fi
+            CHILD_PID=""
+            die "inference server exited before readiness (status ${child_status}; ${url})"
+        fi
         if [ "$waited" -ge "$timeout_s" ]; then
             die "inference server did not become healthy within ${timeout_s}s (${url})"
         fi
@@ -102,25 +134,50 @@ wait_for_health() {
 case "$PRIME_RL_RUN_MODE" in
 smoke)
     : "${PRIME_RL_CONFIG_REL:?PRIME_RL_CONFIG_REL must be set for smoke mode}"
+    [ ! -e "${TAU_OUTPUT_DIR}/smoke-result.json" ] || die "${TAU_OUTPUT_DIR}/smoke-result.json already exists; smoke evidence is immutable"
     log "config smoke: uv run rl --dry-run @ ${OVERLAY_DIR}/${PRIME_RL_CONFIG_REL}"
     uv run --no-sync rl @ "${OVERLAY_DIR}/${PRIME_RL_CONFIG_REL}" \
         --output-dir "$TAU_OUTPUT_DIR" --dry-run
+    uv run --no-sync python -m tau.eval_tools.cli write-smoke-result \
+        --output "${TAU_OUTPUT_DIR}/smoke-result.json" \
+        --source-revision "$resolved_sha" \
+        --config-path "$PRIME_RL_CONFIG_REL" \
+        --configs-dir "${TAU_OUTPUT_DIR}/configs"
     log "smoke OK: resolved per-process TOMLs written under ${TAU_OUTPUT_DIR}/configs/"
     ;;
 
 freeze-draft)
     : "${PRIME_RL_MODEL_NAME:?PRIME_RL_MODEL_NAME must be set}"
+    : "${PRIME_RL_MODEL_REVISION:?PRIME_RL_MODEL_REVISION must be an exact HF commit SHA}"
     : "${PRIME_RL_MANIFEST_DIR:?PRIME_RL_MANIFEST_DIR must be set}"
+    : "${PRIME_RL_TRAIN_DATASET_REVISION:?PRIME_RL_TRAIN_DATASET_REVISION must be an exact HF dataset commit SHA}"
+    : "${HF_HOME:?HF_HOME must point at durable storage for the materialized model snapshot}"
     uv run --no-sync python -m tau.eval_tools.live.freeze_manifest_live draft \
         --model-name "$PRIME_RL_MODEL_NAME" \
+        --model-revision "$PRIME_RL_MODEL_REVISION" \
+        --model-cache-dir "$HF_HOME" \
+        --train-dataset-revision "$PRIME_RL_TRAIN_DATASET_REVISION" \
+        --source-revision "$resolved_sha" \
+        --verifiers-revision "$PRIME_RL_VERIFIERS_SHA" \
+        --tasksets-revision "$PRIME_RL_TASKSETS_SHA" \
         --out "${PRIME_RL_MANIFEST_DIR}/draft-manifest.json" \
         --temperature "${PRIME_RL_EVAL_TEMPERATURE:-0.0}" \
         --seed "${PRIME_RL_EVAL_SEED:-0}"
     ;;
 
 freeze-finalize)
+    : "${PRIME_RL_MODEL_NAME:?PRIME_RL_MODEL_NAME must be set}"
+    : "${PRIME_RL_MODEL_REVISION:?PRIME_RL_MODEL_REVISION must be an exact HF commit SHA}"
     : "${PRIME_RL_MANIFEST_DIR:?PRIME_RL_MANIFEST_DIR must be set}"
     : "${PRIME_RL_BASELINE_MEAN:?PRIME_RL_BASELINE_MEAN must be set to the mean reward measured by the eval-baseline target against the draft manifest}"
+    uv run --no-sync python -m tau.eval_tools.cli validate-manifest \
+        --manifest "${PRIME_RL_MANIFEST_DIR}/draft-manifest.json" \
+        --source-revision "$resolved_sha" \
+        --verifiers-revision "$PRIME_RL_VERIFIERS_SHA" \
+        --tasksets-revision "$PRIME_RL_TASKSETS_SHA" \
+        --model-name "$PRIME_RL_MODEL_NAME" \
+        --model-revision "$PRIME_RL_MODEL_REVISION" \
+        >/dev/null
     uv run --no-sync python -m tau.eval_tools.live.freeze_manifest_live finalize \
         --draft "${PRIME_RL_MANIFEST_DIR}/draft-manifest.json" \
         --baseline-mean "$PRIME_RL_BASELINE_MEAN" \
@@ -130,50 +187,90 @@ freeze-finalize)
 eval)
     : "${PRIME_RL_EVAL_LABEL:?PRIME_RL_EVAL_LABEL must be baseline or post}"
     : "${PRIME_RL_MODEL_NAME:?PRIME_RL_MODEL_NAME must be set}"
+    : "${PRIME_RL_MODEL_REVISION:?PRIME_RL_MODEL_REVISION must be an exact HF commit SHA}"
     : "${PRIME_RL_MANIFEST_PATH:?PRIME_RL_MANIFEST_PATH must be set (draft for the very first baseline, frozen thereafter)}"
+    case "$PRIME_RL_EVAL_LABEL" in
+    baseline | post) ;;
+    *) die "PRIME_RL_EVAL_LABEL must be baseline or post" ;;
+    esac
+    manifest_args=(
+        --manifest "$PRIME_RL_MANIFEST_PATH"
+        --source-revision "$resolved_sha"
+        --verifiers-revision "$PRIME_RL_VERIFIERS_SHA"
+        --tasksets-revision "$PRIME_RL_TASKSETS_SHA"
+        --model-name "$PRIME_RL_MODEL_NAME"
+        --model-revision "$PRIME_RL_MODEL_REVISION"
+    )
     if [ "$PRIME_RL_EVAL_LABEL" = "post" ]; then
         : "${PRIME_RL_BASELINE_REWARDS_PATH:?PRIME_RL_BASELINE_REWARDS_PATH must be set for the post-training comparison}"
+        : "${PRIME_RL_LORA_ADAPTER_PATH:?PRIME_RL_LORA_ADAPTER_PATH must be set for post eval}"
+        : "${PRIME_RL_TRAINING_RESULT_PATH:?PRIME_RL_TRAINING_RESULT_PATH must be set for post eval}"
+        : "${PRIME_RL_FINAL_STEP:?PRIME_RL_FINAL_STEP must match the exact bounded final training step}"
+        [[ "$PRIME_RL_FINAL_STEP" =~ ^[1-9][0-9]*$ ]] || die "PRIME_RL_FINAL_STEP must be a positive integer"
+        manifest_args+=(--require-finalized)
     fi
+    model_snapshot_path="$(uv run --no-sync python -m tau.eval_tools.cli validate-manifest "${manifest_args[@]}")"
 
-    inference_args=(--model.name "$PRIME_RL_MODEL_NAME" --server.port 8000)
+    # A standalone eval has one engine and needs no routing layer. Running the bare
+    # engine keeps health, admin, and OpenAI requests on the same source-supported port.
+    inference_args=(--model.name "$model_snapshot_path" --server.port 8000 --router None)
     lora_name=""
-    if [ -n "${PRIME_RL_LORA_ADAPTER_PATH:-}" ]; then
-        inference_args+=(--enable-lora)
+    if [ "$PRIME_RL_EVAL_LABEL" = "post" ]; then
+        uv run --no-sync python -m tau.eval_tools.cli validate-adapter-handoff \
+            --manifest "$PRIME_RL_MANIFEST_PATH" \
+            --training-result "$PRIME_RL_TRAINING_RESULT_PATH" \
+            --adapter-path "$PRIME_RL_LORA_ADAPTER_PATH" \
+            --final-step "$PRIME_RL_FINAL_STEP" \
+            --lora-rank 16
+        inference_args+=(--enable-lora --max-lora-rank 16)
         lora_name="post-adapter"
     fi
 
-    log "starting inference server: uv run inference ${inference_args[*]}"
-    uv run --no-sync inference "${inference_args[@]}" >"${TAU_OUTPUT_DIR}/inference.log" 2>&1 &
-    CHILD_PID=$!
+    rewards_path="${TAU_OUTPUT_DIR}/rewards.json"
+    if [ "${PRIME_RL_COMPARE_ONLY:-0}" != "1" ]; then
+        [ ! -e "$rewards_path" ] || die "${rewards_path} already exists; reward evidence is immutable"
+        [ ! -e "${TAU_OUTPUT_DIR}/inference.log" ] || die "${TAU_OUTPUT_DIR}/inference.log already exists"
+        log "starting inference server: uv run inference ${inference_args[*]}"
+        uv run --no-sync inference "${inference_args[@]}" >"${TAU_OUTPUT_DIR}/inference.log" 2>&1 &
+        CHILD_PID=$!
 
-    wait_for_health "http://localhost:8000/health" "${PRIME_RL_HEALTH_TIMEOUT_S:-1800}"
+        wait_for_health "http://localhost:8000/health" "${PRIME_RL_HEALTH_TIMEOUT_S:-1800}"
 
-    if [ -n "$lora_name" ]; then
-        log "loading LoRA adapter ${PRIME_RL_LORA_ADAPTER_PATH} as ${lora_name}"
-        curl -sf -X POST "http://localhost:8000/load_lora_adapter" \
-            -H 'Content-Type: application/json' \
-            -d "{\"lora_name\": \"${lora_name}\", \"lora_path\": \"${PRIME_RL_LORA_ADAPTER_PATH}\"}" \
-            >/dev/null
+        if [ -n "$lora_name" ]; then
+            log "loading LoRA adapter ${PRIME_RL_LORA_ADAPTER_PATH} as ${lora_name}"
+            curl -fsS -X POST "http://localhost:8000/load_lora_adapter" \
+                -H 'Content-Type: application/json' \
+                -d "{\"lora_name\": \"${lora_name}\", \"lora_path\": \"${PRIME_RL_LORA_ADAPTER_PATH}\"}" \
+                >/dev/null
+            curl -fsS -o /dev/null "http://localhost:8000/health"
+        fi
+
+        eval_args=(
+            --manifest "$PRIME_RL_MANIFEST_PATH"
+            --base-url "http://localhost:8000/v1"
+            --served-model-name "$model_snapshot_path"
+            --label "$PRIME_RL_EVAL_LABEL"
+            --output "$rewards_path"
+        )
+        [ -n "$lora_name" ] && eval_args+=(--lora-name "$lora_name")
+        uv run --no-sync python -m tau.eval_tools.live.run_frozen_eval_live "${eval_args[@]}"
+    else
+        [ "$PRIME_RL_EVAL_LABEL" = "post" ] || die "PRIME_RL_COMPARE_ONLY=1 is valid only for post eval"
+        [ -f "$rewards_path" ] || die "comparison-only retry requires existing immutable post rewards at ${rewards_path}"
     fi
 
-    rewards_path="${TAU_OUTPUT_DIR}/rewards.json"
-    eval_args=(
-        --manifest "$PRIME_RL_MANIFEST_PATH"
-        --base-url "http://localhost:8000/v1"
-        --served-model-name "$PRIME_RL_MODEL_NAME"
-        --label "$PRIME_RL_EVAL_LABEL"
-        --output "$rewards_path"
-    )
-    [ -n "$lora_name" ] && eval_args+=(--lora-name "$lora_name")
-    uv run --no-sync python -m tau.eval_tools.live.run_frozen_eval_live "${eval_args[@]}"
-
     if [ "$PRIME_RL_EVAL_LABEL" = "post" ]; then
+        comparison_path="${PRIME_RL_COMPARISON_OUTPUT_PATH:-${TAU_OUTPUT_DIR}/comparison.json}"
+        case "$comparison_path" in
+        "${TAU_OUTPUT_DIR}"/*) ;;
+        *) die "PRIME_RL_COMPARISON_OUTPUT_PATH must be a named file under ${TAU_OUTPUT_DIR}" ;;
+        esac
         log "comparing baseline vs post rewards against the pass/fail gate"
         uv run --no-sync python -m tau.eval_tools.cli compare \
             --manifest "$PRIME_RL_MANIFEST_PATH" \
             --baseline "$PRIME_RL_BASELINE_REWARDS_PATH" \
             --post "$rewards_path" \
-            --output "${TAU_OUTPUT_DIR}/comparison.json"
+            --output "$comparison_path"
         # `compare` exits nonzero on a failed gate; with `set -e` that fails this job,
         # which is the intended, honest signal — never overridden or ignored here.
     fi
@@ -182,20 +279,48 @@ eval)
 train)
     : "${PRIME_RL_CONFIG_REL:?PRIME_RL_CONFIG_REL must be set for train mode}"
     : "${PRIME_RL_MANIFEST_DIR:?PRIME_RL_MANIFEST_DIR must be set}"
+    : "${PRIME_RL_MODEL_NAME:?PRIME_RL_MODEL_NAME must be set}"
+    : "${PRIME_RL_MODEL_REVISION:?PRIME_RL_MODEL_REVISION must be an exact HF commit SHA}"
+    : "${PRIME_RL_MAX_STEPS:?PRIME_RL_MAX_STEPS must select the exact bounded final training step}"
+    [[ "$PRIME_RL_MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || die "PRIME_RL_MAX_STEPS must be a positive integer"
     frozen_manifest="${PRIME_RL_MANIFEST_DIR}/frozen-eval-manifest.json"
     if [ ! -f "$frozen_manifest" ]; then
         die "frozen eval manifest not found at ${frozen_manifest} — run freeze-draft, measure the baseline eval, then freeze-finalize before training. Refusing to start training without a pre-committed held-out eval (see tau/README.md's proof ladder)."
     fi
-    log "frozen eval manifest present at ${frozen_manifest} — proceeding"
+    [ ! -e "${TAU_OUTPUT_DIR}/training-result.json" ] || die "${TAU_OUTPUT_DIR}/training-result.json already exists; training evidence is immutable"
+    [ ! -e "${TAU_OUTPUT_DIR}/final-adapter" ] || die "${TAU_OUTPUT_DIR}/final-adapter already exists; adapter handoff is immutable"
+    model_snapshot_path="$(
+        uv run --no-sync python -m tau.eval_tools.cli validate-manifest \
+            --manifest "$frozen_manifest" \
+            --source-revision "$resolved_sha" \
+            --verifiers-revision "$PRIME_RL_VERIFIERS_SHA" \
+            --tasksets-revision "$PRIME_RL_TASKSETS_SHA" \
+            --model-name "$PRIME_RL_MODEL_NAME" \
+            --model-revision "$PRIME_RL_MODEL_REVISION" \
+            --require-finalized
+    )"
+    export HF_DATASETS_OFFLINE=1
+    pinned_training_config="${OVERLAY_DIR}/pinned-training.toml"
+    uv run --no-sync python -m tau.eval_tools.live.validate_training_data_live \
+        --manifest "$frozen_manifest" \
+        --config "${OVERLAY_DIR}/${PRIME_RL_CONFIG_REL}" \
+        --output-config "$pinned_training_config"
+    log "frozen manifest, model snapshot, and training-data identity verified — proceeding"
 
-    rl_args=(--output-dir "$TAU_OUTPUT_DIR")
-    [ -n "${PRIME_RL_MAX_STEPS:-}" ] && rl_args+=(--max-steps "$PRIME_RL_MAX_STEPS")
-    [ "${PRIME_RL_CLEAN_OUTPUT_DIR:-0}" = "1" ] && rl_args+=(--clean-output-dir)
+    rl_args=(--output-dir "$TAU_OUTPUT_DIR" --model.name "$model_snapshot_path" --max-steps "$PRIME_RL_MAX_STEPS")
 
-    log "starting bounded RL training: uv run rl @ ${OVERLAY_DIR}/${PRIME_RL_CONFIG_REL} ${rl_args[*]}"
-    uv run --no-sync rl @ "${OVERLAY_DIR}/${PRIME_RL_CONFIG_REL}" "${rl_args[@]}" &
+    log "starting bounded RL training: uv run rl @ ${pinned_training_config} ${rl_args[*]}"
+    uv run --no-sync rl @ "$pinned_training_config" "${rl_args[@]}" &
     CHILD_PID=$!
     wait "$CHILD_PID"
+    CHILD_PID=""
+    [ -s "${TAU_OUTPUT_DIR}/metrics.jsonl" ] || die "training completed without the configured metrics.jsonl artifact"
+    uv run --no-sync python -m tau.eval_tools.cli publish-training-result \
+        --manifest "$frozen_manifest" \
+        --output-dir "$TAU_OUTPUT_DIR" \
+        --source-revision "$resolved_sha" \
+        --final-step "$PRIME_RL_MAX_STEPS" \
+        --lora-rank 16
     ;;
 
 *)

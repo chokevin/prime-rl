@@ -8,11 +8,24 @@ from tau.eval_tools.compare import (
     RewardRecord,
     compare_runs,
     paired_bootstrap_ci,
+    write_result,
 )
 from tau.eval_tools.hashing import hash_text
-from tau.eval_tools.manifest import DecodingConfig, ExampleRecord, ModelSnapshot, TasksetRef, build_manifest
+from tau.eval_tools.json_io import DuplicateKeyError
+from tau.eval_tools.manifest import (
+    DecodingConfig,
+    ExampleRecord,
+    ModelSnapshot,
+    TasksetRef,
+    TrainingDataIdentity,
+    build_manifest,
+)
 
 N = 200
+SOURCE_REVISION = "a" * 40
+VERIFIERS_REVISION = "b" * 40
+TASKSETS_REVISION = "c" * 40
+MODEL_REVISION = "d" * 40
 
 
 def _manifest(n: int = N):
@@ -21,9 +34,31 @@ def _manifest(n: int = N):
         for i in range(n)
     ]
     return build_manifest(
-        model=ModelSnapshot(name="Qwen/Qwen2.5-7B-Instruct", revision="deadbeef"),
-        eval_taskset=TasksetRef(id="math500-v1", dataset_name="HuggingFaceH4/MATH-500", dataset_split="test"),
-        train_taskset=TasksetRef(id="math-env-v1", dataset_name="PrimeIntellect/Hendrycks-Math", dataset_split="train"),
+        state="finalized",
+        source_revision=SOURCE_REVISION,
+        verifiers_revision=VERIFIERS_REVISION,
+        model=ModelSnapshot(
+            name="Qwen/Qwen2.5-7B-Instruct",
+            revision=MODEL_REVISION,
+            local_path=f"/tmp/models/{MODEL_REVISION}",
+        ),
+        eval_taskset=TasksetRef(
+            id="math500-v1",
+            taskset_revision=TASKSETS_REVISION,
+            dataset_name="HuggingFaceH4/MATH-500",
+            dataset_subset=None,
+            dataset_split="test",
+            dataset_revision="6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be",
+        ),
+        train_taskset=TasksetRef(
+            id="math-env-v1",
+            taskset_revision=TASKSETS_REVISION,
+            dataset_name="PrimeIntellect/Hendrycks-Math",
+            dataset_subset="default",
+            dataset_split="train",
+            dataset_revision="e" * 40,
+        ),
+        training_data=TrainingDataIdentity.from_prompt_hashes([hash_text(f"training problem {i}") for i in range(300)]),
         examples=examples,
         decoding=DecodingConfig(temperature=0.0, seed=0),
         grader="verifiers.v1.scoring.verify_boxed_math_answer",
@@ -106,8 +141,8 @@ def test_compare_runs_fails_when_delta_meets_bar_but_ci_crosses_zero():
 def test_compare_runs_raises_on_identity_mismatch():
     manifest = _manifest()
     other_manifest = _manifest(n=201)
-    baseline_rewards = {i: 0.5 for i in range(N)}
-    post_rewards = {i: 0.5 for i in range(N)}
+    baseline_rewards = {i: 0.0 for i in range(N)}
+    post_rewards = {i: 0.0 for i in range(N)}
     baseline = _reward_record(manifest, baseline_rewards, model_label="baseline")
     # post computed against a *different* frozen manifest (wrong identity hash).
     post = _reward_record(other_manifest, post_rewards, model_label="post")
@@ -118,10 +153,57 @@ def test_compare_runs_raises_on_identity_mismatch():
 
 def test_compare_runs_raises_on_example_id_mismatch():
     manifest = _manifest()
-    baseline_rewards = {i: 0.5 for i in range(N)}
-    post_rewards = {i: 0.5 for i in range(N - 1)}  # missing one id
+    baseline_rewards = {i: 0.0 for i in range(N)}
+    post_rewards = {i: 0.0 for i in range(N - 1)}  # missing one id
     baseline = _reward_record(manifest, baseline_rewards, model_label="baseline")
     post = _reward_record(manifest, post_rewards, model_label="post")
 
     with pytest.raises(IdentityMismatchError, match="example ids"):
         compare_runs(manifest, baseline, post)
+
+
+def test_compare_runs_rejects_swapped_labels():
+    manifest = _manifest()
+    rewards = {i: 0.0 for i in range(N)}
+    baseline = _reward_record(manifest, rewards, model_label="post")
+    post = _reward_record(manifest, rewards, model_label="baseline")
+    with pytest.raises(IdentityMismatchError, match="mislabeled"):
+        compare_runs(manifest, baseline, post)
+
+
+@pytest.mark.parametrize("reward", [float("nan"), float("inf"), -0.1, 0.5, 1.1])
+def test_reward_record_rejects_values_outside_binary_grader_domain(reward):
+    manifest = _manifest()
+    with pytest.raises(ValueError, match="grader domain"):
+        _reward_record(manifest, {0: reward}, model_label="baseline")
+
+
+def test_reward_record_load_rejects_duplicate_json_keys(tmp_path):
+    path = tmp_path / "rewards.json"
+    path.write_text(
+        '{"manifest_identity_hash":"x","model_label":"baseline","created_at":"now","rewards":{"0":0.0,"0":1.0}}'
+    )
+    with pytest.raises(DuplicateKeyError, match="duplicate JSON key"):
+        RewardRecord.load(path)
+
+
+def test_reward_record_rejects_noncanonical_example_id():
+    manifest = _manifest()
+    with pytest.raises(ValueError, match="canonical"):
+        RewardRecord(
+            manifest_identity_hash=manifest.identity_hash(),
+            model_label="baseline",
+            created_at="now",
+            rewards={"00": 0.0},
+        )
+
+
+def test_write_result_refuses_to_overwrite(tmp_path):
+    manifest = _manifest()
+    baseline = _reward_record(manifest, {i: 0.0 for i in range(N)}, model_label="baseline")
+    post = _reward_record(manifest, {i: 1.0 for i in range(N)}, model_label="post")
+    result = compare_runs(manifest, baseline, post, n_bootstrap=100)
+    path = tmp_path / "comparison.json"
+    write_result(result, path)
+    with pytest.raises(FileExistsError):
+        write_result(result, path)

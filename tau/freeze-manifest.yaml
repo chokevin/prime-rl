@@ -1,9 +1,8 @@
 # Freeze (or draft) the held-out eval manifest: `tau run freeze-manifest`.
 #
-# CPU-only: loads math500-v1 (eval) and math-env-v1 (train), hashes every prompt, proves
-# zero train/eval overlap, and writes the frozen-eval-manifest.json that tau/train.yaml
-# refuses to start without. Needs network access to the HF Hub (dataset + model-info
-# lookups) but no GPU.
+# CPU-only: materializes the exact model snapshot, loads math500-v1 (eval) and math-env-v1
+# (train), records exact taskset/dataset revisions and prompt hashes, proves zero
+# train/eval overlap, and writes the manifest that tau/train.yaml strictly validates.
 #
 # Two-phase (see tau/eval_tools/live/freeze_manifest_live.py's docstring): run once with
 # PRIME_RL_RUN_MODE=freeze-draft, measure the baseline mean via tau/eval-baseline.yaml against
@@ -20,7 +19,11 @@ runtime:
     PRIME_RL_RUN_MODE: freeze-draft # switch to freeze-finalize for the second pass
     PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
     PRIME_RL_REPO_SHA: REPLACE_WITH_EXACT_COMMIT_SHA
+    PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
+    PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
     PRIME_RL_MODEL_NAME: Qwen/Qwen2.5-7B-Instruct
+    PRIME_RL_MODEL_REVISION: a09a35458c702b33eeacc393d103063234e8bc28
+    PRIME_RL_TRAIN_DATASET_REVISION: 3ed63f49541bdca4382fba28146aadf20d95cb38
     PRIME_RL_MANIFEST_DIR: /data/pretraining-data/prime-rl-math-7b-h200/manifest
     PRIME_RL_EVAL_TEMPERATURE: "0.0"
     PRIME_RL_EVAL_SEED: "0"

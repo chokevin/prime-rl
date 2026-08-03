@@ -8,6 +8,7 @@ held-out eval prompt set (train/eval leakage check).
 from __future__ import annotations
 
 import hashlib
+import json
 import unicodedata
 
 
@@ -35,3 +36,8 @@ def hash_text(text: str) -> str:
 
 def hash_texts(texts: list[str]) -> list[str]:
     return [hash_text(t) for t in texts]
+
+
+def hash_sequence(values: list[str]) -> str:
+    canonical = json.dumps(values, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

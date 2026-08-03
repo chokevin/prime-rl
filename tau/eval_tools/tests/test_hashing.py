@@ -1,4 +1,4 @@
-from tau.eval_tools.hashing import hash_text, hash_texts, normalize_text
+from tau.eval_tools.hashing import hash_sequence, hash_text, hash_texts, normalize_text
 
 
 def test_normalize_text_strips_and_normalizes_line_endings():
@@ -33,3 +33,8 @@ def test_hash_texts_preserves_order():
     assert hashes[0] == hashes[2]
     assert hashes[0] != hashes[1]
     assert len(hashes) == 3
+
+
+def test_hash_sequence_preserves_order_and_duplicates():
+    assert hash_sequence(["a", "b", "a"]) == hash_sequence(["a", "b", "a"])
+    assert hash_sequence(["a", "b", "a"]) != hash_sequence(["a", "a", "b"])
