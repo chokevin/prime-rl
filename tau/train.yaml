@@ -25,7 +25,7 @@ runtime:
     WANDB_MODE: offline
     PRIME_RL_RUN_MODE: train
     PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
-    PRIME_RL_REPO_SHA: b6be2742bded035cd42cf3272be5152ee751db2c
+    PRIME_RL_REPO_SHA: 5e529e19d0e1b9bf21fc6b5e8572c1554f04f78d
     PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
     PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
     PRIME_RL_MODEL_NAME: Qwen/Qwen2.5-7B-Instruct

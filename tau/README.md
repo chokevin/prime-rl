@@ -79,7 +79,7 @@ The manifest's `org.opencontainers.image.revision` annotation is
 `bbb90a1b4132c351cbe8b0ed1fa808dde99f0318` — exactly this branch's merge-base commit (the
 sync branch's tree is byte-identical to upstream `bbb90a1b4`; see the `/goal` plan's
 Baseline section). The immutable runtime overlay is
-`b6be2742bded035cd42cf3272be5152ee751db2c`. That commit contains the complete Tau
+`5e529e19d0e1b9bf21fc6b5e8572c1554f04f78d`. That commit contains the complete Tau
 wrapper/eval tooling and the workspace-locked `environments/harder_math_v1` package.
 Its dependency set matches the pinned image: `harder-math-v1` uses only `datasets` and
 `verifiers`, which are already present. The later integration commit changes only
@@ -234,7 +234,7 @@ step override. The handoff never enumerates a storage directory.
 ### Proof ladder (in order)
 
 Before any of this, confirm every target pins
-`b6be2742bded035cd42cf3272be5152ee751db2c`, then render the image pin with
+`5e529e19d0e1b9bf21fc6b5e8572c1554f04f78d`, then render the image pin with
 `uv run --no-sync python tau/render_image.py`. The base model and training dataset
 revisions are already immutable pins. Every command below points at
 `tau/.rendered/<target>.yaml`, never the bare `tau/<target>.yaml` template, so pin
@@ -407,7 +407,7 @@ tau run get <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admi
 ## Operator commands
 
 **Before every submit:** confirm all five checked-in templates pin the immutable runtime
-overlay `b6be2742bded035cd42cf3272be5152ee751db2c`, then render. Do not replace it with the
+overlay `5e529e19d0e1b9bf21fc6b5e8572c1554f04f78d`, then render. Do not replace it with the
 later integration/pin commit: that would be a self-reference and that commit changes no
 runtime code. The pinned `Qwen/Qwen2.5-7B-Instruct` revision is
 `a09a35458c702b33eeacc393d103063234e8bc28`. Every model-serving phase downloads that
@@ -497,14 +497,16 @@ Run all of the following before any submit:
 
 - No Tau job has been submitted (no `--dry-run=server`, no real submit). This session's
   scope (W4b) was static config/scripts/tests; live cluster execution is W5–W8.
-- Source commit `b6be2742bded035cd42cf3272be5152ee751db2c` validates private cleanup
+- Source commit `5e529e19d0e1b9bf21fc6b5e8572c1554f04f78d` validates private cleanup
   against a locked-`huggingface-hub==1.16.1` snapshot with symlinks. Fixed JSON evidence
   is fully written, fsynced, and inode-bound before its writer is closed and the entry is
   atomically promoted; closing before promotion is required by the BlobFuse-backed output
   PVC. Model and training snapshots materialize into direct children of the canonical
   private run root while source snapshots and destinations remain strictly contained and
-  symlink-free. Interruption, race, quarantine, and retry behavior is covered by tests.
-  This does not prove the end-to-end job.
+  symlink-free. Before mode dispatch, the wrapper validates mode and eval label against
+  the exact configured output path and creates only that canonical directory beneath the
+  `/data` PVC mount. Interruption, race, quarantine, and retry behavior is covered by
+  tests. This does not prove the end-to-end job.
 - The full `tau/eval_tools/live/*.py` phases have never been executed against the real
   experiment dataset, base model, or inference server.
 - `max_steps = 50` and the resource requests are placeholders, not throughput-measured.
