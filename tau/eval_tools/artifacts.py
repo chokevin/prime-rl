@@ -4,7 +4,6 @@ import errno
 import hashlib
 import os
 import re
-import secrets
 import stat
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -16,12 +15,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from tau.eval_tools.fs_safety import rename_entry_noreplace as _rename_entry_noreplace
+from tau.eval_tools.fs_safety import quarantine_entry
 from tau.eval_tools.fs_safety import rename_noreplace as _rename_noreplace
 from tau.eval_tools.json_io import (
     fsync_directory,
     load_json_with_sha256,
     parse_json_bytes,
+    promote_json_noreplace,
     write_bytes_exclusive,
     write_json_exclusive,
 )
@@ -651,61 +651,25 @@ def _quarantine_owned_staging(path: Path, *, expected_name: str) -> Path | None:
     path = canonical_parent / path.name
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     parent_descriptor = os.open(path.parent, directory_flags)
-    source_descriptor = None
     try:
         if not stat.S_ISDIR(os.fstat(parent_descriptor).st_mode):
             raise ValueError(f"attempt staging parent must be a directory: {path.parent}")
         try:
-            pathname_metadata = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
         except FileNotFoundError:
             return None
-        expected_identity = (pathname_metadata.st_dev, pathname_metadata.st_ino)
-        if stat.S_ISREG(pathname_metadata.st_mode) or stat.S_ISDIR(pathname_metadata.st_mode):
-            file_flags = os.O_RDONLY
-            if stat.S_ISDIR(pathname_metadata.st_mode):
-                file_flags |= os.O_DIRECTORY
-            file_flags |= os.O_NOFOLLOW
-            source_descriptor = os.open(path.name, file_flags, dir_fd=parent_descriptor)
-            opened_metadata = os.fstat(source_descriptor)
-            if (
-                stat.S_IFMT(opened_metadata.st_mode) != stat.S_IFMT(pathname_metadata.st_mode)
-                or (opened_metadata.st_dev, opened_metadata.st_ino) != expected_identity
-            ):
-                raise RuntimeError(f"staging path changed while being opened: {path}")
-        _before_staging_quarantine(path)
-        for _ in range(8):
-            quarantine_name = f"{expected_name}.quarantine-{secrets.token_hex(16)}"
-            try:
-                _rename_entry_noreplace(parent_descriptor, path.name, quarantine_name)
-            except FileExistsError:
-                continue
-            break
-        else:
-            raise FileExistsError("could not allocate a unique staging quarantine name")
-        os.fsync(parent_descriptor)
+        quarantine_name = quarantine_entry(
+            parent_descriptor,
+            path.name,
+            quarantine_prefix=f"{expected_name}.quarantine",
+            before_rename=lambda: _before_staging_quarantine(path),
+        )
         quarantine_metadata = os.stat(quarantine_name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if stat.S_ISREG(quarantine_metadata.st_mode) or stat.S_ISDIR(quarantine_metadata.st_mode):
-            file_flags = os.O_RDONLY
-            if stat.S_ISDIR(quarantine_metadata.st_mode):
-                file_flags |= os.O_DIRECTORY
-            file_flags |= os.O_NOFOLLOW
-            descriptor = os.open(quarantine_name, file_flags, dir_fd=parent_descriptor)
-            try:
-                reopened_metadata = os.fstat(descriptor)
-                quarantine_identity = (reopened_metadata.st_dev, reopened_metadata.st_ino)
-            finally:
-                os.close(descriptor)
-        else:
-            quarantine_identity = (quarantine_metadata.st_dev, quarantine_metadata.st_ino)
         quarantine_path = path.parent / quarantine_name
-        if quarantine_identity != expected_identity:
-            raise RuntimeError(f"quarantined staging inode does not match the captured entry: {quarantine_path}")
         if expected_name == ".publication.stage" and not stat.S_ISDIR(quarantine_metadata.st_mode):
             raise ValueError(f"quarantined attempt evidence has the wrong file type: {quarantine_path}")
         return quarantine_path
     finally:
-        if source_descriptor is not None:
-            os.close(source_descriptor)
         os.close(parent_descriptor)
 
 
@@ -719,9 +683,6 @@ def _write_json_staged_noreplace(
     final_path = Path(final_path)
     staging_path = Path(staging_path)
     _check_cancelled()
-    if final_path.parent != staging_path.parent:
-        if final_path.parent.stat().st_dev != staging_path.parent.stat().st_dev:
-            raise RuntimeError("JSON staging and destination must be on the same filesystem")
     if os.path.lexists(final_path):
         raise FileExistsError(final_path)
     if os.path.lexists(staging_path):
@@ -734,11 +695,22 @@ def _write_json_staged_noreplace(
     _check_cancelled()
     write_json_exclusive(staging_path, payload)
     _check_cancelled()
-    _rename_noreplace(staging_path, final_path)
-    fsync_directory(final_path.parent)
-    if on_installed is not None:
-        on_installed()
+    promote_json_noreplace(
+        staging_path,
+        final_path,
+        after_stage_validation=_after_staged_json_validation,
+        after_install=_after_staged_json_install,
+        on_verified=on_installed,
+    )
     _check_cancelled()
+
+
+def _after_staged_json_validation(_path: Path) -> None:
+    pass
+
+
+def _after_staged_json_install(_path: Path) -> None:
+    pass
 
 
 @dataclass(frozen=True)
@@ -791,20 +763,6 @@ def _open_completion_evidence(path: Path) -> Iterator[_CompletionEvidenceSnapsho
         )
     finally:
         os.close(descriptor)
-
-
-def _require_snapshot_path(path: Path, snapshot: _CompletionEvidenceSnapshot) -> None:
-    metadata = os.lstat(path)
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ValueError(f"completion staging path is no longer a regular file: {path}")
-    if (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns) != (
-        snapshot.device,
-        snapshot.inode,
-        snapshot.size,
-        snapshot.mtime_ns,
-        snapshot.ctime_ns,
-    ):
-        raise RuntimeError("completion staging path changed after handle-bound validation")
 
 
 def _before_completion_stage_promotion(_path: Path) -> None:
@@ -1002,7 +960,6 @@ def _load_or_recover_attempt_evidence(
         )
 
     _check_cancelled()
-    promoted = False
     try:
         with _open_completion_evidence(paths.completion_staging) as staged_snapshot:
             staged_evidence = _load_attempt_evidence(
@@ -1014,40 +971,32 @@ def _load_or_recover_attempt_evidence(
                 completion_evidence=(staged_snapshot.attestation, staged_snapshot.digest),
             )
             _check_cancelled()
-            _before_completion_stage_promotion(paths.completion_staging)
-            _require_snapshot_path(paths.completion_staging, staged_snapshot)
-            _check_cancelled()
-            _rename_noreplace(paths.completion_staging, paths.completion)
-            promoted = True
-            fsync_directory(paths.directory)
-            _after_completion_stage_promotion(paths.completion)
-            with _open_completion_evidence(paths.completion) as final_snapshot:
-                if (
-                    final_snapshot.raw != staged_snapshot.raw
-                    or final_snapshot.digest != staged_snapshot.digest
-                    or final_snapshot.attestation != staged_snapshot.attestation
-                    or (final_snapshot.device, final_snapshot.inode) != (staged_snapshot.device, staged_snapshot.inode)
-                ):
-                    raise RuntimeError("promoted completion evidence does not match its validated staging handle")
-                final_evidence = _load_attempt_evidence(
-                    output_dir=output_dir,
-                    manifest=manifest,
-                    attempt_id=attempt_id,
-                    expected_step=expected_step,
-                    expected_rank=expected_rank,
-                    completion_evidence=(final_snapshot.attestation, final_snapshot.digest),
-                )
-            if final_evidence != staged_evidence:
-                raise RuntimeError("promoted completion validation changed after atomic installation")
+            promoted_snapshot = promote_json_noreplace(
+                paths.completion_staging,
+                paths.completion,
+                expected_object=staged_snapshot.attestation.model_dump(),
+                expected_raw=staged_snapshot.raw,
+                expected_digest=staged_snapshot.digest,
+                expected_identity=(staged_snapshot.device, staged_snapshot.inode),
+                after_stage_validation=_before_completion_stage_promotion,
+                after_install=_after_completion_stage_promotion,
+            )
+            if (
+                promoted_snapshot.raw != staged_snapshot.raw
+                or promoted_snapshot.digest != staged_snapshot.digest
+                or promoted_snapshot.payload != staged_snapshot.attestation.model_dump()
+                or (promoted_snapshot.device, promoted_snapshot.inode)
+                != (staged_snapshot.device, staged_snapshot.inode)
+            ):
+                raise RuntimeError("promoted completion evidence does not match its validated staging handle")
+            final_evidence = staged_evidence
     except Exception as error:
-        if not promoted:
+        if os.path.lexists(paths.completion_staging):
             _quarantine_owned_staging(
                 paths.completion_staging,
                 expected_name=".completion.json.stage",
             )
         _check_cancelled()
-        if promoted:
-            raise ValueError("promoted completion attestation failed strict handle-bound reload") from error
         raise ValueError("staged completion attestation is incomplete or invalid") from error
     _check_cancelled()
     return final_evidence

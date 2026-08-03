@@ -273,6 +273,10 @@ def _publication_quarantines(paths):
     return sorted(paths.directory.glob(".publication.stage.quarantine-*"))
 
 
+def _json_final_quarantines(path):
+    return sorted(path.parent.glob(f"{path.name}.quarantine-*"))
+
+
 def test_select_final_adapter_uses_exact_expected_stable_rank_16_checkpoint(tmp_path):
     _adapter(tmp_path, 10)
     expected = _adapter(tmp_path, 20)
@@ -422,9 +426,134 @@ def test_recovery_binds_completion_promotion_to_validated_handle(
     with pytest.raises(ValueError, match="completion"):
         publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
 
+    assert not paths.completion.exists()
+    quarantines = _completion_final_quarantines(paths)
+    assert len(quarantines) == 1
     assert not paths.publication.exists()
     assert not (tmp_path / "training-result.json").exists()
     assert not (tmp_path / "final-adapter").exists()
+    paths.completion_staging.write_bytes(original)
+    monkeypatch.setattr(artifacts_module, "_before_completion_stage_promotion", lambda _path: None)
+    monkeypatch.setattr(artifacts_module, "_after_completion_stage_promotion", lambda _path: None)
+    recovered = publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+    assert recovered.attempt_id == ATTEMPT_1
+    assert paths.completion.read_bytes() == original
+    assert quarantines[0].exists()
+
+
+@pytest.mark.parametrize("final_name", ["completion.json", "publication.json", "training-result.json"])
+@pytest.mark.parametrize("window", ["after-stage-validation", "after-install"])
+def test_all_staged_json_promotions_quarantine_swaps_and_retry(
+    tmp_path,
+    monkeypatch,
+    final_name,
+    window,
+):
+    parent = tmp_path / "attempt"
+    parent.mkdir()
+    staging_parent = parent if final_name == "completion.json" else parent / ".publication.stage"
+    staging_parent.mkdir(exist_ok=True)
+    staging_name = ".completion.json.stage" if final_name == "completion.json" else final_name
+    staging = staging_parent / staging_name
+    final = parent / final_name
+    displaced = parent / f"{final_name}.displaced"
+    original = {"attempt_id": ATTEMPT_1, "status": "verified"}
+    replacement = {"attempt_id": ATTEMPT_2, "status": "replacement"}
+    callbacks: list[str] = []
+
+    def swap(path):
+        path = Path(path)
+        path.rename(displaced)
+        path.write_text(json.dumps(replacement))
+
+    hook_name = "_after_staged_json_validation" if window == "after-stage-validation" else "_after_staged_json_install"
+    monkeypatch.setattr(artifacts_module, hook_name, swap)
+
+    with pytest.raises(RuntimeError, match="installed JSON evidence"):
+        _write_json_staged_noreplace(
+            final_path=final,
+            staging_path=staging,
+            payload=original,
+            on_installed=lambda: callbacks.append("verified"),
+        )
+
+    assert callbacks == []
+    assert not final.exists()
+    quarantines = _json_final_quarantines(final)
+    assert len(quarantines) == 1
+    assert load_json_with_sha256(quarantines[0])[0] == replacement
+    assert load_json_with_sha256(displaced)[0] == original
+
+    monkeypatch.setattr(artifacts_module, "_after_staged_json_validation", lambda _path: None)
+    monkeypatch.setattr(artifacts_module, "_after_staged_json_install", lambda _path: None)
+    _write_json_staged_noreplace(
+        final_path=final,
+        staging_path=staging,
+        payload=original,
+        on_installed=lambda: callbacks.append("verified"),
+    )
+    final_bytes = final.read_bytes()
+    assert callbacks == ["verified"]
+    assert load_json_with_sha256(final)[0] == original
+    assert quarantines[0].exists()
+
+    with pytest.raises(FileExistsError):
+        _write_json_staged_noreplace(
+            final_path=final,
+            staging_path=staging,
+            payload=replacement,
+        )
+    assert final.read_bytes() == final_bytes
+    assert _json_final_quarantines(final) == quarantines
+
+
+def test_staged_json_promotion_quarantines_unreadable_poisoned_final_and_retry(
+    tmp_path,
+    monkeypatch,
+):
+    staging_parent = tmp_path / ".publication.stage"
+    staging_parent.mkdir()
+    staging = staging_parent / "training-result.json"
+    final = tmp_path / "training-result.json"
+    displaced = tmp_path / "training-result.json.displaced"
+    original = {"attempt_id": ATTEMPT_1, "status": "verified"}
+    replacement = {"attempt_id": ATTEMPT_2, "status": "replacement"}
+
+    def install_unreadable_replacement(path):
+        path = Path(path)
+        path.rename(displaced)
+        path.write_text(json.dumps(replacement))
+        path.chmod(0)
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "_after_staged_json_install",
+        install_unreadable_replacement,
+    )
+
+    with pytest.raises(PermissionError):
+        _write_json_staged_noreplace(
+            final_path=final,
+            staging_path=staging,
+            payload=original,
+        )
+
+    assert not final.exists()
+    quarantines = _json_final_quarantines(final)
+    assert len(quarantines) == 1
+    assert stat.S_IMODE(quarantines[0].lstat().st_mode) == 0
+    quarantines[0].chmod(0o600)
+    assert load_json_with_sha256(quarantines[0])[0] == replacement
+    assert load_json_with_sha256(displaced)[0] == original
+
+    monkeypatch.setattr(artifacts_module, "_after_staged_json_install", lambda _path: None)
+    _write_json_staged_noreplace(
+        final_path=final,
+        staging_path=staging,
+        payload=original,
+    )
+    assert load_json_with_sha256(final)[0] == original
+    assert quarantines[0].exists()
 
 
 def test_recovery_quarantines_malformed_completion_stage_without_other_changes(tmp_path, exact_config_validator):
@@ -1300,14 +1429,12 @@ def test_cancellation_after_publication_transfers_adapter_ownership_to_durable_e
         write_completion=False,
     )
     _install_fake_popen(monkeypatch, tmp_path, return_code=0)
-    original_rename = artifacts_module._rename_noreplace
 
-    def cancel_after_publication_install(source, destination):
-        original_rename(source, destination)
+    def cancel_after_publication_install(destination):
         if Path(destination) == paths.publication:
             signal.raise_signal(signal.SIGTERM)
 
-    monkeypatch.setattr(artifacts_module, "_rename_noreplace", cancel_after_publication_install)
+    monkeypatch.setattr(artifacts_module, "_after_staged_json_install", cancel_after_publication_install)
 
     with pytest.raises(SupervisorCancelled):
         supervise_prepared_attempt(manifest=manifest, preflight=preflight)
@@ -1316,7 +1443,7 @@ def test_cancellation_after_publication_transfers_adapter_ownership_to_durable_e
     assert paths.publication.is_file()
     assert (tmp_path / "final-adapter").is_dir()
     assert not (tmp_path / "training-result.json").exists()
-    monkeypatch.setattr(artifacts_module, "_rename_noreplace", original_rename)
+    monkeypatch.setattr(artifacts_module, "_after_staged_json_install", lambda _path: None)
     recovered = publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
     assert recovered.attempt_id == ATTEMPT_1
 
@@ -1419,14 +1546,16 @@ def test_recovery_cancellation_during_completion_promotion_stops_publication(
     _evidence(tmp_path, manifest, exact_config_validator(manifest))
     paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
     paths.completion.rename(paths.completion_staging)
-    original_rename = artifacts_module._rename_noreplace
 
-    def cancel_during_completion_promotion(source, destination):
+    def cancel_during_completion_promotion(source):
         if Path(source) == paths.completion_staging:
             signal.raise_signal(signal.SIGTERM)
-        original_rename(source, destination)
 
-    monkeypatch.setattr(artifacts_module, "_rename_noreplace", cancel_during_completion_promotion)
+    monkeypatch.setattr(
+        artifacts_module,
+        "_before_completion_stage_promotion",
+        cancel_during_completion_promotion,
+    )
 
     with pytest.raises(SupervisorCancelled) as cancellation:
         recover_publish(

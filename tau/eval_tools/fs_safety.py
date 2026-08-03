@@ -91,7 +91,12 @@ def open_directory_nofollow(path: Path) -> int:
         raise
 
 
-def rename_entry_noreplace(directory_descriptor: int, source_name: str, destination_name: str) -> None:
+def rename_entries_noreplace(
+    source_directory_descriptor: int,
+    source_name: str,
+    destination_directory_descriptor: int,
+    destination_name: str,
+) -> None:
     if "/" in source_name or "/" in destination_name:
         raise ValueError("directory-relative rename names must not contain path separators")
     libc = ctypes.CDLL(None, use_errno=True)
@@ -100,9 +105,9 @@ def rename_entry_noreplace(directory_descriptor: int, source_name: str, destinat
         renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
         renameat2.restype = ctypes.c_int
         result = renameat2(
-            directory_descriptor,
+            source_directory_descriptor,
             os.fsencode(source_name),
-            directory_descriptor,
+            destination_directory_descriptor,
             os.fsencode(destination_name),
             LINUX_RENAME_NOREPLACE,
         )
@@ -119,9 +124,9 @@ def rename_entry_noreplace(directory_descriptor: int, source_name: str, destinat
         ]
         renameatx_np.restype = ctypes.c_int
         result = renameatx_np(
-            directory_descriptor,
+            source_directory_descriptor,
             os.fsencode(source_name),
-            directory_descriptor,
+            destination_directory_descriptor,
             os.fsencode(destination_name),
             DARWIN_RENAME_EXCL,
         )
@@ -133,55 +138,45 @@ def rename_entry_noreplace(directory_descriptor: int, source_name: str, destinat
     raise OSError(error, os.strerror(error), source_name)
 
 
+def rename_entry_noreplace(directory_descriptor: int, source_name: str, destination_name: str) -> None:
+    rename_entries_noreplace(
+        directory_descriptor,
+        source_name,
+        directory_descriptor,
+        destination_name,
+    )
+
+
 def quarantine_entry(
     directory_descriptor: int,
     source_name: str,
     *,
     quarantine_prefix: str,
+    before_rename: Callable[[], None] | None = None,
 ) -> str:
     if "/" in source_name or "/" in quarantine_prefix:
         raise ValueError("directory-relative quarantine names must not contain path separators")
     source_metadata = os.stat(source_name, dir_fd=directory_descriptor, follow_symlinks=False)
-    source_descriptor = None
-    try:
-        if stat.S_ISREG(source_metadata.st_mode) or stat.S_ISDIR(source_metadata.st_mode):
-            flags = os.O_RDONLY | os.O_NOFOLLOW
-            if stat.S_ISDIR(source_metadata.st_mode):
-                flags |= os.O_DIRECTORY
-            source_descriptor = os.open(source_name, flags, dir_fd=directory_descriptor)
-            if not _same_entry(source_metadata, os.fstat(source_descriptor)):
-                raise RuntimeError(f"quarantine source changed while being opened: {source_name}")
-        for _ in range(8):
-            quarantine_name = f"{quarantine_prefix}-{secrets.token_hex(16)}"
-            try:
-                rename_entry_noreplace(directory_descriptor, source_name, quarantine_name)
-            except FileExistsError:
-                continue
-            break
-        else:
-            raise FileExistsError(f"could not allocate a unique quarantine for {source_name}")
-        os.fsync(directory_descriptor)
-        quarantine_metadata = os.stat(
-            quarantine_name,
-            dir_fd=directory_descriptor,
-            follow_symlinks=False,
-        )
-        if not _same_entry(source_metadata, quarantine_metadata):
-            raise RuntimeError(f"quarantined entry does not match captured source: {quarantine_name}")
-        if stat.S_ISREG(quarantine_metadata.st_mode) or stat.S_ISDIR(quarantine_metadata.st_mode):
-            flags = os.O_RDONLY | os.O_NOFOLLOW
-            if stat.S_ISDIR(quarantine_metadata.st_mode):
-                flags |= os.O_DIRECTORY
-            descriptor = os.open(quarantine_name, flags, dir_fd=directory_descriptor)
-            try:
-                if not _same_entry(quarantine_metadata, os.fstat(descriptor)):
-                    raise RuntimeError(f"quarantined entry changed while being reopened: {quarantine_name}")
-            finally:
-                os.close(descriptor)
-        return quarantine_name
-    finally:
-        if source_descriptor is not None:
-            os.close(source_descriptor)
+    if before_rename is not None:
+        before_rename()
+    for _ in range(8):
+        quarantine_name = f"{quarantine_prefix}-{secrets.token_hex(16)}"
+        try:
+            rename_entry_noreplace(directory_descriptor, source_name, quarantine_name)
+        except FileExistsError:
+            continue
+        break
+    else:
+        raise FileExistsError(f"could not allocate a unique quarantine for {source_name}")
+    os.fsync(directory_descriptor)
+    quarantine_metadata = os.stat(
+        quarantine_name,
+        dir_fd=directory_descriptor,
+        follow_symlinks=False,
+    )
+    if not _same_entry(source_metadata, quarantine_metadata):
+        raise RuntimeError(f"quarantined entry inode does not match captured source: {quarantine_name}")
+    return quarantine_name
 
 
 def rename_noreplace(source: Path, destination: Path) -> None:
