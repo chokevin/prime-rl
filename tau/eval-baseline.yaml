@@ -21,14 +21,14 @@ runtime:
     WANDB_MODE: offline
     PRIME_RL_RUN_MODE: eval
     PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
-    PRIME_RL_REPO_SHA: 5e529e19d0e1b9bf21fc6b5e8572c1554f04f78d
+    PRIME_RL_REPO_SHA: 27359e1b1ddab6aba4d467dba76b96c2c3f9f3b8
     PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
     PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
     PRIME_RL_MODEL_NAME: Qwen/Qwen2.5-7B-Instruct
     PRIME_RL_MODEL_REVISION: a09a35458c702b33eeacc393d103063234e8bc28
     PRIME_RL_EVAL_LABEL: baseline
-    PRIME_RL_MANIFEST_PATH: /data/pretraining-data/prime-rl-math-7b-h200/manifest/draft-manifest.json
-    PRIME_RL_BASELINE_REWARDS_PATH: /data/pretraining-data/prime-rl-math-7b-h200/eval-baseline/rewards.json
+    PRIME_RL_MANIFEST_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/27359e1b1ddab6aba4d467dba76b96c2c3f9f3b8/manifest/draft-manifest.json
+    PRIME_RL_BASELINE_REWARDS_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/27359e1b1ddab6aba4d467dba76b96c2c3f9f3b8/eval-baseline/rewards.json
     PRIME_RL_HEALTH_TIMEOUT_S: "1800"
 
 compute:
@@ -48,4 +48,4 @@ policy:
 
 storage:
   data_pvc: blob-training
-  output: /data/pretraining-data/prime-rl-math-7b-h200/eval-baseline
+  output: /data/pretraining-data/prime-rl-math-7b-h200/generations/27359e1b1ddab6aba4d467dba76b96c2c3f9f3b8/eval-baseline

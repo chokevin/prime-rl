@@ -79,12 +79,21 @@ The manifest's `org.opencontainers.image.revision` annotation is
 `bbb90a1b4132c351cbe8b0ed1fa808dde99f0318` — exactly this branch's merge-base commit (the
 sync branch's tree is byte-identical to upstream `bbb90a1b4`; see the `/goal` plan's
 Baseline section). The immutable runtime overlay is
-`5e529e19d0e1b9bf21fc6b5e8572c1554f04f78d`. That commit contains the complete Tau
+`27359e1b1ddab6aba4d467dba76b96c2c3f9f3b8`. That commit contains the complete Tau
 wrapper/eval tooling and the workspace-locked `environments/harder_math_v1` package.
 Its dependency set matches the pinned image: `harder-math-v1` uses only `datasets` and
 `verifiers`, which are already present. The later integration commit changes only
 checked-in Tau pins/docs and the client-side selection fixture; runtime code continues
 to come from the immutable overlay.
+
+Every durable artifact belongs to the complete source generation rooted at
+`/data/pretraining-data/prime-rl-math-7b-h200/generations/27359e1b1ddab6aba4d467dba76b96c2c3f9f3b8`.
+The wrapper derives this root from the exact fetched commit and rejects output or
+cross-mode inputs from any other generation before creating a directory. Any runtime
+behavior or config change must therefore land in a new source commit and start a complete
+new smoke/manifest/baseline/train/post generation. The later pin commit may only wire
+templates and docs to that source SHA. Existing generation directories are immutable and
+preserved; they are never migrated, deleted, or reused by a newer source.
 
 **Why a pin file + render step when the digest is also checked in 5×:** the templates
 must be directly inspectable and runnable-looking, while `tau/image.pin.json` remains
@@ -234,7 +243,7 @@ step override. The handoff never enumerates a storage directory.
 ### Proof ladder (in order)
 
 Before any of this, confirm every target pins
-`5e529e19d0e1b9bf21fc6b5e8572c1554f04f78d`, then render the image pin with
+`27359e1b1ddab6aba4d467dba76b96c2c3f9f3b8`, then render the image pin with
 `uv run --no-sync python tau/render_image.py`. The base model and training dataset
 revisions are already immutable pins. Every command below points at
 `tau/.rendered/<target>.yaml`, never the bare `tau/<target>.yaml` template, so pin
@@ -307,8 +316,8 @@ rerun RL. Use the exact logged ID to recover publication:
 
 ```bash
 uv run --no-sync python -m tau.eval_tools.cli recover-publish \
-  --manifest /data/pretraining-data/prime-rl-math-7b-h200/manifest/frozen-eval-manifest.json \
-  --output-dir /data/pretraining-data/prime-rl-math-7b-h200/train \
+  --manifest /data/pretraining-data/prime-rl-math-7b-h200/generations/27359e1b1ddab6aba4d467dba76b96c2c3f9f3b8/manifest/frozen-eval-manifest.json \
+  --output-dir /data/pretraining-data/prime-rl-math-7b-h200/generations/27359e1b1ddab6aba4d467dba76b96c2c3f9f3b8/train \
   --attempt-id "$ATTEMPT_ID"
 ```
 
@@ -381,11 +390,11 @@ storage proof) — fetch each by its exact name with `--artifact <file>`.
 
 | Target | `storage.output` | Exact artifact(s) | Purpose |
 |---|---|---|---|
-| `smoke` | `.../prime-rl-math-7b-h200/smoke` | `smoke-result.json` | written only after `rl --dry-run` produced all three expected resolved TOMLs |
-| `freeze-manifest` | `.../prime-rl-math-7b-h200/manifest` | `draft-manifest.json`, `frozen-eval-manifest.json` | unfrozen draft (pass 1) and the immutable frozen manifest (pass 2) `tau/eval_tools/manifest.py` reads/writes |
-| `eval-baseline` | `.../prime-rl-math-7b-h200/eval-baseline` | `rewards.json`, `inference.log` | baseline per-example rewards (`RewardRecord`) `tau/eval_tools/compare.py` consumes |
-| `eval-post` | `.../prime-rl-math-7b-h200/eval-post` | `rewards.json`, `comparison.json`, `inference.log` | post-training rewards + the `ComparisonResult` (delta, bootstrap CI, pass/fail) |
-| `train` | `.../prime-rl-math-7b-h200/train` | fixed `training-result.json` and `final-adapter/`; exact logged `attempts/<attempt-id>/{preflight.json,resolved-train.toml,completion.json,publication.json,run-output/metrics.jsonl}`; optional `attempts/<attempt-id>/private-cleanup-diagnostic.json` | the trusted supervisor owns launch and attestation; attempt evidence binds the exact config/process/STABLE adapter, publication fsyncs and atomically installs without replacement, and writes the fixed result last; a post-success private-cleanup failure writes the optional diagnostic without changing success |
+| `smoke` | `<generation-root>/smoke` | `smoke-result.json` | written only after `rl --dry-run` produced all three expected resolved TOMLs |
+| `freeze-manifest` | `<generation-root>/manifest` | `draft-manifest.json`, `frozen-eval-manifest.json` | unfrozen draft (pass 1) and the immutable frozen manifest (pass 2) `tau/eval_tools/manifest.py` reads/writes |
+| `eval-baseline` | `<generation-root>/eval-baseline` | `rewards.json`, `inference.log` | baseline per-example rewards (`RewardRecord`) `tau/eval_tools/compare.py` consumes |
+| `eval-post` | `<generation-root>/eval-post` | `rewards.json`, `comparison.json`, `inference.log` | post-training rewards + the `ComparisonResult` (delta, bootstrap CI, pass/fail) |
+| `train` | `<generation-root>/train` | fixed `training-result.json` and `final-adapter/`; exact logged `attempts/<attempt-id>/{preflight.json,resolved-train.toml,completion.json,publication.json,run-output/metrics.jsonl}`; optional `attempts/<attempt-id>/private-cleanup-diagnostic.json` | the trusted supervisor owns launch and attestation; attempt evidence binds the exact config/process/STABLE adapter, publication fsyncs and atomically installs without replacement, and writes the fixed result last; a post-success private-cleanup failure writes the optional diagnostic without changing success |
 
 Explicit-file fetch while the run's Workload/Job still exists (the proven, reliable path):
 
@@ -400,14 +409,14 @@ proven by W1's storage probe after its Job was cancelled:
 
 ```bash
 tau run get <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admin \
-  --path /data/pretraining-data/prime-rl-math-7b-h200/eval-post/rewards.json \
+  --path /data/pretraining-data/prime-rl-math-7b-h200/generations/27359e1b1ddab6aba4d467dba76b96c2c3f9f3b8/eval-post/rewards.json \
   --pvc blob-training
 ```
 
 ## Operator commands
 
 **Before every submit:** confirm all five checked-in templates pin the immutable runtime
-overlay `5e529e19d0e1b9bf21fc6b5e8572c1554f04f78d`, then render. Do not replace it with the
+overlay `27359e1b1ddab6aba4d467dba76b96c2c3f9f3b8`, then render. Do not replace it with the
 later integration/pin commit: that would be a self-reference and that commit changes no
 runtime code. The pinned `Qwen/Qwen2.5-7B-Instruct` revision is
 `a09a35458c702b33eeacc393d103063234e8bc28`. Every model-serving phase downloads that
@@ -485,19 +494,21 @@ Run all of the following before any submit:
   field-by-field against `packages/prime-rl-configs/src/prime_rl/configs/{rl,orchestrator,trainer}.py`.
 - `PYTHONPATH=.:src uv run --no-project` with editable `prime-rl-configs`,
   `verifiers`, `math-env-v1`, and `math500-v1`, then
-  `pytest -q tau/eval_tools/tests` — 148 tests covering content manifests,
+  `pytest -q tau/eval_tools/tests` — 186 tests covering content manifests,
   path/symlink rejection, ordered train identity, immutable attempt/process evidence,
   a non-mocked real-`RLConfig` TOML round trip, locked-HF snapshot symlink cleanup,
-  fixed bootstrap, cancellation, and retry/recovery-safe atomic publication.
+  fixed bootstrap, cancellation, retry/recovery-safe atomic publication, and
+  source-generation isolation across every cross-mode reference.
 - `ruff check` / `ruff format --check` clean on every new Python file under `tau/`.
 - `uv run --no-project python -m py_compile` on the `live/` scripts.
 - `uv lock --check`, `git diff --check`, and secret/dependency/submodule/dtype scans.
 
 ## What is *not* proven yet (explicitly out of this session's scope)
 
-- No Tau job has been submitted (no `--dry-run=server`, no real submit). This session's
-  scope (W4b) was static config/scripts/tests; live cluster execution is W5–W8.
-- Source commit `5e529e19d0e1b9bf21fc6b5e8572c1554f04f78d` validates private cleanup
+- No Tau job has run source generation
+  `27359e1b1ddab6aba4d467dba76b96c2c3f9f3b8`; client dry-runs do not prove live
+  execution.
+- Source commit `27359e1b1ddab6aba4d467dba76b96c2c3f9f3b8` validates private cleanup
   against a locked-`huggingface-hub==1.16.1` snapshot with symlinks. Fixed JSON evidence
   is fully written, fsynced, and inode-bound before its writer is closed and the entry is
   atomically promoted; closing before promotion is required by the BlobFuse-backed output
@@ -506,12 +517,13 @@ Run all of the following before any submit:
   symlink-free. Before mode dispatch, the wrapper validates mode and eval label against
   the exact configured output path and creates only that canonical directory beneath the
   `/data` PVC mount. Interruption, race, quarantine, and retry behavior is covered by
-  tests. This does not prove the end-to-end job.
-- The full `tau/eval_tools/live/*.py` phases have never been executed against the real
-  experiment dataset, base model, or inference server.
+  tests. It also derives all output and cross-mode evidence paths from the verified source
+  SHA, but this does not prove the end-to-end job.
+- The current source generation's full `tau/eval_tools/live/*.py` sequence has not run
+  against the real experiment dataset, base model, and inference server.
 - `max_steps = 50` and the resource requests are placeholders, not throughput-measured.
-- The frozen eval manifest has not been created; no baseline has been measured; no
-  training has run; no comparison has been computed.
+- This source generation has no frozen eval manifest or baseline yet; no training or
+  comparison has run.
 - Whether `Qwen/Qwen2.5-7B-Instruct` + `DefaultRenderer` + rank-16 LoRA actually loads
   and trains cleanly on this image is unverified — the W2 memo's compatibility read is
   source-backed, not execution-tested.
