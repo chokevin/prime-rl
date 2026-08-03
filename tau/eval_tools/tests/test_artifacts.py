@@ -258,6 +258,10 @@ def _publication_kwargs(output_dir: Path, manifest, attempt_id: str = ATTEMPT_1)
     }
 
 
+def _completion_quarantines(paths):
+    return sorted(paths.directory.glob(".completion.json.stage.quarantine-*"))
+
+
 def test_select_final_adapter_uses_exact_expected_stable_rank_16_checkpoint(tmp_path):
     _adapter(tmp_path, 10)
     expected = _adapter(tmp_path, 20)
@@ -337,6 +341,7 @@ def test_publish_training_result_recovers_adapter_install_and_partial_json_stage
     assert recovered == TrainingResult.load(tmp_path / "training-result.json")
     assert not staging.exists()
     assert not paths.completion_staging.exists()
+    assert len(_completion_quarantines(paths)) == 1
 
 
 def test_recovery_promotes_valid_fsynced_completion_stage(tmp_path, exact_config_validator):
@@ -398,7 +403,7 @@ def test_recovery_binds_completion_promotion_to_validated_handle(
     assert not (tmp_path / "final-adapter").exists()
 
 
-def test_recovery_removes_malformed_completion_stage_without_other_changes(tmp_path, exact_config_validator):
+def test_recovery_quarantines_malformed_completion_stage_without_other_changes(tmp_path, exact_config_validator):
     manifest = _manifest()
     _evidence(tmp_path, manifest, exact_config_validator(manifest))
     paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
@@ -411,6 +416,9 @@ def test_recovery_removes_malformed_completion_stage_without_other_changes(tmp_p
         publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
 
     assert not paths.completion_staging.exists()
+    quarantines = _completion_quarantines(paths)
+    assert len(quarantines) == 1
+    assert quarantines[0].read_text() == '{"status":"succ'
     assert paths.preflight.read_bytes() == preflight_before
     assert paths.resolved_config.read_bytes() == config_before
     assert not paths.publication.exists()
@@ -418,7 +426,7 @@ def test_recovery_removes_malformed_completion_stage_without_other_changes(tmp_p
 
 
 @pytest.mark.parametrize("staged_payload", [b'{"status":"succ', b'{"not":"a completion attestation"}'])
-def test_recovery_with_valid_final_removes_malformed_stage_then_requires_retry(
+def test_recovery_with_valid_final_quarantines_malformed_stage_then_requires_retry(
     tmp_path,
     exact_config_validator,
     staged_payload,
@@ -429,17 +437,20 @@ def test_recovery_with_valid_final_removes_malformed_stage_then_requires_retry(
     final_before = paths.completion.read_bytes()
     paths.completion_staging.write_bytes(staged_payload)
 
-    with pytest.raises(ValueError, match="malformed staged completion was removed"):
+    with pytest.raises(ValueError, match="malformed staged completion was quarantined"):
         publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
 
     assert paths.completion.read_bytes() == final_before
     assert not paths.completion_staging.exists()
+    quarantines = _completion_quarantines(paths)
+    assert len(quarantines) == 1
+    assert quarantines[0].read_bytes() == staged_payload
     assert not paths.publication.exists()
     recovered = publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
     assert recovered.attempt_id == ATTEMPT_1
 
 
-def test_recovery_with_valid_final_rejects_symlink_stage_without_following_or_removing_target(
+def test_recovery_with_valid_final_quarantines_symlink_stage_without_following_target(
     tmp_path,
     exact_config_validator,
 ):
@@ -450,19 +461,53 @@ def test_recovery_with_valid_final_rejects_symlink_stage_without_following_or_re
     target.write_bytes(paths.completion.read_bytes())
     paths.completion_staging.symlink_to(target)
 
-    with pytest.raises(ValueError, match="unsafe staging path was not removed"):
+    with pytest.raises(ValueError, match="malformed staged completion was quarantined"):
         publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
 
     assert paths.completion.is_file()
-    assert paths.completion_staging.is_symlink()
+    assert not os.path.lexists(paths.completion_staging)
+    quarantines = _completion_quarantines(paths)
+    assert len(quarantines) == 1
+    assert quarantines[0].is_symlink()
     assert target.read_bytes() == paths.completion.read_bytes()
     assert not paths.publication.exists()
-    paths.completion_staging.unlink()
     recovered = publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
     assert recovered.attempt_id == ATTEMPT_1
 
 
-def test_recovery_removes_matching_stage_only_after_validating_final(tmp_path, exact_config_validator):
+def test_quarantine_detects_stage_swap_and_preserves_replacement(
+    tmp_path,
+    exact_config_validator,
+    monkeypatch,
+):
+    manifest = _manifest()
+    _evidence(tmp_path, manifest, exact_config_validator(manifest))
+    paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
+    original_stage = b'{"status":"succ'
+    replacement_stage = b'{"replacement":"must survive"}'
+    paths.completion_staging.write_bytes(original_stage)
+    displaced = paths.directory / ".completion.json.stage.displaced"
+
+    def swap_stage(_path):
+        paths.completion_staging.rename(displaced)
+        paths.completion_staging.write_bytes(replacement_stage)
+
+    monkeypatch.setattr(artifacts_module, "_before_staging_quarantine", swap_stage)
+
+    with pytest.raises(ValueError, match="could not be quarantined"):
+        publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+
+    assert not paths.completion_staging.exists()
+    assert displaced.read_bytes() == original_stage
+    quarantines = _completion_quarantines(paths)
+    assert len(quarantines) == 1
+    assert quarantines[0].read_bytes() == replacement_stage
+    assert not paths.publication.exists()
+    recovered = publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+    assert recovered.attempt_id == ATTEMPT_1
+
+
+def test_recovery_quarantines_matching_stage_only_after_validating_final(tmp_path, exact_config_validator):
     manifest = _manifest()
     _evidence(tmp_path, manifest, exact_config_validator(manifest))
     paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
@@ -473,6 +518,7 @@ def test_recovery_removes_matching_stage_only_after_validating_final(tmp_path, e
     assert result.attempt_id == ATTEMPT_1
     assert paths.completion.is_file()
     assert not paths.completion_staging.exists()
+    assert len(_completion_quarantines(paths)) == 1
 
 
 def test_recovery_rejects_mismatched_final_and_completion_stage(tmp_path, exact_config_validator):
@@ -748,12 +794,19 @@ def test_supervisor_post_wait_cancellation_aborts_entire_transaction(
 
     assert cancellation.value.exit_code == expected_exit
     assert captured["signals"] == []
-    assert not paths.completion.exists()
     assert not paths.completion_staging.exists()
     assert not paths.publication.exists()
     assert not paths.publication_staging.exists()
     assert not (tmp_path / "training-result.json").exists()
-    assert not (tmp_path / "final-adapter").exists()
+    if phase == "publication":
+        assert paths.completion.is_file()
+        assert (tmp_path / "final-adapter").is_dir()
+        monkeypatch.setattr(artifacts_module, "_rename_noreplace", original_rename)
+        recovered = publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+        assert recovered.attempt_id == ATTEMPT_1
+    else:
+        assert not paths.completion.exists()
+        assert not (tmp_path / "final-adapter").exists()
 
 
 def test_later_cancelled_attempt_preserves_identical_adapter_owned_by_earlier_attempt(
@@ -793,6 +846,45 @@ def test_later_cancelled_attempt_preserves_identical_adapter_owned_by_earlier_at
     assert not second_paths.publication.exists()
 
 
+def test_adapter_install_detects_destination_swap_and_preserves_conflict(
+    tmp_path,
+    exact_config_validator,
+    monkeypatch,
+):
+    manifest = _manifest()
+    preflight, paths = _evidence(
+        tmp_path,
+        manifest,
+        exact_config_validator(manifest),
+        write_completion=False,
+    )
+    _install_fake_popen(monkeypatch, tmp_path, return_code=0)
+    original_rename = artifacts_module._rename_noreplace
+    displaced = tmp_path / "displaced-installed-adapter"
+
+    def swap_after_adapter_install(source, destination):
+        original_rename(source, destination)
+        if Path(destination).name == "final-adapter":
+            Path(destination).rename(displaced)
+            Path(destination).mkdir()
+            (Path(destination) / "adapter_config.json").write_text('{"r": 16}')
+            (Path(destination) / "adapter_model.safetensors").write_bytes(b"conflicting adapter")
+
+    monkeypatch.setattr(artifacts_module, "_rename_noreplace", swap_after_adapter_install)
+
+    with pytest.raises(RuntimeError, match="inode does not match"):
+        supervise_prepared_attempt(manifest=manifest, preflight=preflight)
+
+    assert displaced.is_dir()
+    assert (tmp_path / "final-adapter").is_dir()
+    assert paths.completion.is_file()
+    assert not paths.publication.exists()
+    assert not (tmp_path / "training-result.json").exists()
+    monkeypatch.setattr(artifacts_module, "_rename_noreplace", original_rename)
+    with pytest.raises(ValueError, match="does not match"):
+        publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+
+
 def test_cancellation_after_publication_transfers_adapter_ownership_to_durable_evidence(
     tmp_path,
     exact_config_validator,
@@ -825,6 +917,16 @@ def test_cancellation_after_publication_transfers_adapter_ownership_to_durable_e
     monkeypatch.setattr(artifacts_module, "_rename_noreplace", original_rename)
     recovered = publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
     assert recovered.attempt_id == ATTEMPT_1
+
+
+def test_supervisor_never_recursively_deletes_global_final_adapter():
+    eval_tools = Path(__file__).parents[1]
+    sources = [
+        (eval_tools / "artifacts.py").read_text(),
+        (eval_tools / "live/training_supervisor_live.py").read_text(),
+    ]
+    assert all("rmtree(final_adapter)" not in source for source in sources)
+    assert all("final_adapter.unlink" not in source for source in sources)
 
 
 @pytest.mark.parametrize(("signum", "expected_exit"), [(signal.SIGINT, 130), (signal.SIGTERM, 143)])

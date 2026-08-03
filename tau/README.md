@@ -294,9 +294,11 @@ interruption point. It also accepts an fsynced `.completion.json.stage` only whe
 then atomically promotes it without replacement. Validation, fsync, and promotion remain
 bound to one no-follow regular-file handle and captured inode; the installed final is
 strict-reopened and must reproduce the exact bytes, digest, object, and inode before
-publication. A malformed regular stage is removed and fails once; when both names exist,
-the strict-valid final wins only if the stage matches exactly. An unsafe symlink stage is
-never followed or removed.
+publication. Malformed, stale, or suspicious stages are atomically renamed relative to
+the opened attempt directory into unique `.completion.json.stage.quarantine-*` evidence.
+The quarantine is no-follow inode-verified and preserved for diagnosis, never unlinked;
+recovery ignores quarantine names, so a strict-valid final succeeds on the next call.
+When both names exist, the final wins only if the valid stage matches exactly.
 A malformed final publication fails rather than being replaced. A
 different attempt can reuse an exactly matching installed adapter only through this
 explicit recovery command; normal training fails. A mismatched/reused ID fails, and an
@@ -307,11 +309,12 @@ supervisor in `CHILD_PID`, forwards TERM/INT, waits, and propagates status 143/1
 supervisor owns a new RL process group, forwards the same signal to that entire group,
 waits/reaps it, and keeps the handlers active through all post-wait validation and
 publication. A signal at any point before the fixed result is complete aborts as 143/130,
-cleans only the current attempt's staging/success evidence (including a content-verified
-adapter only when an in-memory inode token proves this invocation installed it), and cannot
-create later publication or result evidence. A verified adapter reused from an earlier
-attempt is never considered owned. Durable publication transfers ownership, so later
-cancellation preserves the adapter and recovery evidence. Cancellation remains failure
+and cannot create later publication or result evidence. Before adapter install, the
+supervisor captures the fully validated staged directory inode/device and verifies the
+same no-follow token at the final name after atomic rename. Once installed, `final-adapter`
+is never recursively deleted: cancellation/error preserves it plus completion evidence
+for explicit hash-bound recovery, while a conflicting adapter fails closed. A verified
+adapter reused from an earlier attempt is likewise preserved. Cancellation remains failure
 even if the child reports zero; the next normal submission receives a fresh attempt ID.
 
 Every fetch above names an explicit `--artifact <file>` rather than listing the output
@@ -444,7 +447,7 @@ output):
   field-by-field against `packages/prime-rl-configs/src/prime_rl/configs/{rl,orchestrator,trainer}.py`.
 - `PYTHONPATH=.:src uv run --no-project` with editable `prime-rl-configs`,
   `verifiers`, `math-env-v1`, and `math500-v1`, then
-  `pytest -q tau/eval_tools/tests` — 114 tests covering content manifests,
+  `pytest -q tau/eval_tools/tests` — 117 tests covering content manifests,
   path/symlink rejection, ordered train identity, immutable attempt/process evidence,
   a non-mocked real-`RLConfig` TOML round trip, fixed bootstrap, cancellation, and
   retry/recovery-safe atomic publication.

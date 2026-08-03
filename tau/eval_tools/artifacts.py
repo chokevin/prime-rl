@@ -5,6 +5,7 @@ import errno
 import hashlib
 import os
 import re
+import secrets
 import shutil
 import stat
 from collections.abc import Callable, Iterator
@@ -42,14 +43,13 @@ _CANCELLATION_CHECK: ContextVar[Callable[[], None] | None] = ContextVar(
 
 @dataclass(frozen=True)
 class AdapterInstallationToken:
-    path: Path
     device: int
     inode: int
 
 
 @dataclass
 class AdapterPublicationState:
-    installation: AdapterInstallationToken | None = None
+    installed_by_invocation: bool = False
     ownership_transferred: bool = False
 
 
@@ -76,25 +76,28 @@ def _check_cancelled() -> None:
         check()
 
 
-def _record_adapter_installation(path: Path) -> None:
+def _capture_adapter_installation_token(path: Path) -> AdapterInstallationToken:
+    metadata = os.lstat(path)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("staged final adapter must be a regular directory")
+    return AdapterInstallationToken(device=metadata.st_dev, inode=metadata.st_ino)
+
+
+def _record_adapter_installation(path: Path, expected: AdapterInstallationToken) -> None:
+    metadata = os.lstat(path)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_dev != expected.device or metadata.st_ino != expected.inode:
+        raise RuntimeError("installed final adapter inode does not match the validated staging directory")
     state = _ADAPTER_PUBLICATION_STATE.get()
     if state is None:
         return
-    if state.installation is not None:
+    if state.installed_by_invocation:
         raise RuntimeError("adapter installation ownership was already recorded")
-    metadata = os.lstat(path)
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise ValueError("installed final adapter must be a regular directory")
-    state.installation = AdapterInstallationToken(
-        path=Path(path),
-        device=metadata.st_dev,
-        inode=metadata.st_ino,
-    )
+    state.installed_by_invocation = True
 
 
 def _transfer_adapter_ownership() -> None:
     state = _ADAPTER_PUBLICATION_STATE.get()
-    if state is not None and state.installation is not None:
+    if state is not None and state.installed_by_invocation:
         state.ownership_transferred = True
 
 
@@ -626,45 +629,117 @@ def _remove_owned_staging(path: Path, attempt_id: str) -> None:
     fsync_directory(path.parent)
 
 
-def _remove_owned_json_staging(path: Path, *, expected_name: str) -> None:
-    if not os.path.lexists(path):
+def _rename_entry_noreplace(directory_descriptor: int, source_name: str, destination_name: str) -> None:
+    if "/" in source_name or "/" in destination_name:
+        raise ValueError("directory-relative rename names must not contain path separators")
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is not None:
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            directory_descriptor,
+            os.fsencode(source_name),
+            directory_descriptor,
+            os.fsencode(destination_name),
+            LINUX_RENAME_NOREPLACE,
+        )
+    else:
+        renameatx_np = getattr(libc, "renameatx_np", None)
+        if renameatx_np is None:
+            raise OSError(errno.ENOTSUP, "safe directory-relative no-replace rename is unavailable")
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            directory_descriptor,
+            os.fsencode(source_name),
+            directory_descriptor,
+            os.fsencode(destination_name),
+            DARWIN_RENAME_EXCL,
+        )
+    if result == 0:
         return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(destination_name)
+    raise OSError(error, os.strerror(error), source_name)
+
+
+def _before_staging_quarantine(_path: Path) -> None:
+    pass
+
+
+def _quarantine_owned_json_staging(path: Path, *, expected_name: str) -> Path | None:
+    path = Path(path)
     if (
         path.name != expected_name
         or not ATTEMPT_ID_RE.fullmatch(path.parent.name)
         or path.parent.parent.name != "attempts"
     ):
-        raise ValueError(f"refusing to remove unsafe JSON staging path: {path}")
+        raise ValueError(f"refusing to quarantine unsafe JSON staging path: {path}")
     directory_flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         directory_flags |= os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
         directory_flags |= os.O_NOFOLLOW
     parent_descriptor = os.open(path.parent, directory_flags)
+    source_descriptor = None
     try:
-        pathname_metadata = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if not stat.S_ISREG(pathname_metadata.st_mode):
-            raise ValueError(f"refusing to remove unsafe JSON staging path: {path}")
-        file_flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            file_flags |= os.O_NOFOLLOW
-        descriptor = os.open(path.name, file_flags, dir_fd=parent_descriptor)
+        if not stat.S_ISDIR(os.fstat(parent_descriptor).st_mode):
+            raise ValueError(f"attempt staging parent must be a directory: {path.parent}")
         try:
-            opened_metadata = os.fstat(descriptor)
+            pathname_metadata = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        expected_identity = (pathname_metadata.st_dev, pathname_metadata.st_ino)
+        if stat.S_ISREG(pathname_metadata.st_mode):
+            file_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                file_flags |= os.O_NOFOLLOW
+            source_descriptor = os.open(path.name, file_flags, dir_fd=parent_descriptor)
+            opened_metadata = os.fstat(source_descriptor)
             if (
                 not stat.S_ISREG(opened_metadata.st_mode)
-                or opened_metadata.st_dev != pathname_metadata.st_dev
-                or opened_metadata.st_ino != pathname_metadata.st_ino
+                or (opened_metadata.st_dev, opened_metadata.st_ino) != expected_identity
             ):
                 raise RuntimeError(f"JSON staging path changed while being opened: {path}")
-            current_metadata = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
-            if current_metadata.st_dev != opened_metadata.st_dev or current_metadata.st_ino != opened_metadata.st_ino:
-                raise RuntimeError(f"JSON staging path changed before removal: {path}")
-            os.unlink(path.name, dir_fd=parent_descriptor)
-            os.fsync(parent_descriptor)
-        finally:
-            os.close(descriptor)
+        _before_staging_quarantine(path)
+        for _ in range(8):
+            quarantine_name = f"{expected_name}.quarantine-{secrets.token_hex(16)}"
+            try:
+                _rename_entry_noreplace(parent_descriptor, path.name, quarantine_name)
+            except FileExistsError:
+                continue
+            break
+        else:
+            raise FileExistsError("could not allocate a unique staging quarantine name")
+        os.fsync(parent_descriptor)
+        quarantine_metadata = os.stat(quarantine_name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if stat.S_ISREG(quarantine_metadata.st_mode):
+            file_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                file_flags |= os.O_NOFOLLOW
+            descriptor = os.open(quarantine_name, file_flags, dir_fd=parent_descriptor)
+            try:
+                reopened_metadata = os.fstat(descriptor)
+                quarantine_identity = (reopened_metadata.st_dev, reopened_metadata.st_ino)
+            finally:
+                os.close(descriptor)
+        else:
+            quarantine_identity = (quarantine_metadata.st_dev, quarantine_metadata.st_ino)
+        quarantine_path = path.parent / quarantine_name
+        if quarantine_identity != expected_identity:
+            raise RuntimeError(f"quarantined staging inode does not match the captured entry: {quarantine_path}")
+        return quarantine_path
     finally:
+        if source_descriptor is not None:
+            os.close(source_descriptor)
         os.close(parent_descriptor)
 
 
@@ -719,10 +794,12 @@ def _write_json_staged_noreplace(
     if os.path.lexists(final_path):
         raise FileExistsError(final_path)
     if os.path.lexists(staging_path):
-        if staging_path.is_symlink() or not staging_path.is_file():
-            raise ValueError(f"refusing to clean unsafe JSON staging path: {staging_path}")
-        staging_path.unlink()
-        fsync_directory(staging_path.parent)
+        if staging_path.name != ".completion.json.stage":
+            raise FileExistsError(f"refusing to replace existing JSON staging evidence: {staging_path}")
+        _quarantine_owned_json_staging(
+            staging_path,
+            expected_name=".completion.json.stage",
+        )
     _check_cancelled()
     write_json_exclusive(staging_path, payload)
     _check_cancelled()
@@ -963,22 +1040,22 @@ def _load_or_recover_attempt_evidence(
                     )
             except Exception as error:
                 try:
-                    _remove_owned_json_staging(
+                    _quarantine_owned_json_staging(
                         paths.completion_staging,
                         expected_name=".completion.json.stage",
                     )
                 except Exception as cleanup_error:
                     raise ValueError(
-                        "final completion is valid but its unsafe staging path was not removed"
+                        "final completion is valid but its unsafe staging entry could not be quarantined"
                     ) from cleanup_error
                 raise ValueError(
-                    "final completion is valid; malformed staged completion was removed and recovery must be retried"
+                    "final completion is valid; malformed staged completion was quarantined and recovery must be retried"
                 ) from error
             _check_cancelled()
             if staged_evidence[3] != final_evidence[3] or staged_evidence[4] != final_evidence[4]:
                 raise ValueError("staged completion attestation does not match finalized completion evidence")
             _check_cancelled()
-            _remove_owned_json_staging(
+            _quarantine_owned_json_staging(
                 paths.completion_staging,
                 expected_name=".completion.json.stage",
             )
@@ -1033,7 +1110,7 @@ def _load_or_recover_attempt_evidence(
                 raise RuntimeError("promoted completion validation changed after atomic installation")
     except Exception as error:
         if not promoted:
-            _remove_owned_json_staging(
+            _quarantine_owned_json_staging(
                 paths.completion_staging,
                 expected_name=".completion.json.stage",
             )
@@ -1132,9 +1209,10 @@ def publish_training_result(
         staged_digest = validate_adapter_directory(staged_adapter, expected_rank=expected_rank)
         if staged_digest != source_digest:
             raise RuntimeError(f"staged adapter digest {staged_digest} does not match source digest {source_digest}")
+        staged_adapter_token = _capture_adapter_installation_token(staged_adapter)
         _check_cancelled()
         _rename_noreplace(staged_adapter, final_adapter)
-        _record_adapter_installation(final_adapter)
+        _record_adapter_installation(final_adapter, staged_adapter_token)
         fsync_directory(output_dir)
         _check_cancelled()
         published_digest = validate_adapter_directory(final_adapter, expected_rank=expected_rank)
