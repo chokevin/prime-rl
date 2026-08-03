@@ -1,5 +1,6 @@
 import tomllib
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -12,13 +13,17 @@ from tau.eval_tools.artifacts import (
 )
 from tau.eval_tools.hashing import hash_text
 from tau.eval_tools.json_io import DuplicateKeyError
-from tau.eval_tools.live.validate_training_data_live import _write_pinned_training_config
+from tau.eval_tools.live.validate_training_data_live import validate_source_toml_contract
 from tau.eval_tools.manifest import (
     DecodingConfig,
     ExampleRecord,
+    FileManifest,
+    FileRecord,
     ModelSnapshot,
+    RLConfigIdentity,
     TasksetRef,
     TrainingDataIdentity,
+    TrainingRecord,
     build_manifest,
 )
 
@@ -26,6 +31,18 @@ SOURCE_REVISION = "a" * 40
 VERIFIERS_REVISION = "b" * 40
 TASKSETS_REVISION = "c" * 40
 MODEL_REVISION = "d" * 40
+MODEL_FILES = FileManifest.from_records(
+    [
+        FileRecord(path="config.json", size=2, sha256="1" * 64),
+        FileRecord(path="model.safetensors", size=7, sha256="2" * 64),
+    ]
+)
+RL_CONFIG = RLConfigIdentity(
+    source_config_rel="configs/tau/math-7b-h200/train.toml",
+    output_dir="/data/pretraining-data/prime-rl-math-7b-h200/train",
+    max_steps=50,
+    resolved_toml_sha256="3" * 64,
+)
 
 
 def _manifest():
@@ -36,7 +53,9 @@ def _manifest():
         model=ModelSnapshot(
             name="Qwen/Qwen2.5-7B-Instruct",
             revision=MODEL_REVISION,
+            cache_root="/tmp/models",
             local_path=f"/tmp/models/{MODEL_REVISION}",
+            file_manifest=MODEL_FILES,
         ),
         eval_taskset=TasksetRef(
             id="math500-v1",
@@ -54,8 +73,15 @@ def _manifest():
             dataset_split="train",
             dataset_revision="e" * 40,
         ),
-        training_data=TrainingDataIdentity.from_prompt_hashes(
-            [hash_text(f"training problem {index}") for index in range(300)]
+        training_data=TrainingDataIdentity.from_records(
+            [
+                TrainingRecord(
+                    id=index,
+                    prompt_hash=hash_text(f"training problem {index}"),
+                    answer_hash=hash_text(f"training answer {index}"),
+                )
+                for index in range(300)
+            ]
         ),
         examples=[
             ExampleRecord(
@@ -68,6 +94,8 @@ def _manifest():
         decoding=DecodingConfig(temperature=0.0, seed=0),
         grader="verifiers.v1.scoring.verify_boxed_math_answer",
         baseline_mean=0.4,
+        baseline_rewards_sha256="4" * 64,
+        rl_config=RL_CONFIG,
         created_at=datetime.now(timezone.utc).isoformat(),
     )
 
@@ -119,9 +147,20 @@ def test_publish_training_result_copies_fixed_handoff_and_records_metadata(tmp_p
         expected_step=50,
         expected_rank=16,
     )
+    wrong_config = result.model_copy(
+        update={"rl_config": result.rl_config.model_copy(update={"resolved_toml_sha256": "f" * 64})}
+    )
+    with pytest.raises(ValueError, match="effective RL config identity"):
+        validate_adapter_handoff(
+            result=wrong_config,
+            manifest=manifest,
+            expected_adapter_path=tmp_path / "final-adapter",
+            expected_step=50,
+            expected_rank=16,
+        )
 
 
-def test_publish_training_result_refuses_existing_fixed_handoff(tmp_path):
+def test_publish_training_result_is_idempotent_after_completion(tmp_path):
     _adapter(tmp_path, 50)
     manifest = _manifest()
     publish_training_result(
@@ -131,14 +170,45 @@ def test_publish_training_result_refuses_existing_fixed_handoff(tmp_path):
         expected_step=50,
         expected_rank=16,
     )
-    with pytest.raises(FileExistsError, match="immutable"):
-        publish_training_result(
-            output_dir=tmp_path,
-            manifest=manifest,
-            source_revision=SOURCE_REVISION,
-            expected_step=50,
-            expected_rank=16,
-        )
+    staging = tmp_path / ".training-publication.stage"
+    staging.mkdir()
+    (staging / "stale").write_text("interrupted after completion")
+    retried = publish_training_result(
+        output_dir=tmp_path,
+        manifest=manifest,
+        source_revision=SOURCE_REVISION,
+        expected_step=50,
+        expected_rank=16,
+    )
+    assert retried == TrainingResult.load(tmp_path / "training-result.json")
+    assert not staging.exists()
+
+
+def test_publish_training_result_recovers_interrupted_final_install(tmp_path):
+    _adapter(tmp_path, 50)
+    manifest = _manifest()
+    publish_training_result(
+        output_dir=tmp_path,
+        manifest=manifest,
+        source_revision=SOURCE_REVISION,
+        expected_step=50,
+        expected_rank=16,
+    )
+    (tmp_path / "training-result.json").unlink()
+    staging = tmp_path / ".training-publication.stage"
+    staging.mkdir()
+    (staging / "partial").write_text("interrupted")
+
+    recovered = publish_training_result(
+        output_dir=tmp_path,
+        manifest=manifest,
+        source_revision=SOURCE_REVISION,
+        expected_step=50,
+        expected_rank=16,
+    )
+
+    assert recovered == TrainingResult.load(tmp_path / "training-result.json")
+    assert not staging.exists()
 
 
 def test_select_final_adapter_rejects_stable_checkpoint_at_wrong_step(tmp_path):
@@ -180,29 +250,21 @@ def test_training_result_load_rejects_duplicate_json_keys(tmp_path):
         TrainingResult.load(path)
 
 
-def test_write_pinned_training_config_uses_manifest_snapshot_exclusively(tmp_path):
+def test_source_equivalent_config_contract_accepts_full_current_toml():
     manifest = _manifest()
-    snapshot_path = tmp_path / ("e" * 40)
-    manifest.train_taskset.dataset_local_path = str(snapshot_path)
-    source = tmp_path / "train.toml"
-    source.write_text(
-        """
-[orchestrator]
-[[orchestrator.train.source]]
-name = "math"
-[orchestrator.train.source.env.taskset]
-id = "math-env-v1"
-dataset_name = "PrimeIntellect/Hendrycks-Math"
-dataset_subset = "default"
-dataset_split = "train"
-"""
-    )
-    output = tmp_path / "pinned.toml"
-    _write_pinned_training_config(source, output, manifest)
-    parsed = tomllib.loads(output.read_text())
-    taskset = parsed["orchestrator"]["train"]["source"][0]["env"]["taskset"]
-    assert taskset["dataset_name"] == str(snapshot_path)
-    assert taskset["dataset_subset"] == "default"
-    assert taskset["dataset_split"] == "train"
-    with pytest.raises(FileExistsError):
-        _write_pinned_training_config(source, output, manifest)
+    config_path = Path(__file__).parents[3] / "configs/tau/math-7b-h200/train.toml"
+    validate_source_toml_contract(tomllib.loads(config_path.read_text()), manifest)
+
+
+def test_source_equivalent_config_contract_rejects_minimal_and_task_config_drift(tmp_path):
+    manifest = _manifest()
+    minimal = tmp_path / "minimal.toml"
+    minimal.write_text("[deployment]\nnum_train_gpus = 1\nnum_infer_gpus = 1\n")
+    with pytest.raises(ValueError, match="missing required contract"):
+        validate_source_toml_contract(tomllib.loads(minimal.read_text()), manifest)
+
+    source = Path(__file__).parents[3] / "configs/tau/math-7b-h200/train.toml"
+    drifted = tmp_path / "drifted.toml"
+    drifted.write_text(source.read_text().replace('judge = "None"', "judge = {}"))
+    with pytest.raises(ValueError, match="task config"):
+        validate_source_toml_contract(tomllib.loads(drifted.read_text()), manifest)

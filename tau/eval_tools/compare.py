@@ -13,14 +13,16 @@ from typing import Literal
 import numpy as np
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from tau.eval_tools.json_io import load_json, write_json_exclusive
-from tau.eval_tools.manifest import FrozenEvalManifest
+from tau.eval_tools.json_io import load_json_with_sha256, write_json_exclusive
+from tau.eval_tools.manifest import SHA256_RE, FrozenEvalManifest
 
 #: The goal harness's fixed acceptance thresholds (see the parent plan's "Measured hill
 #: climb" done-check and decision ledger's "Metric default"). Not configurable via CLI
 #: flags on purpose — relaxing them to fit a budget is explicitly forbidden.
 MIN_DELTA = 0.03
 CI_ALPHA = 0.05
+N_BOOTSTRAP = 10_000
+BOOTSTRAP_SEED = 0
 
 
 class IdentityMismatchError(ValueError):
@@ -34,17 +36,25 @@ class RewardRecord(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    manifest_identity_hash: str
+    evaluation_identity_hash: str
+    frozen_manifest_identity_hash: str | None = None
     model_label: Literal["baseline", "post"]
     created_at: str
     rewards: dict[str, float]
     """Example id (as string, for JSON-object-key portability) -> binary reward."""
 
-    @field_validator("manifest_identity_hash")
+    @field_validator("evaluation_identity_hash")
     @classmethod
     def validate_manifest_identity_hash(cls, digest: str) -> str:
         if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
-            raise ValueError("manifest identity must be a lowercase SHA-256 hex digest")
+            raise ValueError("evaluation identity must be a lowercase SHA-256 hex digest")
+        return digest
+
+    @field_validator("frozen_manifest_identity_hash")
+    @classmethod
+    def validate_frozen_manifest_identity_hash(cls, digest: str | None) -> str | None:
+        if digest is not None and not SHA256_RE.fullmatch(digest):
+            raise ValueError("frozen manifest identity must be a lowercase SHA-256 hex digest")
         return digest
 
     @field_validator("rewards", mode="before")
@@ -66,7 +76,13 @@ class RewardRecord(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> "RewardRecord":
-        return cls.model_validate(load_json(path))
+        payload, _ = load_json_with_sha256(path)
+        return cls.model_validate(payload)
+
+    @classmethod
+    def load_with_digest(cls, path: Path) -> tuple["RewardRecord", str]:
+        payload, digest = load_json_with_sha256(path)
+        return cls.model_validate(payload), digest
 
 
 class ComparisonResult(BaseModel):
@@ -78,8 +94,13 @@ class ComparisonResult(BaseModel):
     delta: float
     ci_lower: float
     ci_upper: float
-    n_bootstrap: int
-    bootstrap_seed: int
+    n_bootstrap: Literal[10_000]
+    bootstrap_seed: Literal[0]
+    ci_alpha: Literal[0.05]
+    min_delta: Literal[0.03]
+    manifest_identity_hash: str
+    baseline_rewards_sha256: str
+    post_rewards_sha256: str
     passed: bool
 
     def report(self) -> str:
@@ -94,10 +115,6 @@ class ComparisonResult(BaseModel):
 
 def paired_bootstrap_ci(
     deltas: np.ndarray,
-    *,
-    n_bootstrap: int = 10_000,
-    seed: int = 0,
-    alpha: float = CI_ALPHA,
 ) -> tuple[float, float]:
     """Deterministic (seeded) percentile-bootstrap CI for the mean of `deltas` (one
     per-example post-minus-baseline reward difference). Resampling with a fixed seed
@@ -105,12 +122,12 @@ def paired_bootstrap_ci(
     versions for the same input, which the goal harness's replay requirement needs."""
     if deltas.ndim != 1 or deltas.size == 0:
         raise ValueError("deltas must be a non-empty 1-D array")
-    rng = np.random.RandomState(seed)
+    rng = np.random.RandomState(BOOTSTRAP_SEED)
     n = deltas.size
-    resample_idx = rng.randint(0, n, size=(n_bootstrap, n))
+    resample_idx = rng.randint(0, n, size=(N_BOOTSTRAP, n))
     resampled_means = deltas[resample_idx].mean(axis=1)
-    lower = float(np.percentile(resampled_means, 100 * (alpha / 2)))
-    upper = float(np.percentile(resampled_means, 100 * (1 - alpha / 2)))
+    lower = float(np.percentile(resampled_means, 100 * (CI_ALPHA / 2)))
+    upper = float(np.percentile(resampled_means, 100 * (1 - CI_ALPHA / 2)))
     return lower, upper
 
 
@@ -119,24 +136,41 @@ def compare_runs(
     baseline: RewardRecord,
     post: RewardRecord,
     *,
-    n_bootstrap: int = 10_000,
-    bootstrap_seed: int = 0,
+    baseline_sha256: str,
+    post_sha256: str,
 ) -> ComparisonResult:
     """Validate manifest/example identity between the two reward files, then compute
     the paired delta, bootstrap CI, and pass/fail gate."""
+    if manifest.state != "finalized":
+        raise IdentityMismatchError("comparison requires a finalized manifest")
     identity = manifest.identity_hash()
+    evaluation_identity = manifest.evaluation_identity_hash()
     for label, record in (("baseline", baseline), ("post", post)):
         if record.model_label != label:
             raise IdentityMismatchError(
                 f"{label} input carries model_label={record.model_label!r}; refusing a swapped or mislabeled comparison"
             )
-        if record.manifest_identity_hash != identity:
+        if record.evaluation_identity_hash != evaluation_identity:
             raise IdentityMismatchError(
-                f"{label} reward file's manifest_identity_hash "
-                f"({record.manifest_identity_hash}) does not match the frozen "
-                f"manifest's ({identity}) — refusing to compare rewards computed "
+                f"{label} reward file's evaluation_identity_hash "
+                f"({record.evaluation_identity_hash}) does not match the frozen "
+                f"manifest's ({evaluation_identity}) — refusing to compare rewards computed "
                 "against a different example set, decoding config, or grader."
             )
+    if baseline.frozen_manifest_identity_hash is not None:
+        raise IdentityMismatchError(
+            "baseline reward evidence must predate finalization and omit frozen manifest identity"
+        )
+    if post.frozen_manifest_identity_hash != identity:
+        raise IdentityMismatchError("post reward evidence does not bind the finalized manifest identity")
+    if baseline_sha256 != manifest.baseline_rewards_sha256:
+        raise IdentityMismatchError(
+            f"baseline rewards SHA-256 {baseline_sha256} does not match finalized manifest "
+            f"digest {manifest.baseline_rewards_sha256}"
+        )
+    for label, digest in (("baseline", baseline_sha256), ("post", post_sha256)):
+        if not SHA256_RE.fullmatch(digest):
+            raise ValueError(f"{label} rewards digest must be a lowercase SHA-256 hex digest")
 
     manifest_ids = {str(i) for i in manifest.example_ids}
     for label, record in (("baseline", baseline), ("post", post)):
@@ -155,7 +189,7 @@ def compare_runs(
     deltas = post_values - baseline_values
 
     delta_mean = float(deltas.mean())
-    ci_lower, ci_upper = paired_bootstrap_ci(deltas, n_bootstrap=n_bootstrap, seed=bootstrap_seed)
+    ci_lower, ci_upper = paired_bootstrap_ci(deltas)
     passed = bool(delta_mean >= MIN_DELTA and ci_lower > 0)
 
     return ComparisonResult(
@@ -165,8 +199,13 @@ def compare_runs(
         delta=delta_mean,
         ci_lower=ci_lower,
         ci_upper=ci_upper,
-        n_bootstrap=n_bootstrap,
-        bootstrap_seed=bootstrap_seed,
+        n_bootstrap=N_BOOTSTRAP,
+        bootstrap_seed=BOOTSTRAP_SEED,
+        ci_alpha=CI_ALPHA,
+        min_delta=MIN_DELTA,
+        manifest_identity_hash=identity,
+        baseline_rewards_sha256=baseline_sha256,
+        post_rewards_sha256=post_sha256,
         passed=passed,
     )
 
@@ -175,14 +214,17 @@ def compare_from_paths(
     manifest_path: Path,
     baseline_path: Path,
     post_path: Path,
-    *,
-    n_bootstrap: int = 10_000,
-    bootstrap_seed: int = 0,
 ) -> ComparisonResult:
     manifest = FrozenEvalManifest.load(manifest_path)
-    baseline = RewardRecord.load(baseline_path)
-    post = RewardRecord.load(post_path)
-    return compare_runs(manifest, baseline, post, n_bootstrap=n_bootstrap, bootstrap_seed=bootstrap_seed)
+    baseline, baseline_sha256 = RewardRecord.load_with_digest(baseline_path)
+    post, post_sha256 = RewardRecord.load_with_digest(post_path)
+    return compare_runs(
+        manifest,
+        baseline,
+        post,
+        baseline_sha256=baseline_sha256,
+        post_sha256=post_sha256,
+    )
 
 
 def write_result(result: ComparisonResult, path: Path) -> None:

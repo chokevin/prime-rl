@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -7,15 +8,22 @@ from tau.eval_tools.json_io import DuplicateKeyError
 from tau.eval_tools.manifest import (
     DecodingConfig,
     ExampleRecord,
+    FileManifest,
+    FileRecord,
     FrozenEvalManifest,
     LeakageError,
     ModelSnapshot,
+    RLConfigIdentity,
     TasksetRef,
     TrainingDataIdentity,
+    TrainingRecord,
+    build_file_manifest,
     build_manifest,
     check_disjoint,
     check_headroom,
+    materialize_regular_snapshot,
     validate_manifest_contract,
+    validate_model_snapshot,
     validate_training_prompt_hashes,
 )
 
@@ -25,6 +33,18 @@ VERIFIERS_REVISION = "b" * 40
 TASKSETS_REVISION = "c" * 40
 MODEL_REVISION = "a09a35458c702b33eeacc393d103063234e8bc28"
 TRAIN_DATASET_REVISION = "3ed63f49541bdca4382fba28146aadf20d95cb38"
+MODEL_FILES = FileManifest.from_records(
+    [
+        FileRecord(path="config.json", size=2, sha256="1" * 64),
+        FileRecord(path="model.safetensors", size=7, sha256="2" * 64),
+    ]
+)
+RL_CONFIG = RLConfigIdentity(
+    source_config_rel="configs/tau/math-7b-h200/train.toml",
+    output_dir="/data/pretraining-data/prime-rl-math-7b-h200/train",
+    max_steps=50,
+    resolved_toml_sha256="3" * 64,
+)
 
 
 def _examples(n: int = N_EXAMPLES) -> list[ExampleRecord]:
@@ -35,7 +55,16 @@ def _examples(n: int = N_EXAMPLES) -> list[ExampleRecord]:
 
 
 def _manifest(**overrides) -> FrozenEvalManifest:
-    training_data = TrainingDataIdentity.from_prompt_hashes([hash_text(f"training problem {i}") for i in range(300)])
+    training_data = TrainingDataIdentity.from_records(
+        [
+            TrainingRecord(
+                id=i,
+                prompt_hash=hash_text(f"training problem {i}"),
+                answer_hash=hash_text(f"training answer {i}"),
+            )
+            for i in range(300)
+        ]
+    )
     kwargs = dict(
         state="finalized",
         source_revision=SOURCE_REVISION,
@@ -43,7 +72,9 @@ def _manifest(**overrides) -> FrozenEvalManifest:
         model=ModelSnapshot(
             name="Qwen/Qwen2.5-7B-Instruct",
             revision=MODEL_REVISION,
+            cache_root="/tmp/models",
             local_path=f"/tmp/models/{MODEL_REVISION}",
+            file_manifest=MODEL_FILES,
         ),
         eval_taskset=TasksetRef(
             id="math500-v1",
@@ -67,6 +98,8 @@ def _manifest(**overrides) -> FrozenEvalManifest:
         decoding=DecodingConfig(temperature=0.0, seed=0),
         grader="verifiers.v1.scoring.verify_boxed_math_answer",
         baseline_mean=0.4,
+        baseline_rewards_sha256="4" * 64,
+        rl_config=RL_CONFIG,
         created_at=datetime.now(timezone.utc).isoformat(),
     )
     kwargs.update(overrides)
@@ -104,11 +137,12 @@ def test_validate_examples_rejects_duplicate_prompt_hashes():
         _manifest(examples=examples)
 
 
-def test_identity_hash_is_deterministic_and_ignores_finalization_metadata():
+def test_evaluation_identity_hash_is_deterministic_and_ignores_timestamp():
     m1 = _manifest()
     m2 = _manifest(
         created_at="2099-01-01T00:00:00+00:00",
     )
+    assert m1.evaluation_identity_hash() == m2.evaluation_identity_hash()
     assert m1.identity_hash() == m2.identity_hash()
 
 
@@ -119,7 +153,9 @@ def test_identity_hash_changes_when_model_revision_changes():
         model=ModelSnapshot(
             name=m1.model.name,
             revision=revision,
+            cache_root="/tmp/models",
             local_path=f"/tmp/models/{revision}",
+            file_manifest=m1.model.file_manifest,
         )
     )
     assert m1.identity_hash() != m2.identity_hash()
@@ -128,8 +164,15 @@ def test_identity_hash_changes_when_model_revision_changes():
 def test_identity_hash_changes_when_training_data_changes():
     m1 = _manifest()
     m2 = _manifest(
-        training_data=TrainingDataIdentity.from_prompt_hashes(
-            [hash_text(f"other training problem {i}") for i in range(300)]
+        training_data=TrainingDataIdentity.from_records(
+            [
+                TrainingRecord(
+                    id=i,
+                    prompt_hash=hash_text(f"other training problem {i}"),
+                    answer_hash=hash_text(f"training answer {i}"),
+                )
+                for i in range(300)
+            ]
         )
     )
     assert m1.identity_hash() != m2.identity_hash()
@@ -212,24 +255,137 @@ def test_manifest_rejects_unknown_fields():
 
 def test_validate_training_prompt_hashes_rejects_actual_drift():
     manifest = _manifest()
-    actual = list(manifest.training_data.prompt_hashes)
-    actual[0] = hash_text("drifted training prompt")
-    with pytest.raises(ValueError, match="training prompts do not match"):
-        validate_training_prompt_hashes(manifest, actual)
+    records = list(manifest.training_data.records)
+    records[0] = records[0].model_copy(update={"prompt_hash": hash_text("drifted training prompt")})
+    with pytest.raises(ValueError, match="ordered training records do not match"):
+        validate_training_prompt_hashes(manifest, records)
+
+
+def test_validate_training_records_rejects_answer_only_mutation_and_reordering():
+    manifest = _manifest()
+    answer_mutated = list(manifest.training_data.records)
+    answer_mutated[0] = answer_mutated[0].model_copy(update={"answer_hash": hash_text("different answer")})
+    with pytest.raises(ValueError, match="ordered training records do not match"):
+        validate_training_prompt_hashes(manifest, answer_mutated)
+    with pytest.raises(ValueError, match="ordered training records do not match"):
+        validate_training_prompt_hashes(manifest, list(reversed(manifest.training_data.records)))
+    with pytest.raises(ValueError, match="ordered training records do not match"):
+        validate_training_prompt_hashes(manifest, manifest.training_data.records[:-1])
+    extra = TrainingRecord(id=999, prompt_hash=hash_text("extra prompt"), answer_hash=hash_text("extra answer"))
+    with pytest.raises(ValueError, match="ordered training records do not match"):
+        validate_training_prompt_hashes(manifest, [*manifest.training_data.records, extra])
+
+
+def test_training_identity_rejects_duplicate_ids_and_prompts():
+    records = list(_manifest().training_data.records)
+    duplicate_id = records[1].model_copy(update={"id": records[0].id})
+    with pytest.raises(ValueError, match="duplicate record ids"):
+        TrainingDataIdentity.from_records([records[0], duplicate_id])
+    duplicate_prompt = records[1].model_copy(update={"prompt_hash": records[0].prompt_hash})
+    with pytest.raises(ValueError, match="duplicate prompt hashes"):
+        TrainingDataIdentity.from_records([records[0], duplicate_prompt])
+
+
+def _materialized_model(tmp_path):
+    model_dir = tmp_path / "prime-rl-trusted-models" / "Qwen--Qwen2.5-7B-Instruct" / MODEL_REVISION
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.json").write_text("{}")
+    (model_dir / "model.safetensors").write_bytes(b"weights")
+    return ModelSnapshot(
+        name="Qwen/Qwen2.5-7B-Instruct",
+        revision=MODEL_REVISION,
+        cache_root=str(tmp_path),
+        local_path=str(model_dir),
+        file_manifest=build_file_manifest(model_dir),
+    )
+
+
+def test_model_manifest_rejects_weight_mutation_missing_extra_and_path_swap(tmp_path):
+    model = _materialized_model(tmp_path)
+    weight = Path(model.local_path) / "model.safetensors"
+    weight.write_bytes(b"modified")
+    with pytest.raises(ValueError, match="changed=.*model.safetensors"):
+        validate_model_snapshot(model)
+
+    weight.write_bytes(b"weights")
+    weight.unlink()
+    with pytest.raises(ValueError, match="missing=.*model.safetensors"):
+        validate_model_snapshot(model)
+
+    weight.write_bytes(b"weights")
+    extra = Path(model.local_path) / "unexpected.txt"
+    extra.write_text("extra")
+    with pytest.raises(ValueError, match="extra=.*unexpected.txt"):
+        validate_model_snapshot(model)
+
+    extra.unlink()
+    weight.unlink()
+    weight.mkdir()
+    with pytest.raises(ValueError, match="missing=.*model.safetensors"):
+        validate_model_snapshot(model)
+
+
+def test_file_manifest_rejects_wrong_aggregate_digest(tmp_path):
+    model = _materialized_model(tmp_path)
+    payload = model.file_manifest.model_dump()
+    payload["aggregate_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="aggregate digest"):
+        FileManifest.model_validate(payload)
+
+
+def test_model_snapshot_rejects_directory_path_swap(tmp_path):
+    model = _materialized_model(tmp_path)
+    wrong_path = tmp_path / MODEL_REVISION
+    wrong_path.mkdir()
+    (wrong_path / "config.json").write_text("{}")
+    (wrong_path / "model.safetensors").write_bytes(b"weights")
+    swapped = model.model_copy(update={"local_path": str(wrong_path)})
+    with pytest.raises(ValueError, match="expected fixed trusted path"):
+        validate_model_snapshot(swapped)
+
+
+def test_model_manifest_rejects_symlink_escape(tmp_path):
+    model = _materialized_model(tmp_path)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-weights"
+    outside.write_bytes(b"weights")
+    weight = Path(model.local_path) / "model.safetensors"
+    weight.unlink()
+    weight.symlink_to(outside)
+    try:
+        with pytest.raises(ValueError, match="symlink"):
+            validate_model_snapshot(model)
+    finally:
+        outside.unlink()
+
+
+def test_snapshot_materialization_rejects_symlink_escape(tmp_path):
+    cache_root = tmp_path / "cache"
+    source = cache_root / "snapshots" / MODEL_REVISION
+    source.mkdir(parents=True)
+    outside = tmp_path / "outside.safetensors"
+    outside.write_bytes(b"weights")
+    (source / "config.json").write_text("{}")
+    (source / "model.safetensors").symlink_to(outside)
+    destination = cache_root / "prime-rl-trusted-models" / "Qwen--Qwen2.5-7B-Instruct" / MODEL_REVISION
+    with pytest.raises(ValueError, match="escapes the verified cache root"):
+        materialize_regular_snapshot(source, cache_root, destination)
 
 
 def test_validate_manifest_contract_accepts_exact_finalized_identity(tmp_path):
-    model_dir = tmp_path / MODEL_REVISION
-    model_dir.mkdir()
+    model_dir = tmp_path / "prime-rl-trusted-models" / "Qwen--Qwen2.5-7B-Instruct" / MODEL_REVISION
+    model_dir.mkdir(parents=True)
     (model_dir / "config.json").write_text("{}")
-    dataset_dir = tmp_path / "datasets" / TRAIN_DATASET_REVISION
+    (model_dir / "model.safetensors").write_bytes(b"weights")
+    dataset_dir = tmp_path / "prime-rl-trusted-datasets" / "PrimeIntellect--Hendrycks-Math" / TRAIN_DATASET_REVISION
     (dataset_dir / "data").mkdir(parents=True)
     (dataset_dir / "data" / "train-00000-of-00001.parquet").write_bytes(b"parquet")
     manifest = _manifest(
         model=ModelSnapshot(
             name="Qwen/Qwen2.5-7B-Instruct",
             revision=MODEL_REVISION,
+            cache_root=str(tmp_path),
             local_path=str(model_dir),
+            file_manifest=build_file_manifest(model_dir),
         ),
         train_taskset=TasksetRef(
             id="math-env-v1",
@@ -258,6 +414,8 @@ def test_validate_manifest_contract_rejects_draft(tmp_path):
     manifest = _manifest(
         state="draft",
         baseline_mean=None,
+        baseline_rewards_sha256=None,
+        rl_config=None,
         examples=_examples(500),
     )
     with pytest.raises(ValueError, match="expected 'finalized'"):

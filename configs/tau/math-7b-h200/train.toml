@@ -92,6 +92,7 @@ seq_len = 16384
 
 [inference]
 enable_lora = true
+seed = 0
 
 [inference.model]
 max_model_len = 8192

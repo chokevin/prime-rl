@@ -2,28 +2,28 @@
 example IDs and hashes, seed, decoding parameters, N)` before training starts, and that
 every later eval (baseline or post-training) must replay unmodified.
 
-Only one manifest is ever written per experiment (immutable and exclusively created).
-Both the baseline-eval and
-post-eval Tau jobs read the *same* manifest file; they never build their own, so
-"identical example set" is true by construction rather than by re-derivation. The
-comparison utility (`compare.py`) still re-validates this via `identity_hash()` so an
-accidental copy/edit of the manifest is caught rather than silently accepted.
+A draft is exclusively written before baseline; finalization exclusively writes a second
+manifest that binds the baseline digest and resolved RL configuration. Baseline and post
+bind the same stable evaluation identity, while post also binds the complete finalized
+identity. The comparison utility re-validates both so an accidental copy/edit is rejected.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
-from pathlib import Path
+import shutil
+import stat
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-from tau.eval_tools.hashing import hash_sequence
-from tau.eval_tools.json_io import load_json, write_json_exclusive
+from tau.eval_tools.json_io import load_json_with_sha256, write_json_exclusive
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 EXPECTED_EVAL_TASKSET_ID = "math500-v1"
@@ -44,12 +44,202 @@ EXPECTED_DECODING = {
     "max_completion_tokens": None,
     "seed": 0,
 }
+MODEL_WEIGHT_SUFFIXES = (".safetensors", ".bin")
 
 #: Below this, a baseline is considered too hard to show a defensible hill-climb and too
 #: easy to rule out reward hacking / saturation. Mirrors the goal harness's `[0.10, 0.80]`
 #: headroom band (see the parent plan's "Measured hill climb" done-check).
 MIN_HEADROOM_MEAN = 0.10
 MAX_HEADROOM_MEAN = 0.80
+
+
+class FileRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    size: int
+    sha256: str
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, path: str) -> str:
+        parsed = PurePosixPath(path)
+        if not path or parsed.is_absolute() or "." in parsed.parts or ".." in parsed.parts:
+            raise ValueError(f"file manifest path must be canonical and relative: {path!r}")
+        if parsed.as_posix() != path:
+            raise ValueError(f"file manifest path is not canonical POSIX form: {path!r}")
+        return path
+
+    @field_validator("size")
+    @classmethod
+    def validate_size(cls, size: int) -> int:
+        if size < 0:
+            raise ValueError("file size must be non-negative")
+        return size
+
+    @field_validator("sha256")
+    @classmethod
+    def validate_sha256(cls, digest: str) -> str:
+        if not SHA256_RE.fullmatch(digest):
+            raise ValueError("file SHA-256 must be a lowercase hex digest")
+        return digest
+
+
+def _file_manifest_digest(files: list[FileRecord]) -> str:
+    payload = [record.model_dump() for record in files]
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class FileManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    files: list[FileRecord]
+    aggregate_sha256: str
+
+    @model_validator(mode="after")
+    def validate_manifest(self):
+        paths = [record.path for record in self.files]
+        if not paths:
+            raise ValueError("file manifest must contain at least one file")
+        if paths != sorted(paths):
+            raise ValueError("file manifest records must be sorted by canonical relative path")
+        if len(paths) != len(set(paths)):
+            raise ValueError("file manifest contains duplicate paths")
+        expected = _file_manifest_digest(self.files)
+        if self.aggregate_sha256 != expected:
+            raise ValueError(
+                f"file manifest aggregate digest {self.aggregate_sha256} does not match computed digest {expected}"
+            )
+        return self
+
+    @classmethod
+    def from_records(cls, records: list[FileRecord]) -> "FileManifest":
+        ordered = sorted(records, key=lambda record: record.path)
+        return cls(files=ordered, aggregate_sha256=_file_manifest_digest(ordered))
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _assert_no_symlink_components(path: Path) -> Path:
+    absolute = Path(os.path.abspath(path))
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        mode = current.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            raise ValueError(f"path contains a symlink component: {current}")
+    resolved = absolute.resolve(strict=True)
+    if resolved != absolute:
+        raise ValueError(f"path does not resolve canonically to itself: {absolute} -> {resolved}")
+    return absolute
+
+
+def _canonical_child(path: Path, parent: Path) -> Path:
+    canonical_parent = _assert_no_symlink_components(parent)
+    canonical_path = _assert_no_symlink_components(path)
+    if canonical_path == canonical_parent or not canonical_path.is_relative_to(canonical_parent):
+        raise ValueError(f"{canonical_path} must be a strict child of {canonical_parent}")
+    return canonical_path
+
+
+def build_file_manifest(root: Path) -> FileManifest:
+    root = _assert_no_symlink_components(root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"file manifest root is not a directory: {root}")
+
+    records: list[FileRecord] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        for entry in os.scandir(directory):
+            entry_path = Path(entry.path)
+            if entry.is_symlink():
+                raise ValueError(f"file manifest tree contains a symlink: {entry_path}")
+            if entry.is_dir(follow_symlinks=False):
+                pending.append(entry_path)
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                raise ValueError(f"file manifest tree contains a non-regular entry: {entry_path}")
+            relative = entry_path.relative_to(root).as_posix()
+            records.append(
+                FileRecord(
+                    path=relative, size=entry.stat(follow_symlinks=False).st_size, sha256=_sha256_file(entry_path)
+                )
+            )
+    return FileManifest.from_records(records)
+
+
+def validate_file_manifest(root: Path, expected: FileManifest) -> None:
+    actual = build_file_manifest(root)
+    if actual != expected:
+        expected_by_path = {record.path: record for record in expected.files}
+        actual_by_path = {record.path: record for record in actual.files}
+        missing = sorted(expected_by_path.keys() - actual_by_path.keys())
+        extra = sorted(actual_by_path.keys() - expected_by_path.keys())
+        changed = sorted(
+            path
+            for path in expected_by_path.keys() & actual_by_path.keys()
+            if expected_by_path[path] != actual_by_path[path]
+        )
+        raise ValueError(
+            "file manifest mismatch "
+            f"(missing={missing[:5]}, extra={extra[:5]}, changed={changed[:5]}, "
+            f"actual_aggregate={actual.aggregate_sha256}, expected_aggregate={expected.aggregate_sha256})"
+        )
+
+
+def materialize_regular_snapshot(source: Path, cache_root: Path, destination: Path) -> FileManifest:
+    cache_root = _assert_no_symlink_components(cache_root)
+    source = _canonical_child(source, cache_root)
+    destination_parent = destination.parent
+    destination_parent.mkdir(parents=True, exist_ok=True)
+    destination_parent = _canonical_child(destination_parent, cache_root)
+    destination = Path(os.path.abspath(destination))
+    if destination.parent != destination_parent:
+        raise ValueError("trusted snapshot destination must be a direct child of its verified parent")
+    staging = destination.with_name(f".{destination.name}.materializing")
+
+    records: list[FileRecord] = []
+    for directory, dirnames, filenames in os.walk(source, followlinks=False):
+        directory_path = Path(directory)
+        for name in dirnames:
+            if (directory_path / name).is_symlink():
+                raise ValueError(f"snapshot contains a symlinked directory: {directory_path / name}")
+        for name in filenames:
+            item = directory_path / name
+            target = item.resolve(strict=True)
+            if not target.is_relative_to(cache_root):
+                raise ValueError(f"snapshot file target escapes the verified cache root: {item} -> {target}")
+            mode = target.stat().st_mode
+            if not stat.S_ISREG(mode):
+                raise ValueError(f"snapshot file target is not regular: {item} -> {target}")
+            relative = item.relative_to(source).as_posix()
+            records.append(FileRecord(path=relative, size=target.stat().st_size, sha256=_sha256_file(target)))
+    source_manifest = FileManifest.from_records(records)
+
+    if destination.exists():
+        validate_file_manifest(destination, source_manifest)
+        return source_manifest
+    if staging.exists():
+        if staging.is_symlink() or staging.parent != destination_parent:
+            raise ValueError(f"refusing to remove unsafe snapshot staging path: {staging}")
+        shutil.rmtree(staging)
+    staging.mkdir()
+    for record in source_manifest.files:
+        source_item = (source / record.path).resolve(strict=True)
+        destination_item = staging / record.path
+        destination_item.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_item, destination_item)
+    validate_file_manifest(staging, source_manifest)
+    os.rename(staging, destination)
+    return source_manifest
 
 
 class ModelSnapshot(BaseModel):
@@ -70,11 +260,14 @@ class ModelSnapshot(BaseModel):
             raise ValueError("model revision must be an exact 40-character lowercase commit SHA")
         return revision
 
-    @field_validator("local_path")
+    cache_root: str
+    file_manifest: FileManifest
+
+    @field_validator("local_path", "cache_root")
     @classmethod
     def validate_local_path(cls, local_path: str) -> str:
         if not Path(local_path).is_absolute():
-            raise ValueError("model local_path must be absolute")
+            raise ValueError("model snapshot paths must be absolute")
         return local_path
 
     local_path: str
@@ -144,39 +337,102 @@ class ExampleRecord(BaseModel):
         return digest
 
 
+class TrainingRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    prompt_hash: str
+    answer_hash: str
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, record_id: int) -> int:
+        if record_id < 0:
+            raise ValueError("training record id must be non-negative")
+        return record_id
+
+    @field_validator("prompt_hash", "answer_hash")
+    @classmethod
+    def validate_hash(cls, digest: str) -> str:
+        if not SHA256_RE.fullmatch(digest):
+            raise ValueError("training record hashes must be lowercase SHA-256 hex digests")
+        return digest
+
+
+def _training_record_digest(records: list[TrainingRecord]) -> str:
+    canonical = json.dumps(
+        [record.model_dump() for record in records],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class TrainingDataIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     n: int
-    prompt_hashes: list[str]
-    prompt_hash_digest: str
-
-    @field_validator("prompt_hashes")
-    @classmethod
-    def validate_prompt_hashes(cls, prompt_hashes: list[str]) -> list[str]:
-        invalid = [digest for digest in prompt_hashes if not SHA256_RE.fullmatch(digest)]
-        if invalid:
-            raise ValueError("training prompt hashes must be lowercase SHA-256 hex digests")
-        return prompt_hashes
+    records: list[TrainingRecord]
+    record_digest: str
 
     @model_validator(mode="after")
     def validate_identity(self):
-        if self.n != len(self.prompt_hashes):
-            raise ValueError(f"training-data n={self.n} does not match len(prompt_hashes)={len(self.prompt_hashes)}")
-        expected_digest = hash_sequence(self.prompt_hashes)
-        if self.prompt_hash_digest != expected_digest:
+        if self.n != len(self.records):
+            raise ValueError(f"training-data n={self.n} does not match len(records)={len(self.records)}")
+        ids = [record.id for record in self.records]
+        if len(ids) != len(set(ids)):
+            raise ValueError("training data contains duplicate record ids")
+        prompt_hashes = [record.prompt_hash for record in self.records]
+        if len(prompt_hashes) != len(set(prompt_hashes)):
+            raise ValueError("training data contains duplicate prompt hashes")
+        expected_digest = _training_record_digest(self.records)
+        if self.record_digest != expected_digest:
             raise ValueError(
-                f"training prompt hash digest {self.prompt_hash_digest} does not match computed digest {expected_digest}"
+                f"training record digest {self.record_digest} does not match computed digest {expected_digest}"
             )
         return self
 
+    @property
+    def prompt_hashes(self) -> list[str]:
+        return [record.prompt_hash for record in self.records]
+
     @classmethod
-    def from_prompt_hashes(cls, prompt_hashes: list[str]) -> "TrainingDataIdentity":
+    def from_records(cls, records: list[TrainingRecord]) -> "TrainingDataIdentity":
         return cls(
-            n=len(prompt_hashes),
-            prompt_hashes=prompt_hashes,
-            prompt_hash_digest=hash_sequence(prompt_hashes),
+            n=len(records),
+            records=records,
+            record_digest=_training_record_digest(records),
         )
+
+
+class RLConfigIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_config_rel: Literal["configs/tau/math-7b-h200/train.toml"]
+    output_dir: str
+    max_steps: int
+    resolved_toml_sha256: str
+
+    @field_validator("output_dir")
+    @classmethod
+    def validate_output_dir(cls, output_dir: str) -> str:
+        if not Path(output_dir).is_absolute():
+            raise ValueError("RL output directory must be absolute")
+        return output_dir
+
+    @field_validator("max_steps")
+    @classmethod
+    def validate_max_steps(cls, max_steps: int) -> int:
+        if max_steps < 1:
+            raise ValueError("RL max_steps must be positive")
+        return max_steps
+
+    @field_validator("resolved_toml_sha256")
+    @classmethod
+    def validate_sha256(cls, digest: str) -> str:
+        if not SHA256_RE.fullmatch(digest):
+            raise ValueError("resolved RL TOML digest must be a lowercase SHA-256 hex digest")
+        return digest
 
 
 class FrozenEvalManifest(BaseModel):
@@ -203,6 +459,8 @@ class FrozenEvalManifest(BaseModel):
     n: int
     baseline_mean: float | None
     baseline_mean_headroom_ok: bool
+    baseline_rewards_sha256: str | None = None
+    rl_config: RLConfigIdentity | None = None
     """Whether the baseline mean reward (measured once, before freezing) fell inside
     `[MIN_HEADROOM_MEAN, MAX_HEADROOM_MEAN]`. `freeze_manifest_live.py` refuses to write
     a manifest with this False; kept as an explicit field so a manifest on disk is
@@ -231,12 +489,21 @@ class FrozenEvalManifest(BaseModel):
         if len(prompt_hashes) != len(set(prompt_hashes)):
             raise ValueError("duplicate eval prompt hashes in frozen eval manifest")
         if self.state == "draft":
-            if self.baseline_mean is not None or self.baseline_mean_headroom_ok:
+            if (
+                self.baseline_mean is not None
+                or self.baseline_mean_headroom_ok
+                or self.baseline_rewards_sha256 is not None
+                or self.rl_config is not None
+            ):
                 raise ValueError("draft manifest must not claim finalized baseline headroom")
         elif self.baseline_mean is None or not check_headroom(self.baseline_mean):
             raise ValueError("finalized manifest must record a baseline mean inside the accepted headroom band")
         elif not self.baseline_mean_headroom_ok:
             raise ValueError("finalized manifest must record baseline_mean_headroom_ok=true")
+        elif self.baseline_rewards_sha256 is None or not SHA256_RE.fullmatch(self.baseline_rewards_sha256):
+            raise ValueError("finalized manifest must record the baseline rewards artifact SHA-256")
+        elif self.rl_config is None:
+            raise ValueError("finalized manifest must record the effective RL config identity")
         return self
 
     @property
@@ -247,14 +514,8 @@ class FrozenEvalManifest(BaseModel):
     def example_ids(self) -> set[int]:
         return {e.id for e in self.examples}
 
-    def identity_hash(self) -> str:
-        """Deterministic fingerprint of everything a replay eval must match exactly:
-        taskset identity, the ordered example set, decoding settings, grader, and N.
-        Excludes only finalization metadata (`state`, `created_at`, `baseline_mean`, and
-        `baseline_mean_headroom_ok`) so the baseline reward file produced from the draft
-        remains valid after finalization. The immutable base model, source revisions, and
-        training-data identity are included."""
-        payload = {
+    def _evaluation_identity_payload(self) -> dict:
+        return {
             "schema_version": self.schema_version,
             "source_revision": self.source_revision,
             "verifiers_revision": self.verifiers_revision,
@@ -266,6 +527,22 @@ class FrozenEvalManifest(BaseModel):
             "decoding": self.decoding.model_dump(),
             "grader": self.grader,
             "n": self.n,
+        }
+
+    def evaluation_identity_hash(self) -> str:
+        """Identity available before baseline evaluation and stable through finalization."""
+        canonical = json.dumps(self._evaluation_identity_payload(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def identity_hash(self) -> str:
+        """Complete immutable finalized identity, including baseline evidence and RL config."""
+        payload = {
+            **self._evaluation_identity_payload(),
+            "state": self.state,
+            "baseline_mean": self.baseline_mean,
+            "baseline_mean_headroom_ok": self.baseline_mean_headroom_ok,
+            "baseline_rewards_sha256": self.baseline_rewards_sha256,
+            "rl_config": self.rl_config.model_dump() if self.rl_config is not None else None,
         }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -281,7 +558,8 @@ class FrozenEvalManifest(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> "FrozenEvalManifest":
-        return cls.model_validate(load_json(path))
+        payload, _ = load_json_with_sha256(path)
+        return cls.model_validate(payload)
 
 
 class LeakageError(ValueError):
@@ -327,6 +605,8 @@ def build_manifest(
     decoding: DecodingConfig,
     grader: str,
     baseline_mean: float | None,
+    baseline_rewards_sha256: str | None,
+    rl_config: RLConfigIdentity | None,
     created_at: str,
 ) -> FrozenEvalManifest:
     return FrozenEvalManifest(
@@ -344,26 +624,38 @@ def build_manifest(
         n=len(examples),
         baseline_mean=baseline_mean,
         baseline_mean_headroom_ok=baseline_mean is not None and check_headroom(baseline_mean),
+        baseline_rewards_sha256=baseline_rewards_sha256,
+        rl_config=rl_config,
     )
 
 
 def validate_model_snapshot(model: ModelSnapshot) -> Path:
-    path = Path(model.local_path)
+    cache_root = _assert_no_symlink_components(Path(model.cache_root))
+    path = _canonical_child(Path(model.local_path), cache_root)
+    expected_path = cache_root / "prime-rl-trusted-models" / model.name.replace("/", "--") / model.revision
+    if path != expected_path:
+        raise ValueError(f"materialized model snapshot path is {path}, expected fixed trusted path {expected_path}")
     if not path.is_dir():
         raise FileNotFoundError(f"materialized model snapshot directory not found: {path}")
     if path.name != model.revision:
         raise ValueError(
             f"materialized model snapshot path {path} does not end in the pinned revision {model.revision}"
         )
+    manifest_paths = {record.path for record in model.file_manifest.files}
+    if "config.json" not in manifest_paths:
+        raise ValueError("trusted model file manifest is missing config.json")
+    if not any(path.endswith(MODEL_WEIGHT_SUFFIXES) for path in manifest_paths):
+        raise ValueError("trusted model file manifest contains no model weight file")
     if not (path / "config.json").is_file():
         raise FileNotFoundError(f"materialized model snapshot is missing config.json: {path}")
+    validate_file_manifest(path, model.file_manifest)
     return path
 
 
 def validate_training_snapshot(taskset: TasksetRef) -> Path:
     if taskset.dataset_local_path is None:
         raise ValueError("training taskset must record its materialized dataset snapshot path")
-    path = Path(taskset.dataset_local_path)
+    path = _assert_no_symlink_components(Path(taskset.dataset_local_path))
     if not path.is_dir():
         raise FileNotFoundError(f"materialized training dataset snapshot directory not found: {path}")
     if path.name != taskset.dataset_revision:
@@ -373,20 +665,35 @@ def validate_training_snapshot(taskset: TasksetRef) -> Path:
     data_file = path / EXPECTED_TRAIN_DATA_FILE
     if not data_file.is_file():
         raise FileNotFoundError(f"materialized training dataset is missing pinned data file: {data_file}")
+    _assert_no_symlink_components(data_file)
+    return path
+
+
+def validate_training_snapshot_location(manifest: FrozenEvalManifest) -> Path:
+    cache_root = _assert_no_symlink_components(Path(manifest.model.cache_root))
+    expected_path = (
+        cache_root
+        / "prime-rl-trusted-datasets"
+        / manifest.train_taskset.dataset_name.replace("/", "--")
+        / manifest.train_taskset.dataset_revision
+    )
+    path = validate_training_snapshot(manifest.train_taskset)
+    if path != expected_path:
+        raise ValueError(f"materialized training dataset path is {path}, expected fixed trusted path {expected_path}")
     return path
 
 
 def validate_training_prompt_hashes(
     manifest: FrozenEvalManifest,
-    actual_prompt_hashes: list[str],
+    actual_records: list[TrainingRecord],
 ) -> None:
-    actual = TrainingDataIdentity.from_prompt_hashes(actual_prompt_hashes)
+    actual = TrainingDataIdentity.from_records(actual_records)
     if actual != manifest.training_data:
         raise ValueError(
-            "actual math-env-v1 training prompts do not match the frozen training-data identity "
-            f"(actual={actual.prompt_hash_digest}, expected={manifest.training_data.prompt_hash_digest})"
+            "actual math-env-v1 ordered training records do not match the frozen training-data identity "
+            f"(actual={actual.record_digest}, expected={manifest.training_data.record_digest})"
         )
-    check_disjoint(manifest.eval_prompt_hashes, set(actual_prompt_hashes))
+    check_disjoint(manifest.eval_prompt_hashes, set(actual.prompt_hashes))
 
 
 def validate_manifest_contract(
@@ -443,6 +750,6 @@ def validate_manifest_contract(
         raise ValueError(f"manifest decoding tuple is {manifest.decoding.model_dump()}, expected {EXPECTED_DECODING}")
     if manifest.grader != EXPECTED_GRADER:
         raise ValueError(f"manifest grader is {manifest.grader!r}, expected {EXPECTED_GRADER!r}")
-    validate_training_prompt_hashes(manifest, manifest.training_data.prompt_hashes)
-    validate_training_snapshot(manifest.train_taskset)
+    validate_training_prompt_hashes(manifest, manifest.training_data.records)
+    validate_training_snapshot_location(manifest)
     return validate_model_snapshot(manifest.model)

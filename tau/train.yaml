@@ -2,9 +2,10 @@
 #
 # Runs configs/tau/math-7b-h200/train.toml via prime-rl's `rl` entrypoint, which
 # supervises the trainer, orchestrator, and inference server as one process group.
-# Refuses to start unless the finalized manifest, materialized base snapshot, and actual
-# reloaded training prompt identity all match. After successful RL it publishes one
-# verified fixed final-adapter and training-result.json handoff. The
+# Refuses to start unless the finalized manifest, complete base snapshot, ordered
+# ID/prompt/answer training identity, and final resolved RL TOML all match. The exact
+# materialized dataset is revalidated immediately before launch. After successful RL it
+# atomically publishes one verified fixed final-adapter and training-result.json last. The
 # in-training startup/periodic/final eval against math500-v1 (configured in the TOML)
 # is a monitoring signal only; the frozen manifest is what tau/eval-baseline.yaml and
 # tau/eval-post.yaml replay for the paired comparison that is the actual hill-climb

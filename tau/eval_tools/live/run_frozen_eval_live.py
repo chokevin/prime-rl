@@ -37,7 +37,7 @@ from pathlib import Path
 from tau.eval_tools.compare import RewardRecord
 from tau.eval_tools.hashing import hash_text
 from tau.eval_tools.json_io import write_json_exclusive
-from tau.eval_tools.manifest import FrozenEvalManifest
+from tau.eval_tools.manifest import FrozenEvalManifest, validate_manifest_contract
 
 
 def _reload_and_verify_examples(manifest: FrozenEvalManifest) -> list[tuple[int, str, str]]:
@@ -52,6 +52,10 @@ def _reload_and_verify_examples(manifest: FrozenEvalManifest) -> list[tuple[int,
 
     tasks = Math500Taskset(vf.TasksetConfig()).select()
     by_id = {t.data.idx: t for t in tasks}
+    if len(tasks) != len(by_id):
+        raise RuntimeError("reloaded math500-v1 contains duplicate example ids")
+    if set(by_id) != manifest.example_ids:
+        raise RuntimeError("reloaded math500-v1 ids do not exactly match the frozen 500-example identity")
 
     triples: list[tuple[int, str, str]] = []
     for record in manifest.examples:
@@ -130,6 +134,19 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("post evaluation requires --lora-name")
 
     manifest = FrozenEvalManifest.load(Path(args.manifest))
+    if args.label == "baseline" and manifest.state != "draft":
+        raise ValueError("baseline evidence must be measured against the immutable draft before finalization")
+    if args.label == "post" and manifest.state != "finalized":
+        raise ValueError("post evidence requires the finalized manifest")
+    validate_manifest_contract(
+        manifest,
+        expected_source_revision=manifest.source_revision,
+        expected_verifiers_revision=manifest.verifiers_revision,
+        expected_tasksets_revision=manifest.eval_taskset.taskset_revision,
+        expected_model_name=manifest.model.name,
+        expected_model_revision=manifest.model.revision,
+        require_finalized=args.label == "post",
+    )
     triples = _reload_and_verify_examples(manifest)
     model_name = args.lora_name or args.served_model_name
 
@@ -144,7 +161,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     record = RewardRecord(
-        manifest_identity_hash=manifest.identity_hash(),
+        evaluation_identity_hash=manifest.evaluation_identity_hash(),
+        frozen_manifest_identity_hash=manifest.identity_hash() if manifest.state == "finalized" else None,
         model_label=args.label,
         created_at=datetime.now(timezone.utc).isoformat(),
         rewards=rewards,

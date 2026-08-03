@@ -41,8 +41,6 @@ def _cmd_compare(args: argparse.Namespace) -> int:
             Path(args.manifest),
             Path(args.baseline),
             Path(args.post),
-            n_bootstrap=args.n_bootstrap,
-            bootstrap_seed=args.bootstrap_seed,
         )
     except Exception as exc:  # noqa: BLE001 - CLI boundary: surface any failure as a clean nonzero exit
         print(f"error: {exc}", file=sys.stderr)
@@ -137,12 +135,6 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--baseline", required=True, help="Path to the baseline rewards JSON.")
     compare_parser.add_argument("--post", required=True, help="Path to the post-training rewards JSON.")
     compare_parser.add_argument("--output", default=None, help="Optional path to write the comparison result JSON.")
-    compare_parser.add_argument(
-        "--n-bootstrap", type=int, default=10_000, help="Bootstrap resample count (default: 10000)."
-    )
-    compare_parser.add_argument(
-        "--bootstrap-seed", type=int, default=0, help="Bootstrap RNG seed (default: 0, deterministic)."
-    )
     compare_parser.set_defaults(func=_cmd_compare)
 
     disjoint_parser = subparsers.add_parser(

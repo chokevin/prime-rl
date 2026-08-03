@@ -16,7 +16,7 @@
 #   smoke          - CPU-only config validation: `rl --dry-run`, no model/GPU/network.
 #   freeze-draft   - load math500-v1 + math-env-v1, prove disjointness, write a draft
 #                    frozen-eval manifest (CPU-only, no GPU).
-#   freeze-finalize- given a measured baseline mean, freeze the immutable manifest.
+#   freeze-finalize- validate fixed baseline rewards and freeze the immutable manifest.
 #   eval           - 1 GPU: standalone frozen-eval replay (baseline or post-training).
 #   train          - 2 GPU: bounded RL training; refuses to start without a frozen
 #                    manifest already on durable storage.
@@ -40,11 +40,22 @@ die() {
 [[ "$PRIME_RL_TASKSETS_SHA" =~ ^[0-9a-f]{40}$ ]] || die "PRIME_RL_TASKSETS_SHA must be a full lowercase 40-character commit SHA"
 
 CHILD_PID=""
-OVERLAY_DIR="$(mktemp -d /tmp/prime-rl-overlay.XXXXXX)"
+TMP_ROOT="$(realpath -e /tmp)"
+[ -d "$TMP_ROOT" ] || die "canonical /tmp root is unavailable"
+overlay_raw="$(mktemp -d "${TMP_ROOT}/prime-rl-overlay.XXXXXX")"
+OVERLAY_DIR="$(realpath -e "$overlay_raw")"
 case "$OVERLAY_DIR" in
-/tmp/prime-rl-overlay.*) ;;
+"${TMP_ROOT}"/prime-rl-overlay.*) ;;
 *) die "mktemp returned unsafe overlay path ${OVERLAY_DIR}" ;;
 esac
+[ "$OVERLAY_DIR" != "$TMP_ROOT" ] || die "overlay must be a private child, never /tmp itself"
+[ "$(stat -c %d "$OVERLAY_DIR")" = "$(stat -c %d "$TMP_ROOT")" ] || die "overlay must remain on the /tmp filesystem"
+OVERLAY_DEVICE="$(stat -c %d "$OVERLAY_DIR")"
+OVERLAY_INODE="$(stat -c %i "$OVERLAY_DIR")"
+if command -v findmnt >/dev/null 2>&1; then
+    [ "$(findmnt -n -o TARGET -T "$OVERLAY_DIR")" = "$(findmnt -n -o TARGET -T "$TMP_ROOT")" ] ||
+        die "overlay must not be a nested mount"
+fi
 
 cleanup() {
     if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
@@ -52,8 +63,18 @@ cleanup() {
         kill -TERM "$CHILD_PID" 2>/dev/null || true
         wait "$CHILD_PID" 2>/dev/null || true
     fi
-    case "$OVERLAY_DIR" in
-    /tmp/prime-rl-overlay.*) rm -rf -- "$OVERLAY_DIR" ;;
+    canonical_overlay="$(realpath -e "$OVERLAY_DIR" 2>/dev/null || true)"
+    case "$canonical_overlay" in
+    "${TMP_ROOT}"/prime-rl-overlay.*)
+        if [ "$canonical_overlay" = "$OVERLAY_DIR" ] &&
+            [ ! -L "$OVERLAY_DIR" ] &&
+            [ "$(stat -c %d "$canonical_overlay")" = "$OVERLAY_DEVICE" ] &&
+            [ "$(stat -c %i "$canonical_overlay")" = "$OVERLAY_INODE" ]; then
+            rm -rf -- "$canonical_overlay"
+        else
+            log "refusing to remove unsafe overlay path ${canonical_overlay}"
+        fi
+        ;;
     *) log "refusing to remove unsafe overlay path ${OVERLAY_DIR}" ;;
     esac
 }
@@ -87,21 +108,51 @@ verify_gitlink() {
 verify_gitlink deps/verifiers "$PRIME_RL_VERIFIERS_SHA"
 verify_gitlink deps/research-environments "$PRIME_RL_TASKSETS_SHA"
 
+canonical_overlay_path() {
+    local relative="$1" expected_kind="$2" current="$OVERLAY_DIR" component canonical
+    case "$relative" in
+    /* | *"//"* | "." | ".." | ../* | */../* | */.. | ./* | */./* | */.) die "unsafe overlay-relative path: ${relative}" ;;
+    esac
+    IFS=/ read -ra components <<<"$relative"
+    for component in "${components[@]}"; do
+        current="${current}/${component}"
+        [ ! -L "$current" ] || die "overlay path contains symlink component: ${current}"
+    done
+    canonical="$(realpath -e "$current")" || die "overlay path does not exist: ${relative}"
+    case "$canonical" in
+    "${OVERLAY_DIR}"/*) ;;
+    *) die "overlay path escapes verified checkout: ${relative} -> ${canonical}" ;;
+    esac
+    case "$expected_kind" in
+    file) [ -f "$canonical" ] || die "overlay path is not a regular file: ${relative}" ;;
+    dir) [ -d "$canonical" ] || die "overlay path is not a directory: ${relative}" ;;
+    *) die "internal error: unsupported overlay path kind ${expected_kind}" ;;
+    esac
+    printf '%s\n' "$canonical"
+}
+
+primary_config_path() {
+    [ "${PRIME_RL_CONFIG_REL:-}" = "configs/tau/math-7b-h200/train.toml" ] ||
+        die "PRIME_RL_CONFIG_REL must be exactly configs/tau/math-7b-h200/train.toml"
+    canonical_overlay_path "$PRIME_RL_CONFIG_REL" file
+}
+
 # Optional narrow install of one repo-local environment package — forward-compatible
 # with a future harder-math environment (W4a/W9), not used by the primary
 # math-env-v1/math500-v1 experiment, which ships in deps/research-environments already
 # baked into the image. --no-deps + a single `-e` target keeps this narrow; never a
 # full/`--inexact` `uv sync` of the whole workspace.
 if [ -n "${PRIME_RL_EXTRA_ENV_PACKAGE_DIR:-}" ]; then
-    pkg_dir="${OVERLAY_DIR}/${PRIME_RL_EXTRA_ENV_PACKAGE_DIR}"
-    [ -d "$pkg_dir" ] || die "PRIME_RL_EXTRA_ENV_PACKAGE_DIR=${PRIME_RL_EXTRA_ENV_PACKAGE_DIR} not found in the overlay checkout"
+    [ "$PRIME_RL_EXTRA_ENV_PACKAGE_DIR" = "environments/harder_math_v1" ] ||
+        die "PRIME_RL_EXTRA_ENV_PACKAGE_DIR may only select environments/harder_math_v1"
+    pkg_dir="$(canonical_overlay_path "$PRIME_RL_EXTRA_ENV_PACKAGE_DIR" dir)"
     log "installing extra environment package from ${pkg_dir} (narrow: --no-deps, no full sync)"
     cd /app
     uv pip install --no-deps -e "$pkg_dir"
 fi
 
 cd /app
-export PYTHONPATH="${OVERLAY_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="$OVERLAY_DIR"
 
 # --- Step 2: child-process lifecycle helpers -----------------------------------------
 # Backgrounding the long-running child + trapping here (rather than running it in the
@@ -134,9 +185,10 @@ wait_for_health() {
 case "$PRIME_RL_RUN_MODE" in
 smoke)
     : "${PRIME_RL_CONFIG_REL:?PRIME_RL_CONFIG_REL must be set for smoke mode}"
+    config_path="$(primary_config_path)"
     [ ! -e "${TAU_OUTPUT_DIR}/smoke-result.json" ] || die "${TAU_OUTPUT_DIR}/smoke-result.json already exists; smoke evidence is immutable"
-    log "config smoke: uv run rl --dry-run @ ${OVERLAY_DIR}/${PRIME_RL_CONFIG_REL}"
-    uv run --no-sync rl @ "${OVERLAY_DIR}/${PRIME_RL_CONFIG_REL}" \
+    log "config smoke: uv run rl --dry-run @ ${config_path}"
+    uv run --no-sync rl @ "$config_path" \
         --output-dir "$TAU_OUTPUT_DIR" --dry-run
     uv run --no-sync python -m tau.eval_tools.cli write-smoke-result \
         --output "${TAU_OUTPUT_DIR}/smoke-result.json" \
@@ -169,7 +221,11 @@ freeze-finalize)
     : "${PRIME_RL_MODEL_NAME:?PRIME_RL_MODEL_NAME must be set}"
     : "${PRIME_RL_MODEL_REVISION:?PRIME_RL_MODEL_REVISION must be an exact HF commit SHA}"
     : "${PRIME_RL_MANIFEST_DIR:?PRIME_RL_MANIFEST_DIR must be set}"
-    : "${PRIME_RL_BASELINE_MEAN:?PRIME_RL_BASELINE_MEAN must be set to the mean reward measured by the eval-baseline target against the draft manifest}"
+    : "${PRIME_RL_BASELINE_REWARDS_PATH:?PRIME_RL_BASELINE_REWARDS_PATH must point to immutable baseline rewards.json}"
+    : "${PRIME_RL_CONFIG_REL:?PRIME_RL_CONFIG_REL must be set}"
+    : "${PRIME_RL_MAX_STEPS:?PRIME_RL_MAX_STEPS must select the exact bounded final training step}"
+    [[ "$PRIME_RL_MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || die "PRIME_RL_MAX_STEPS must be a positive integer"
+    config_path="$(primary_config_path)"
     uv run --no-sync python -m tau.eval_tools.cli validate-manifest \
         --manifest "${PRIME_RL_MANIFEST_DIR}/draft-manifest.json" \
         --source-revision "$resolved_sha" \
@@ -180,7 +236,11 @@ freeze-finalize)
         >/dev/null
     uv run --no-sync python -m tau.eval_tools.live.freeze_manifest_live finalize \
         --draft "${PRIME_RL_MANIFEST_DIR}/draft-manifest.json" \
-        --baseline-mean "$PRIME_RL_BASELINE_MEAN" \
+        --baseline-rewards "$PRIME_RL_BASELINE_REWARDS_PATH" \
+        --config "$config_path" \
+        --config-rel "$PRIME_RL_CONFIG_REL" \
+        --output-dir "/data/pretraining-data/prime-rl-math-7b-h200/train" \
+        --max-steps "$PRIME_RL_MAX_STEPS" \
         --out "${PRIME_RL_MANIFEST_DIR}/frozen-eval-manifest.json"
     ;;
 
@@ -283,12 +343,11 @@ train)
     : "${PRIME_RL_MODEL_REVISION:?PRIME_RL_MODEL_REVISION must be an exact HF commit SHA}"
     : "${PRIME_RL_MAX_STEPS:?PRIME_RL_MAX_STEPS must select the exact bounded final training step}"
     [[ "$PRIME_RL_MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || die "PRIME_RL_MAX_STEPS must be a positive integer"
+    config_path="$(primary_config_path)"
     frozen_manifest="${PRIME_RL_MANIFEST_DIR}/frozen-eval-manifest.json"
     if [ ! -f "$frozen_manifest" ]; then
         die "frozen eval manifest not found at ${frozen_manifest} — run freeze-draft, measure the baseline eval, then freeze-finalize before training. Refusing to start training without a pre-committed held-out eval (see tau/README.md's proof ladder)."
     fi
-    [ ! -e "${TAU_OUTPUT_DIR}/training-result.json" ] || die "${TAU_OUTPUT_DIR}/training-result.json already exists; training evidence is immutable"
-    [ ! -e "${TAU_OUTPUT_DIR}/final-adapter" ] || die "${TAU_OUTPUT_DIR}/final-adapter already exists; adapter handoff is immutable"
     model_snapshot_path="$(
         uv run --no-sync python -m tau.eval_tools.cli validate-manifest \
             --manifest "$frozen_manifest" \
@@ -300,17 +359,19 @@ train)
             --require-finalized
     )"
     export HF_DATASETS_OFFLINE=1
-    pinned_training_config="${OVERLAY_DIR}/pinned-training.toml"
+    pinned_training_config="${TAU_OUTPUT_DIR}/resolved-train.toml"
     uv run --no-sync python -m tau.eval_tools.live.validate_training_data_live \
         --manifest "$frozen_manifest" \
-        --config "${OVERLAY_DIR}/${PRIME_RL_CONFIG_REL}" \
-        --output-config "$pinned_training_config"
+        --config "$config_path" \
+        --config-rel "$PRIME_RL_CONFIG_REL" \
+        --output-config "$pinned_training_config" \
+        --output-dir "$TAU_OUTPUT_DIR" \
+        --max-steps "$PRIME_RL_MAX_STEPS" \
+        --preflight "${TAU_OUTPUT_DIR}/training-preflight.json"
     log "frozen manifest, model snapshot, and training-data identity verified — proceeding"
 
-    rl_args=(--output-dir "$TAU_OUTPUT_DIR" --model.name "$model_snapshot_path" --max-steps "$PRIME_RL_MAX_STEPS")
-
-    log "starting bounded RL training: uv run rl @ ${pinned_training_config} ${rl_args[*]}"
-    uv run --no-sync rl @ "$pinned_training_config" "${rl_args[@]}" &
+    log "starting bounded RL training: uv run rl @ ${pinned_training_config}"
+    uv run --no-sync rl @ "$pinned_training_config" &
     CHILD_PID=$!
     wait "$CHILD_PID"
     CHILD_PID=""

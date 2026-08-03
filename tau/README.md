@@ -110,12 +110,13 @@ that *does* change dependencies, but heavier than this branch needs. If a future
 on this branch adds a Python dependency, switch to that built-in mechanism (or add an
 explicit `uv sync --inexact` step to this wrapper) instead of silently going stale.
 
-**Narrow package-install escape hatch:** if a future commit (e.g. the harder-math
-environment from W4a/W9) needs one extra installed package, set
-`runtime.env.PRIME_RL_EXTRA_ENV_PACKAGE_DIR` to that package's path relative to the repo
-root; the wrapper runs `uv pip install --no-deps -e <that one dir>` — never a full/
-`--inexact` workspace sync. Not needed by the primary experiment: `math-env-v1` and
-`math500-v1` already ship in `deps/research-environments`, baked into the image.
+**Narrow package-install escape hatch:** W4c may set
+`runtime.env.PRIME_RL_EXTRA_ENV_PACKAGE_DIR=environments/harder_math_v1`. No other path
+is accepted. The wrapper rejects absolute paths, `..`, symlink components, and canonical
+escapes before running `uv pip install --no-deps -e` on that verified checkout path. It
+also replaces rather than extends inherited `PYTHONPATH`. The primary experiment does
+not need this escape hatch: `math-env-v1` and `math500-v1` already ship in
+`deps/research-environments`, baked into the image.
 
 **If no matching image digest existed:** the fallback is a manual
 `workflow_dispatch` of `.github/workflows/build_image.yaml` — but that workflow only
@@ -152,6 +153,7 @@ Derived from `configs/basic/hendrycks-sanity/rl.toml` per the W2 selection memo:
 | `[model].name` | `Qwen/Qwen2.5-7B-Instruct` | primary experiment tuple (W2) |
 | `[orchestrator.renderer].name` | `default` | not in `MODEL_RENDERER_MAP` (verified against `deps/renderers/renderers/base.py`); `renderer.name="auto"` would hard-fail its own validator for this model. No `reasoning_parser` — plain instruct model, not a `<think>`-tag reasoning model. |
 | `[trainer.model.lora].rank` | 16 | W2's LoRA choice |
+| `[inference].seed` | `0` | fixed resolved inference seed; the effective-config preflight rejects drift |
 | `[trainer.ckpt.weights].save_adapter_separately` | `true` | so `tau/eval-post.yaml` can load just the adapter |
 | `[file_monitor]` | enabled | writes the documented fixed `metrics.jsonl` artifact |
 | `[orchestrator.train.source.env.taskset]` | `math-env-v1`, `PrimeIntellect/Hendrycks-Math`, `default`, `train` | the freeze job materializes commit `3ed63f49541bdca4382fba28146aadf20d95cb38`; training rewrites only `dataset_name` to that fixed local snapshot before `rl` |
@@ -166,28 +168,32 @@ The handoff never enumerates a storage directory.
 
 ## Frozen eval manifest and the paired comparison gate
 
-- `tau/eval_tools/manifest.py` — schema-v3 `FrozenEvalManifest` pins the overlay,
-  verifiers, taskset, model, eval dataset, and training dataset revisions; the absolute
-  materialized model snapshot path; every ordered training prompt hash plus its digest;
-  all 500 eval IDs and prompt/answer hashes; the exact decoding tuple; grader; and
-  finalized headroom state. `identity_hash()` includes the base model and training-data
-  identities and excludes only draft/finalization metadata, so the draft baseline
-  remains paired with the finalized manifest.
+- `tau/eval_tools/manifest.py` — schema-v4 `FrozenEvalManifest` pins the overlay,
+  verifiers, taskset, model, eval dataset, and training dataset revisions. Freeze copies
+  model and dataset snapshots into trusted regular-file trees. The model identity records
+  every canonical path, byte size, per-file SHA-256, and an aggregate digest; baseline,
+  train, and post-eval reject missing, extra, changed, path-escaping, or symlinked files.
+  Training identity binds ordered `{id, prompt_hash, answer_hash}` records, count, source
+  revision/config, and digest. Eval identity binds all 500 IDs and prompt/answer hashes,
+  decoding, and grader. Finalization additionally binds the exact resolved RL TOML,
+  materialized train path, and baseline reward artifact SHA-256.
 - `tau/eval_tools/compare.py` — strict JSON loading rejects duplicate keys; reward files
   must carry the expected `baseline`/`post` labels, exact example IDs, and finite binary
   rewards (the pinned grader is source-proven to return exactly `0.0` or `1.0`).
-  `compare_runs()` validates both files share the manifest identity, computes the paired
-  mean delta, a **deterministic**
-  (seeded `numpy.random.RandomState`) percentile bootstrap 95% CI, and the gate: pass
-  only if `delta >= +0.03` **and** `ci_lower > 0`.
+  Baseline finalization strict-loads the fixed baseline file, computes its mean internally,
+  requires `[0.10, 0.80]`, and binds its digest. `compare_runs()` rechecks that digest and
+  computes a paired percentile bootstrap using exactly 10,000 resamples and seed 0.
+  Neither is caller-configurable. The gate passes only if `delta >= +0.03` **and**
+  `ci_lower > 0`.
 - Standalone baseline/post eval disables prime-rl's default router. The one vLLM engine
   serves health, LoRA admin, and OpenAI traffic on port 8000; startup and adapter-load
   failures are fatal before any reward evidence can be written.
 - `tau/eval_tools/live/` materializes exact model commit
   `a09a35458c702b33eeacc393d103063234e8bc28` and exact training dataset commit
   `3ed63f49541bdca4382fba28146aadf20d95cb38`. Immediately before RL, offline mode
-  reloads both tasksets, revalidates every eval/training hash, and emits the config that
-  points `math-env-v1` at that same local dataset snapshot.
+  revalidates the full model and ordered training identities, validates the final
+  repository `RLConfig`, writes the exact resolved TOML consumed by `rl`, and emits
+  immutable `training-preflight.json` evidence bound to that TOML digest.
 
 ### Proof ladder (in order)
 
@@ -219,16 +225,20 @@ tau run --config tau/.rendered/eval-baseline.yaml --context aks-ai-runtime-eastu
 tau run get prime-rl-math-7b-h200-eval-baseline -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact rewards.json
 
-# 4. Freeze the manifest, recording the measured baseline mean (edit
-#    tau/freeze-manifest.yaml: PRIME_RL_RUN_MODE=freeze-finalize, PRIME_RL_BASELINE_MEAN=<step 3's mean>,
-#    then re-render).
+# 4. Freeze the manifest from immutable baseline evidence (edit only
+#    tau/freeze-manifest.yaml: PRIME_RL_RUN_MODE=freeze-finalize, then re-render).
+#    Finalization reads the fixed PRIME_RL_BASELINE_REWARDS_PATH; no mean is supplied.
 python3 tau/render_image.py
 tau run --config tau/.rendered/freeze-manifest.yaml --context aks-ai-runtime-eastus2-admin
 tau run get prime-rl-math-7b-h200-freeze-manifest -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact frozen-eval-manifest.json
 
-# 5. Train (2 GPU) — strict manifest/data/model validation runs immediately before RL.
+# 5. Train (2 GPU) — strict manifest/data/model/config validation runs immediately before RL.
 tau run --config tau/.rendered/train.yaml --context aks-ai-runtime-eastus2-admin
+tau run get prime-rl-math-7b-h200-train -n pretraining-data \
+  --context aks-ai-runtime-eastus2-admin --artifact training-preflight.json
+tau run get prime-rl-math-7b-h200-train -n pretraining-data \
+  --context aks-ai-runtime-eastus2-admin --artifact resolved-train.toml
 tau run get prime-rl-math-7b-h200-train -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact training-result.json
 tau run get prime-rl-math-7b-h200-train -n pretraining-data \
@@ -252,9 +262,9 @@ implementation writes its results to a fixed, predictable filename inside its ow
 directory to find them. Reward, comparison, smoke, training, and manifest evidence is
 created exclusively; an existing filename fails instead of being overwritten.
 
-`eval-baseline`'s rewards stay valid after freezing without a rerun:
-`identity_hash()` is unaffected by `freeze-finalize` (it only changes
-`baseline_mean_headroom_ok` and `created_at`, both excluded from the hash).
+`eval-baseline` binds the stable evaluation identity available in the draft. Finalization
+then binds that exact artifact digest and the effective training configuration into the
+full immutable identity. Post-eval must match both identities and the same baseline digest.
 
 ## Artifact manifest
 
@@ -268,7 +278,7 @@ storage proof) — fetch each by its exact name with `--artifact <file>`.
 | `freeze-manifest` | `.../prime-rl-math-7b-h200/manifest` | `draft-manifest.json`, `frozen-eval-manifest.json` | unfrozen draft (pass 1) and the immutable frozen manifest (pass 2) `tau/eval_tools/manifest.py` reads/writes |
 | `eval-baseline` | `.../prime-rl-math-7b-h200/eval-baseline` | `rewards.json`, `inference.log` | baseline per-example rewards (`RewardRecord`) `tau/eval_tools/compare.py` consumes |
 | `eval-post` | `.../prime-rl-math-7b-h200/eval-post` | `rewards.json`, `comparison.json`, `inference.log` | post-training rewards + the `ComparisonResult` (delta, bootstrap CI, pass/fail) |
-| `train` | `.../prime-rl-math-7b-h200/train` | `training-result.json`, `metrics.jsonl`; fixed handoff path `final-adapter/` | after successful RL, verifies the exact `weights/step_<PRIME_RL_MAX_STEPS>/lora_adapters/`, copies it to `final-adapter/`, and records source step/path/hash |
+| `train` | `.../prime-rl-math-7b-h200/train` | `training-preflight.json`, `resolved-train.toml`, `training-result.json`, `metrics.jsonl`; fixed handoff path `final-adapter/` | validates the exact config/data/model identity before launch; after successful RL, stages only fixed adapter files from the exact `STABLE` final step, fsyncs and atomically installs `final-adapter/` without replacement, then writes `training-result.json` last |
 
 Explicit-file fetch while the run's Workload/Job still exists (the proven, reliable path):
 
@@ -361,22 +371,21 @@ output):
   selectors, topology annotation, storage mounts, and env vars; the embedded
   `TAU_SCRIPT_B64` was verified byte-identical to `tau/scripts/run-prime-rl.sh` by
   decoding it back and diffing.
-- `python3 tau/render_image.py` (and its `--check-only`/malformed-pin/missing-pin error
+- `uv run --no-sync python tau/render_image.py` (and its `--check-only`/malformed-pin/missing-pin error
   paths) exercised directly; confirmed the un-rendered `tau/<target>.yaml` templates
   still pass `tau run validate` (schema-only) but the sentinel image string is not
   rejected by `--dry-run=client` either (documented in "Image and overlay strategy" so
   this isn't mistaken for a stronger guarantee than it is).
 - `bash -n` and `shellcheck` (zero warnings) on `tau/scripts/run-prime-rl.sh`.
-- `python -m tomllib` parse of `configs/tau/math-7b-h200/train.toml`, cross-referenced
+- stdlib JSON/TOML parsing of the image pin and training config, cross-referenced
   field-by-field against `packages/prime-rl-configs/src/prime_rl/configs/{rl,orchestrator,trainer}.py`.
-- Focused `pytest` cases for `tau/eval_tools/` (identity
-  mismatch, leakage, deterministic bootstrap, and both comparison-gate pass/fail
-  branches — including a case where the mean delta meets the `+0.03` bar but the CI
-  still crosses zero) — run in an isolated macOS `uv venv` with only `pydantic`/`numpy`/
-  `pytest` installed (no project-wide `uv sync`, since torch/vllm are Linux/CUDA-only).
+- `PYTHONPATH=. uv run --no-sync pytest -q tau/eval_tools/tests` — 70 tests covering
+  content manifests, path/symlink rejection, ordered train identity, immutable evidence,
+  fixed bootstrap, config drift, and retry-safe adapter publication.
 - `ruff check` / `ruff format --check` clean on every new Python file under `tau/`.
-- `python -m py_compile` on the `live/` scripts (syntax only — they import
+- `uv run --no-sync python -m py_compile` on the `live/` scripts (syntax only — they import
   `verifiers`/`datasets`/`openai`/`huggingface_hub`, unavailable here).
+- `uv lock --check`, `git diff --check`, and secret/dependency/submodule/dtype scans.
 
 ## What is *not* proven yet (explicitly out of this session's scope)
 
