@@ -90,6 +90,10 @@ id = "null"
 type = "subprocess"
 
 [trainer.model]
+# Qwen2.5 uses prime-rl's Hugging Face trainer path. Hopper's automatic FA3
+# selection is custom-implementation-only, so pin the compatible FA2 path.
+impl = "hf"
+attn = "flash_attention_2"
 seq_len = 16384
 
 [inference]
