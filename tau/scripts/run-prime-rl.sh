@@ -200,6 +200,12 @@ cd /app
 export PYTHONPATH="$OVERLAY_DIR"
 export HF_HOME="${RUN_ROOT}/hf-home"
 
+uv run --no-sync python -m tau.eval_tools.output_paths \
+    --mode "$PRIME_RL_RUN_MODE" \
+    --output-dir "$TAU_OUTPUT_DIR" \
+    --eval-label "${PRIME_RL_EVAL_LABEL:-}"
+log "prepared exact mode-bound output directory ${TAU_OUTPUT_DIR}"
+
 # --- Step 2: child-process lifecycle helpers -----------------------------------------
 # Backgrounding the long-running child + trapping here (rather than running it in the
 # foreground) is required, not decorative: bash defers a foreground command's signal
