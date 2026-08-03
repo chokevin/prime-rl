@@ -111,6 +111,44 @@ def test_exclusive_json_preserves_suspicious_stage_collision(tmp_path, monkeypat
     assert load_json_with_sha256(path)[0] == {"status": "success"}
 
 
+def test_exclusive_json_closes_staged_writer_before_promotion(tmp_path, monkeypatch):
+    path = tmp_path / "evidence.json"
+    original_open = json_io_module.os.open
+    original_close = json_io_module.os.close
+    original_rename = json_io_module.rename_entry_noreplace
+    staged_writers = set()
+    closed_descriptors = set()
+
+    def tracked_open(name, flags, mode=0o777, *, dir_fd=None):
+        descriptor = original_open(name, flags, mode, dir_fd=dir_fd)
+        if str(name).startswith(".evidence.json.stage-") and flags & json_io_module.os.O_WRONLY:
+            staged_writers.add(descriptor)
+        return descriptor
+
+    def tracked_close(descriptor):
+        if descriptor in staged_writers:
+            closed_descriptors.add(descriptor)
+        original_close(descriptor)
+
+    def assert_closed_before_rename(directory_descriptor, source_name, destination_name):
+        assert staged_writers
+        assert staged_writers <= closed_descriptors
+        original_rename(directory_descriptor, source_name, destination_name)
+
+    monkeypatch.setattr(
+        json_io_module.os,
+        "supports_dir_fd",
+        json_io_module.os.supports_dir_fd | {tracked_open},
+    )
+    monkeypatch.setattr(json_io_module.os, "open", tracked_open)
+    monkeypatch.setattr(json_io_module.os, "close", tracked_close)
+    monkeypatch.setattr(json_io_module, "rename_entry_noreplace", assert_closed_before_rename)
+
+    write_json_exclusive(path, {"status": "success"})
+
+    assert load_json_with_sha256(path)[0] == {"status": "success"}
+
+
 def test_exclusive_json_rejects_stage_swap_without_installing_replacement(tmp_path, monkeypatch):
     path = tmp_path / "evidence.json"
     displaced = tmp_path / "displaced-owned-stage"

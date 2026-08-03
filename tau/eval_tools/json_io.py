@@ -351,6 +351,8 @@ def write_bytes_exclusive(
         _write_all(stage_descriptor, payload)
         os.fsync(stage_descriptor)
         staged_metadata = os.fstat(stage_descriptor)
+        os.close(stage_descriptor)
+        stage_descriptor = None
         _before_json_install(path.parent / stage_name)
         current_stage = os.stat(stage_name, dir_fd=parent_descriptor, follow_symlinks=False)
         if (
