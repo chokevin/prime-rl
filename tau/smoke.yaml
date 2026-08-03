@@ -18,7 +18,7 @@ runtime:
     # Operator must set this to the exact commit being validated before submitting —
     # see tau/README.md's "Before every submit" step. Never leave this pointing at a
     # branch name: the overlay fetch verifies an exact SHA.
-    PRIME_RL_REPO_SHA: e38f54c1e9025cffefed3efe30b94f8e24203c78
+    PRIME_RL_REPO_SHA: ce9d0919b6eb266a7c8100b333dc9ea91e95b96f
     PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
     PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
     PRIME_RL_CONFIG_REL: configs/tau/math-7b-h200/train.toml
@@ -39,4 +39,4 @@ policy:
 
 storage:
   data_pvc: blob-training
-  output: /data/pretraining-data/prime-rl-math-7b-h200/generations/e38f54c1e9025cffefed3efe30b94f8e24203c78/smoke
+  output: /data/pretraining-data/prime-rl-math-7b-h200/generations/ce9d0919b6eb266a7c8100b333dc9ea91e95b96f/smoke

@@ -79,7 +79,7 @@ The manifest's `org.opencontainers.image.revision` annotation is
 `bbb90a1b4132c351cbe8b0ed1fa808dde99f0318` — exactly this branch's merge-base commit (the
 sync branch's tree is byte-identical to upstream `bbb90a1b4`; see the `/goal` plan's
 Baseline section). The immutable runtime overlay is
-`e38f54c1e9025cffefed3efe30b94f8e24203c78`. That commit contains the complete Tau
+`ce9d0919b6eb266a7c8100b333dc9ea91e95b96f`. That commit contains the complete Tau
 wrapper/eval tooling and the workspace-locked `environments/harder_math_v1` package.
 Its dependency set matches the pinned image: `harder-math-v1` uses only `datasets` and
 `verifiers`, which are already present. The later integration commit changes only
@@ -92,7 +92,7 @@ automatic `flash_attention_3` selection is custom-only; leaving both fields on `
 therefore fails before model loading.
 
 Every durable artifact belongs to the complete source generation rooted at
-`/data/pretraining-data/prime-rl-math-7b-h200/generations/e38f54c1e9025cffefed3efe30b94f8e24203c78`.
+`/data/pretraining-data/prime-rl-math-7b-h200/generations/ce9d0919b6eb266a7c8100b333dc9ea91e95b96f`.
 The wrapper derives this root from the exact fetched commit and rejects output or
 cross-mode inputs from any other generation before creating a directory. Any runtime
 behavior or config change must therefore land in a new source commit and start a complete
@@ -248,7 +248,7 @@ step override. The handoff never enumerates a storage directory.
 ### Proof ladder (in order)
 
 Before any of this, confirm every target pins
-`e38f54c1e9025cffefed3efe30b94f8e24203c78`, then render the image pin with
+`ce9d0919b6eb266a7c8100b333dc9ea91e95b96f`, then render the image pin with
 `uv run --no-sync python tau/render_image.py`. The base model and training dataset
 revisions are already immutable pins. Every command below points at
 `tau/.rendered/<target>.yaml`, never the bare `tau/<target>.yaml` template, so pin
@@ -321,8 +321,8 @@ rerun RL. Use the exact logged ID to recover publication:
 
 ```bash
 uv run --no-sync python -m tau.eval_tools.cli recover-publish \
-  --manifest /data/pretraining-data/prime-rl-math-7b-h200/generations/e38f54c1e9025cffefed3efe30b94f8e24203c78/manifest/frozen-eval-manifest.json \
-  --output-dir /data/pretraining-data/prime-rl-math-7b-h200/generations/e38f54c1e9025cffefed3efe30b94f8e24203c78/train \
+  --manifest /data/pretraining-data/prime-rl-math-7b-h200/generations/ce9d0919b6eb266a7c8100b333dc9ea91e95b96f/manifest/frozen-eval-manifest.json \
+  --output-dir /data/pretraining-data/prime-rl-math-7b-h200/generations/ce9d0919b6eb266a7c8100b333dc9ea91e95b96f/train \
   --attempt-id "$ATTEMPT_ID"
 ```
 
@@ -414,14 +414,14 @@ proven by W1's storage probe after its Job was cancelled:
 
 ```bash
 tau run get <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admin \
-  --path /data/pretraining-data/prime-rl-math-7b-h200/generations/e38f54c1e9025cffefed3efe30b94f8e24203c78/eval-post/rewards.json \
+  --path /data/pretraining-data/prime-rl-math-7b-h200/generations/ce9d0919b6eb266a7c8100b333dc9ea91e95b96f/eval-post/rewards.json \
   --pvc blob-training
 ```
 
 ## Operator commands
 
 **Before every submit:** confirm all five checked-in templates pin the immutable runtime
-overlay `e38f54c1e9025cffefed3efe30b94f8e24203c78`, then render. Do not replace it with the
+overlay `ce9d0919b6eb266a7c8100b333dc9ea91e95b96f`, then render. Do not replace it with the
 later integration/pin commit: that would be a self-reference and that commit changes no
 runtime code. The pinned `Qwen/Qwen2.5-7B-Instruct` revision is
 `a09a35458c702b33eeacc393d103063234e8bc28`. Every model-serving phase downloads that
@@ -511,9 +511,9 @@ Run all of the following before any submit:
 ## What is *not* proven yet (explicitly out of this session's scope)
 
 - No Tau job has run source generation
-  `e38f54c1e9025cffefed3efe30b94f8e24203c78`; client dry-runs do not prove live
+  `ce9d0919b6eb266a7c8100b333dc9ea91e95b96f`; client dry-runs do not prove live
   execution.
-- Source commit `e38f54c1e9025cffefed3efe30b94f8e24203c78` validates private cleanup
+- Source commit `ce9d0919b6eb266a7c8100b333dc9ea91e95b96f` validates private cleanup
   against a locked-`huggingface-hub==1.16.1` snapshot with symlinks. Fixed JSON evidence
   is fully written, fsynced, and inode-bound before its writer is closed and the entry is
   atomically promoted; closing before promotion is required by the BlobFuse-backed output
