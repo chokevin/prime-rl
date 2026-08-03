@@ -1694,7 +1694,10 @@ def test_source_equivalent_config_contract_accepts_full_current_toml():
     manifest = _manifest()
     config_path = Path(__file__).parents[3] / "configs/tau/math-7b-h200/train.toml"
     source_bytes = config_path.read_bytes()
-    validate_source_toml_contract(source_bytes, tomllib.loads(source_bytes.decode()), manifest)
+    raw = tomllib.loads(source_bytes.decode())
+    assert raw["trainer"]["model"]["impl"] == "hf"
+    assert raw["trainer"]["model"]["attn"] == "flash_attention_2"
+    validate_source_toml_contract(source_bytes, raw, manifest)
 
 
 def test_run_specific_config_binds_only_private_materializations():

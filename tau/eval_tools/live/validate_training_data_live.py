@@ -14,7 +14,7 @@ from tau.eval_tools.manifest import (
     TrainingRecord,
 )
 
-CANONICAL_SOURCE_TOML_SHA256 = "c22b5221f7e11abe5b4f38c5cbd09ab0c3336a648cc8ab04f7737c7478b699de"
+CANONICAL_SOURCE_TOML_SHA256 = "7617f4d2e574ac4eb834b488b8b43d4d9f5034e89e92ea7af761f3c3198a6c2c"
 PRIVATE_MODEL_SENTINEL = "/__prime_rl_private__/model"
 PRIVATE_DATASET_SENTINEL = "/__prime_rl_private__/training-dataset"
 EXPECTED_LORA_TARGET_MODULES = [
@@ -86,6 +86,8 @@ def validate_source_toml_contract(
         raise ValueError("source TOML model name does not match the frozen model name")
     if deployment.get("num_train_gpus") != 1 or deployment.get("num_infer_gpus") != 1:
         raise ValueError("source TOML must request exactly one trainer and one inference GPU")
+    if trainer_model.get("impl") != "hf" or trainer_model.get("attn") != "flash_attention_2":
+        raise ValueError("source TOML must use the Qwen2.5-compatible HF trainer with flash attention 2")
     if trainer_model.get("lora", {}).get("rank") != 16:
         raise ValueError("source TOML must explicitly configure trainer rank-16 LoRA")
     if (
