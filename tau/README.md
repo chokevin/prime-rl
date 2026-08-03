@@ -39,10 +39,10 @@ configs/tau/math-7b-h200/
   train.toml             # derived from configs/basic/hendrycks-sanity/rl.toml
 ```
 
-Every `tau/*.yaml` is a **template**: its `runtime.image` is the literal sentinel
-`RENDER_REQUIRED__see_tau/render_image.py`, not a real image reference. Run
-`python3 tau/render_image.py` first, then point every command below at
-`tau/.rendered/<target>.yaml` — see "Image and overlay strategy" below for why.
+Every `tau/*.yaml` pins the real public digest recorded in `tau/image.pin.json`. Run
+`uv run --no-sync python tau/render_image.py` first: it rejects any target that drifts
+from the pin and stages validated copies plus their entrypoint under `tau/.rendered/`.
+Point every command below at `tau/.rendered/<target>.yaml`.
 
 There is no `tau/workspace.connection.yaml` — the installed `tau v0.1.2-26-g57532229`
 rejects the scaffold's `requirements.minTauVersion: 0.3.0`, so every command below passes
@@ -75,24 +75,22 @@ curl -sD - -o /dev/null --oauth2-bearer "$TOKEN" \
 The manifest's `org.opencontainers.image.revision` annotation is
 `bbb90a1b4132c351cbe8b0ed1fa808dde99f0318` — exactly this branch's merge-base commit (the
 sync branch's tree is byte-identical to upstream `bbb90a1b4`; see the `/goal` plan's
-Baseline section). The overlay changes code/config only and does not change
-`pyproject.toml` or `uv.lock`, so the baked `/app/.venv` still satisfies the exact locked
-dependency set.
+Baseline section). The immutable runtime overlay is
+`ec9194a586d473667c0c6cea4ba0cb3495fe01a6`. That commit contains the complete Tau
+wrapper/eval tooling and the workspace-locked `environments/harder_math_v1` package.
+Its dependency set matches the pinned image: `harder-math-v1` uses only `datasets` and
+`verifiers`, which are already present. The later integration commit changes only
+checked-in Tau pins/docs and the client-side selection fixture; runtime code continues
+to come from the immutable overlay.
 
-**Why a pin file + render step instead of hardcoding the digest 5×:** every checked-in
-`tau/*.yaml` carries the sentinel `RENDER_REQUIRED__see_tau/render_image.py` instead of
-a real (or worse, fake/placeholder-that-looks-real) digest. `tau/render_image.py`
-substitutes the one digest recorded in `tau/image.pin.json` into every template,
-writing to gitignored `tau/.rendered/` (and mirrors `tau/scripts/` alongside each
-rendered file, since `entrypoint:` paths resolve relative to the config file's own
-directory), and refuses to render (nonzero exit, no output) if the pin file is missing,
-malformed, or itself contains a placeholder/`latest` value. Re-pinning to a new digest
-is a one-line JSON edit, not five find-and-replace edits. Tested empirically: Tau's
-client-side `validate`/`--dry-run=client` does **not** reject the un-rendered sentinel
-string (it passes straight through into the rendered Job spec) — the real safety net is
-one step later, since the sentinel isn't a resolvable image reference and an accidental
-un-rendered submit fails loudly at image-pull time (`ErrImagePull`) rather than silently
-running. Always render first regardless.
+**Why a pin file + render step when the digest is also checked in 5×:** the templates
+must be directly inspectable and runnable-looking, while `tau/image.pin.json` remains
+the source of truth used to detect drift. `tau/render_image.py` validates that every
+template carries exactly that real digest, writes validated copies to gitignored
+`tau/.rendered/`, and mirrors `tau/scripts/` alongside them because `entrypoint:` paths
+resolve relative to the config file's own directory. It refuses to stage anything if
+the pin is missing, malformed, set to `latest`, or disagrees with any target. Re-pinning
+therefore requires an intentional edit to the pin and all five visible targets.
 
 **Why no `uv sync` at job startup:** `tau/scripts/run-prime-rl.sh` creates a private
 `/tmp/prime-rl-overlay.XXXXXX` scratch directory, fetches this exact fork/commit into it
@@ -111,13 +109,31 @@ that *does* change dependencies, but heavier than this branch needs. If a future
 adds a Python dependency, switch to that built-in mechanism (or add an
 explicit `uv sync --inexact` step to this wrapper) instead of silently going stale.
 
-**Narrow package-install escape hatch:** W4c may set
+**Narrow package-install escape hatch:** a later harder-math tier-curve target may set
 `runtime.env.PRIME_RL_EXTRA_ENV_PACKAGE_DIR=environments/harder_math_v1`. No other path
 is accepted. The wrapper rejects absolute paths, `..`, symlink components, and canonical
 escapes before running `uv pip install --no-deps -e` on that verified checkout path. It
 also replaces rather than extends inherited `PYTHONPATH`. The primary experiment does
 not need this escape hatch: `math-env-v1` and `math500-v1` already ship in
 `deps/research-environments`, baked into the image.
+
+The corresponding prime-rl source-selection overlay is
+`configs/tau/math-7b-h200/harder-math-v1-hard.toml`. It is a static fixture for config
+selection and a future tier-curve run; none of the five primary targets use it. Compose
+it after `train.toml` to replace only `orchestrator.train.source`. The primary
+`math-env-v1` training and all-500 `math500-v1` frozen-evaluation proof ladder remain the
+default.
+
+**Harder-math metadata boundary:** the primary frozen manifest remains a strict,
+ordered 500-row MATH-500 contract. A `harder-math-v1` tier curve is a separate
+`tier-curve.v1` artifact covering its full 5,030-row eval catalog; it must never be
+inserted into `FrozenEvalManifest.examples`. For later disjointness tooling,
+`tier-curve.v1.records[].prompt_sha256` is the field corresponding to Tau's
+`prompt_hash`. `content_sha256` hashes prompt plus gold and is not Tau's
+answer-only `answer_hash`; `record_id` is source-qualified text rather than the
+MATH-500 integer ID. Keeping those artifacts separate lets Tau consume the W4a prompt
+hash set later without weakening or renaming the primary manifest fields and without
+claiming any empirical tier result.
 
 **If no matching image digest existed:** the fallback is a manual
 `workflow_dispatch` of `.github/workflows/build_image.yaml` — but that workflow only
@@ -209,16 +225,16 @@ step override. The handoff never enumerates a storage directory.
 
 ### Proof ladder (in order)
 
-Before any of this: substitute the exact 40-character integrated overlay commit into
-every target (see "Operator commands" below) and render the image pin —
-`python3 tau/render_image.py`. The overlay placeholder fails the wrapper's strict SHA
-check. The base model and training dataset revisions are already immutable pins. Every
-command below points at `tau/.rendered/<target>.yaml`, never the bare `tau/<target>.yaml`
-template (that still carries the unrendered image sentinel).
+Before any of this, confirm every target pins
+`ec9194a586d473667c0c6cea4ba0cb3495fe01a6`, then render the image pin with
+`uv run --no-sync python tau/render_image.py`. The base model and training dataset
+revisions are already immutable pins. Every command below points at
+`tau/.rendered/<target>.yaml`, never the bare `tau/<target>.yaml` template, so pin
+validation and entrypoint mirroring cannot be skipped.
 
 ```bash
-# 0. Render once per commit (after substituting PRIME_RL_REPO_SHA — see below).
-python3 tau/render_image.py
+# 0. Render the checked-in immutable source and image pins.
+uv run --no-sync python tau/render_image.py
 
 # 1. Smoke the resolved config and fetch the fixed success evidence.
 tau run --config tau/.rendered/smoke.yaml --context aks-ai-runtime-eastus2-admin
@@ -240,7 +256,7 @@ tau run get prime-rl-math-7b-h200-eval-baseline -n pretraining-data \
 # 4. Freeze the manifest from immutable baseline evidence (edit only
 #    tau/freeze-manifest.yaml: PRIME_RL_RUN_MODE=freeze-finalize, then re-render).
 #    Finalization reads the fixed PRIME_RL_BASELINE_REWARDS_PATH; no mean is supplied.
-python3 tau/render_image.py
+uv run --no-sync python tau/render_image.py
 tau run --config tau/.rendered/freeze-manifest.yaml --context aks-ai-runtime-eastus2-admin
 tau run get prime-rl-math-7b-h200-freeze-manifest -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact frozen-eval-manifest.json
@@ -370,17 +386,17 @@ tau run get <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admi
 
 ## Operator commands
 
-**Before every submit:** replace `REPLACE_WITH_EXACT_COMMIT_SHA` with the full integrated
-commit being run. W4c must do this only after the additive review-fix commit is integrated.
-The pinned `Qwen/Qwen2.5-7B-Instruct` revision is
+**Before every submit:** confirm all five checked-in templates pin the immutable runtime
+overlay `ec9194a586d473667c0c6cea4ba0cb3495fe01a6`, then render. Do not replace it with the
+later integration/pin commit: that would be a self-reference and that commit changes no
+runtime code. The pinned `Qwen/Qwen2.5-7B-Instruct` revision is
 `a09a35458c702b33eeacc393d103063234e8bc28`. Every model-serving phase downloads that
 exact revision directly into a fresh job-private cache, validates the complete frozen
 file manifest, and serves only the non-writable private regular-file tree. Post-eval does
 the same for the durable final adapter after verifying all training evidence.
 
 ```bash
-sed -i '' "s/REPLACE_WITH_EXACT_COMMIT_SHA/$(git rev-parse HEAD)/" tau/<target>.yaml
-python3 tau/render_image.py
+uv run --no-sync python tau/render_image.py
 ```
 
 Validate + dry-run client (no cluster mutation) for any target — schema `validate` works
@@ -410,8 +426,8 @@ target (see the proof ladder above), so no command in this doc lists a directory
 its output.
 
 `<job-name>` equals each YAML's `name:` field (`prime-rl-math-7b-h200-{smoke,freeze-manifest,eval-baseline,eval-post,train}`).
-Never submit the bare `tau/<target>.yaml` template directly — it still carries the
-unrendered image sentinel.
+Never submit the bare `tau/<target>.yaml` template directly; use the validated rendered
+copy so image-pin validation cannot be skipped.
 
 ## Secrets
 
@@ -428,14 +444,12 @@ unrendered image sentinel.
   registry) should be added explicitly and reviewed — do not add a bare token.
 - Secrets/diff check for this change: `git diff <merge-base>... | grep -iE
   "token|secret|password|api[_-]?key|BEGIN [A-Z]+ PRIVATE KEY"` — run as part of static
-  validation below; only the known `REPLACE_WITH_EXACT_COMMIT_SHA` placeholder and the
-  harmless string `api_key_var` (a prime-rl config *field
-  name*, not a value) should match.
+  validation below; only documented config field names such as `api_key_var` should
+  match.
 
-## Static validation done in this session
+## Static validation contract
 
-All of the following were run in this session and passed (see the W4b report for full
-output):
+Run all of the following before any submit:
 
 - `tau run validate --config tau/.rendered/<target>.yaml` for all 5 targets.
 - `tau run --config tau/.rendered/<target>.yaml --context aks-ai-runtime-eastus2-admin --dry-run=client`
@@ -443,11 +457,9 @@ output):
   selectors, topology annotation, storage mounts, and env vars; the embedded
   `TAU_SCRIPT_B64` was verified byte-identical to `tau/scripts/run-prime-rl.sh` by
   decoding it back and diffing.
-- `uv run --no-sync python tau/render_image.py` (and its `--check-only`/malformed-pin/missing-pin error
-  paths) exercised directly; confirmed the un-rendered `tau/<target>.yaml` templates
-  still pass `tau run validate` (schema-only) but the sentinel image string is not
-  rejected by `--dry-run=client` either (documented in "Image and overlay strategy" so
-  this isn't mistaken for a stronger guarantee than it is).
+- `uv run --no-sync python tau/render_image.py` (and its
+  `--check-only`/malformed-pin/missing-pin/mismatched-template error paths); confirm all
+  five checked-in and rendered targets carry the exact public digest.
 - `bash -n` and `shellcheck` (zero warnings) on `tau/scripts/run-prime-rl.sh`.
 - stdlib JSON/TOML parsing of the image pin and training config, cross-referenced
   field-by-field against `packages/prime-rl-configs/src/prime_rl/configs/{rl,orchestrator,trainer}.py`.
@@ -465,11 +477,15 @@ output):
 
 - No Tau job has been submitted (no `--dry-run=server`, no real submit). This session's
   scope (W4b) was static config/scripts/tests; live cluster execution is W5–W8.
+- Do not submit the model-materializing phases yet. Closeout review reproduced two
+  runtime blockers in the immutable source overlay: Hugging Face snapshot-cache
+  symlinks make the training supervisor reject its private-root cleanup, and an
+  interrupted fixed-path JSON evidence write can leave a partial final file that blocks
+  retry. W4c does not patch either accepted runtime chain after recording `SOURCE_SHA`;
+  an accepted follow-up source commit and explicit re-pin are required before W5.
 - `tau/eval_tools/live/*.py` have never been executed against a real dataset, model, or
   inference server.
 - `max_steps = 50` and the resource requests are placeholders, not throughput-measured.
-- W4c must still replace every `PRIME_RL_REPO_SHA` placeholder with the exact integrated
-  commit and render from that tree; placeholders fail closed.
 - The frozen eval manifest has not been created; no baseline has been measured; no
   training has run; no comparison has been computed.
 - Whether `Qwen/Qwen2.5-7B-Instruct` + `DefaultRenderer` + rank-16 LoRA actually loads

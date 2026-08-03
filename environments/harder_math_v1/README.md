@@ -53,20 +53,34 @@ The trusted final catalog contract is:
 | `train` | 7,495 | 1,912 | 3,282 | 2,301 | `f51df30441c419d3e569c6a9a4588bab9da55c16e13988e627d299fe0314eb8f` |
 | `eval` | 5,030 | 1,331 | 2,345 | 1,354 | `ebe68009a7104d960d15e890489bdb6485476d56fe89407babbcc1532608285b` |
 
-Use the null harness with the subprocess runtime:
+In prime-rl, select the taskset with the null harness and subprocess runtime:
 
 ```toml
-[env.taskset]
+[[orchestrator.train.source]]
+name = "harder-math-hard"
+
+[orchestrator.train.source.env.taskset]
 id = "harder-math-v1"
 partition = "train"
 tier = "hard"
 catalog_manifest_path = "artifacts/harder-math-train-hard.json"
 
-[env.agent.harness]
+[orchestrator.train.source.env.agent.harness]
 id = "null"
 
-[env.agent.runtime]
+[orchestrator.train.source.env.agent.runtime]
 type = "subprocess"
+```
+
+`configs/tau/math-7b-h200/harder-math-v1-hard.toml` is the checked-in
+selection overlay. Compose it after the primary Tau config to replace only
+the training-source list while preserving the frozen `math500-v1` eval:
+
+```bash
+uv run --package prime-rl --package harder-math-v1 rl \
+  @ configs/tau/math-7b-h200/train.toml \
+  @ configs/tau/math-7b-h200/harder-math-v1-hard.toml \
+  --dry-run --output-dir /tmp/harder-math-config-smoke
 ```
 
 The loader always reads every pinned source needed to verify train/eval

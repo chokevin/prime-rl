@@ -1,0 +1,17 @@
+# Static selection fixture and future training-source overlay for harder-math-v1.
+# Compose after train.toml. It replaces the training-source list only; the primary
+# all-500 math500-v1 evaluation remains unchanged.
+[[orchestrator.train.source]]
+name = "harder-math-hard"
+
+[orchestrator.train.source.env.taskset]
+id = "harder-math-v1"
+partition = "train"
+tier = "hard"
+catalog_manifest_path = "artifacts/harder-math-train-hard.json"
+
+[orchestrator.train.source.env.agent.harness]
+id = "null"
+
+[orchestrator.train.source.env.agent.runtime]
+type = "subprocess"
