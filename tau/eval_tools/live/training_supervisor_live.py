@@ -8,7 +8,7 @@ import secrets
 import shutil
 import signal
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +17,7 @@ from tau.eval_tools.artifacts import (
     SOURCE_CONFIG_REL,
     TrainingCompletionAttestation,
     TrainingPreflight,
+    _write_json_staged_noreplace,
     attempt_paths,
     publish_training_result,
     select_final_adapter,
@@ -51,10 +52,9 @@ class RLProcessResult:
     started_at: str
     ended_at: str
     return_code: int
+    cancelled_signal: int | None
 
 
-ProcessRunner = Callable[[Sequence[str]], RLProcessResult]
-Publisher = Callable[..., object]
 PRIVATE_RUN_ROOT_RE = re.compile(r"^prime-rl-run-[0-9a-f]{32}$")
 
 
@@ -63,27 +63,45 @@ def generate_attempt_id() -> str:
     return f"{timestamp}-{secrets.token_hex(8)}"
 
 
-def run_streaming_process(argv: Sequence[str]) -> RLProcessResult:
+def _signal_process_group(pid: int, signum: int) -> None:
+    os.killpg(pid, signum)
+
+
+def _run_rl_process(argv: Sequence[str]) -> RLProcessResult:
     argv = tuple(argv)
     executable = shutil.which(argv[0])
     if executable is None:
         raise FileNotFoundError(f"trusted RL executable is unavailable: {argv[0]}")
     executable = str(Path(executable).resolve(strict=True))
     started_at = datetime.now(timezone.utc).isoformat()
-    process = subprocess.Popen(argv)
     previous_handlers: dict[int, object] = {}
+    cancelled_signal = None
+    process = None
 
     def forward_signal(signum, _frame):
-        if process.poll() is None:
-            process.send_signal(signum)
+        nonlocal cancelled_signal
+        cancelled_signal = signum
+        if process is not None and process.poll() is None:
+            try:
+                _signal_process_group(process.pid, signum)
+            except ProcessLookupError:
+                pass
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous_handlers[signum] = signal.signal(signum, forward_signal)
     try:
+        process = subprocess.Popen(argv, start_new_session=True)
+        if cancelled_signal is not None and process.poll() is None:
+            try:
+                _signal_process_group(process.pid, cancelled_signal)
+            except ProcessLookupError:
+                pass
         return_code = process.wait()
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
+    if process is None:
+        raise RuntimeError("RL process was not started")
     ended_at = datetime.now(timezone.utc).isoformat()
     return RLProcessResult(
         argv=argv,
@@ -92,6 +110,7 @@ def run_streaming_process(argv: Sequence[str]) -> RLProcessResult:
         started_at=started_at,
         ended_at=ended_at,
         return_code=return_code,
+        cancelled_signal=cancelled_signal,
     )
 
 
@@ -224,11 +243,13 @@ def _write_completion_from_process(
     paths = attempt_paths(preflight.artifact_output_dir, preflight.attempt_id, require_existing=True)
     expected_argv = ("uv", "run", "--no-sync", "rl", "@", preflight.private_config_path)
     if process_result.argv != expected_argv:
-        raise ValueError("process runner did not execute the exact trusted RL command")
+        raise ValueError("supervisor did not execute the exact trusted RL command")
     if Path(process_result.executable).name != "uv" or not Path(process_result.executable).is_absolute():
-        raise ValueError("process runner did not bind the resolved uv executable")
+        raise ValueError("supervisor did not bind the resolved uv executable")
     if process_result.pid <= 1:
-        raise ValueError("process runner returned an invalid RL PID")
+        raise ValueError("supervisor observed an invalid RL PID")
+    if process_result.cancelled_signal is not None:
+        raise InterruptedError("cancelled RL process cannot produce a completion attestation")
     if process_result.return_code != 0:
         raise RuntimeError(f"rl process exited with status {process_result.return_code}")
     if datetime.fromisoformat(process_result.ended_at) < datetime.fromisoformat(process_result.started_at):
@@ -303,7 +324,11 @@ def _write_completion_from_process(
         source_adapter_path=str(source_adapter),
         source_adapter_files=build_file_manifest(source_adapter),
     )
-    write_json_exclusive(paths.completion, attestation.model_dump())
+    _write_json_staged_noreplace(
+        final_path=paths.completion,
+        staging_path=paths.completion_staging,
+        payload=attestation.model_dump(),
+    )
     return attestation
 
 
@@ -311,8 +336,6 @@ def supervise_prepared_attempt(
     *,
     manifest: FrozenEvalManifest,
     preflight: TrainingPreflight,
-    process_runner: ProcessRunner = run_streaming_process,
-    publisher: Publisher = publish_training_result,
     expected_rank: int = 16,
 ) -> object:
     if manifest.rl_config is None:
@@ -353,7 +376,12 @@ def supervise_prepared_attempt(
     ):
         raise ValueError("private RL launch config does not match durable preflight/config identity")
     command = ("uv", "run", "--no-sync", "rl", "@", preflight.private_config_path)
-    process_result = process_runner(command)
+    process_result = _run_rl_process(command)
+    if process_result.cancelled_signal is not None:
+        raise InterruptedError(
+            f"rl process {process_result.pid} was cancelled by signal {process_result.cancelled_signal}; "
+            "no completion attestation or result was written"
+        )
     if process_result.return_code != 0:
         raise RuntimeError(
             f"rl process {process_result.pid} exited with status {process_result.return_code}; "
@@ -369,7 +397,7 @@ def supervise_prepared_attempt(
         expected_step=manifest.rl_config.max_steps,
         expected_rank=expected_rank,
     )
-    return publisher(
+    return publish_training_result(
         output_dir=Path(preflight.artifact_output_dir),
         manifest=manifest,
         attempt_id=preflight.attempt_id,
@@ -383,9 +411,6 @@ def run_training_attempt(
     manifest_path: Path,
     source_config_path: Path,
     artifact_output_dir: Path,
-    attempt_id_factory: Callable[[], str] = generate_attempt_id,
-    process_runner: ProcessRunner = run_streaming_process,
-    publisher: Publisher = publish_training_result,
 ) -> object:
     artifact_output_dir = Path(artifact_output_dir).resolve(strict=True)
     if (artifact_output_dir / "training-result.json").exists():
@@ -402,7 +427,7 @@ def run_training_attempt(
         expected_model_revision=manifest.model.revision,
         require_finalized=True,
     )
-    attempt_id = attempt_id_factory()
+    attempt_id = generate_attempt_id()
     create_attempt_directory(artifact_output_dir, attempt_id)
     print(f"[training-supervisor] attempt_id={attempt_id}", flush=True)
     run_root = create_private_run_root()
@@ -417,8 +442,6 @@ def run_training_attempt(
         return supervise_prepared_attempt(
             manifest=manifest,
             preflight=preflight,
-            process_runner=process_runner,
-            publisher=publisher,
         )
     finally:
         if os.path.lexists(run_root):
@@ -440,6 +463,7 @@ def recover_publish(
         attempt_id=attempt_id,
         expected_step=manifest.rl_config.max_steps,
         expected_rank=16,
+        recovery=True,
     )
 
 

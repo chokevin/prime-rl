@@ -156,6 +156,7 @@ Derived from `configs/basic/hendrycks-sanity/rl.toml` per the W2 selection memo:
 | `[trainer.model.lora].rank` | 16 | W2's LoRA choice |
 | `[inference].seed` | `0` | fixed resolved inference seed; the effective-config preflight rejects drift |
 | `[trainer.ckpt.weights].save_adapter_separately` | `true` | so `tau/eval-post.yaml` can load just the adapter |
+| `[orchestrator.ckpt]` | enabled, no resume/skip fields | the real current `RLConfig` requires trainer and orchestrator checkpoint state to be enabled together |
 | `[file_monitor]` | enabled | writes the documented fixed `metrics.jsonl` artifact |
 | `[orchestrator.train.source.env.taskset]` | `math-env-v1`, `PrimeIntellect/Hendrycks-Math`, `default`, `train` | the manifest binds commit `3ed63f49541bdca4382fba28146aadf20d95cb38` and every dataset file; training rewrites only `dataset_name` to its verified job-private immutable copy |
 | `[orchestrator.train.source.env.taskset.task].judge` | `"None"` | disables `math-env-v1`'s LLM reference-judge fallback so training reward is purely deterministic (`"None"` → Python `None`, per `deps/pydantic-config/src/pydantic_config/cli.py`'s TOML-null convention) |
@@ -200,7 +201,9 @@ step override. The handoff never enumerates a storage directory.
   `attempts/<attempt-id>/completion.json` only after a zero exit and a verified fixed
   `STABLE` checkpoint. Publication re-parses the durable resolved TOML through the full
   canonical config validator, recomputes its identity, verifies all attempt evidence,
-  and writes fixed `training-result.json` last.
+  and writes fixed `training-result.json` last. Completion, publication, and result JSON
+  are fsynced in attempt-owned staging before atomic no-replace installation; normal code
+  never streams bytes into their final names.
 
 ### Proof ladder (in order)
 
@@ -282,8 +285,19 @@ uv run --no-sync python -m tau.eval_tools.cli recover-publish \
 Run that command only in the same pinned image/overlay with `blob-training` mounted.
 It derives exact paths from the supplied ID, strict-verifies the existing preflight,
 canonical resolved TOML, real-process attestation, STABLE marker, and adapter hashes,
-then completes atomic publication without launching RL. A mismatched/reused ID fails,
-and an existing fixed `training-result.json` prevents a normal training rerun.
+then removes only that attempt's stale staging and completes atomic publication without
+launching RL. This includes the adapter-installed/publication-not-yet-installed
+interruption point. A malformed final publication fails rather than being replaced. A
+different attempt can reuse an exactly matching installed adapter only through this
+explicit recovery command; normal training fails. A mismatched/reused ID fails, and an
+existing fixed `training-result.json` prevents a normal training rerun.
+
+`tau run cancel` sends TERM to the shell entrypoint. During training the shell has the
+supervisor in `CHILD_PID`, forwards TERM/INT, waits, and propagates status 143/130. The
+supervisor owns a new RL process group, forwards the same signal to that entire group,
+waits/reaps it, and treats cancellation as failure even if the child reports zero. No
+completion attestation, publication, or result is written for a cancelled/nonzero run;
+the next normal submission receives a fresh attempt ID.
 
 Every fetch above names an explicit `--artifact <file>` rather than listing the output
 directory: W1's storage proof found directory listing on `blob-training` unreliable
@@ -413,13 +427,14 @@ output):
 - `bash -n` and `shellcheck` (zero warnings) on `tau/scripts/run-prime-rl.sh`.
 - stdlib JSON/TOML parsing of the image pin and training config, cross-referenced
   field-by-field against `packages/prime-rl-configs/src/prime_rl/configs/{rl,orchestrator,trainer}.py`.
-- `PYTHONPATH=. uv run --no-project --with pytest --with pydantic --with numpy pytest -q tau/eval_tools/tests`
-  — 92 tests covering content manifests,
+- `PYTHONPATH=.:src uv run --no-project` with editable `prime-rl-configs`,
+  `verifiers`, `math-env-v1`, and `math500-v1`, then
+  `pytest -q tau/eval_tools/tests` — 96 tests covering content manifests,
   path/symlink rejection, ordered train identity, immutable attempt/process evidence,
-  full resolved-config rebinding, fixed bootstrap, and retry/recovery-safe publication.
+  a non-mocked real-`RLConfig` TOML round trip, fixed bootstrap, cancellation, and
+  retry/recovery-safe atomic publication.
 - `ruff check` / `ruff format --check` clean on every new Python file under `tau/`.
-- `uv run --no-sync python -m py_compile` on the `live/` scripts (syntax only — they import
-  `verifiers`/`datasets`/`openai`/`huggingface_hub`, unavailable here).
+- `uv run --no-project python -m py_compile` on the `live/` scripts.
 - `uv lock --check`, `git diff --check`, and secret/dependency/submodule/dtype scans.
 
 ## What is *not* proven yet (explicitly out of this session's scope)

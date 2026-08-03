@@ -6,8 +6,8 @@
 # the full rationale (model/renderer/taskset/LoRA compatibility).
 #
 # Bounded step count: this value is a placeholder until throughput is measured on the
-# real H200 pod (see tau/README.md's proof ladder). Override per-run with
-# `--max-steps N` (the Tau wrapper also honors `$PRIME_RL_MAX_STEPS`).
+# real H200 pod (see tau/README.md's proof ladder). Finalization binds this exact value;
+# update the source config and freeze-manifest setting together before creating evidence.
 max_steps = 50
 
 [deployment]
@@ -35,6 +35,8 @@ save_adapter_separately = true
 batch_size = 128
 group_size = 8
 seq_len = 8192
+
+[orchestrator.ckpt]
 
 [orchestrator.model.lora]
 name = "r16-math"

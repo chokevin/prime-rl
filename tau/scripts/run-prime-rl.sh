@@ -108,7 +108,22 @@ cleanup() {
     *) log "refusing to remove unsafe private run root ${RUN_ROOT}" ;;
     esac
 }
-trap cleanup EXIT INT TERM
+
+forward_signal_and_exit() {
+    local signal_name="$1" exit_status="$2"
+    trap - INT TERM
+    if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+        log "forwarding ${signal_name} to child process (pid ${CHILD_PID})"
+        kill "-${signal_name}" "$CHILD_PID" 2>/dev/null || true
+        wait "$CHILD_PID" 2>/dev/null || true
+    fi
+    CHILD_PID=""
+    exit "$exit_status"
+}
+
+trap cleanup EXIT
+trap 'forward_signal_and_exit INT 130' INT
+trap 'forward_signal_and_exit TERM 143' TERM
 
 # --- Step 1: immutable source overlay ------------------------------------------------
 # Fetch the exact pinned commit into a scratch checkout and verify it landed precisely
@@ -395,7 +410,18 @@ train)
     uv run --no-sync python -m tau.eval_tools.live.training_supervisor_live run \
         --manifest "$frozen_manifest" \
         --config "$config_path" \
-        --output-dir "$TAU_OUTPUT_DIR"
+        --output-dir "$TAU_OUTPUT_DIR" &
+    CHILD_PID=$!
+    if wait "$CHILD_PID"; then
+        supervisor_status=0
+    else
+        supervisor_status=$?
+    fi
+    CHILD_PID=""
+    if [ "$supervisor_status" -ne 0 ]; then
+        log "training supervisor failed with status ${supervisor_status}"
+        exit "$supervisor_status"
+    fi
     ;;
 
 *)

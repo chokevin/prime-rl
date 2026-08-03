@@ -29,6 +29,8 @@ ADAPTER_CONFIG = "adapter_config.json"
 ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors",)
 ATTEMPT_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{16}$")
 SOURCE_CONFIG_REL = "configs/tau/math-7b-h200/train.toml"
+LINUX_RENAME_NOREPLACE = 1
+DARWIN_RENAME_EXCL = 4
 
 
 @dataclass(frozen=True)
@@ -37,7 +39,9 @@ class AttemptPaths:
     preflight: Path
     resolved_config: Path
     completion: Path
+    completion_staging: Path
     publication: Path
+    publication_staging: Path
     run_output: Path
 
 
@@ -58,7 +62,9 @@ def attempt_paths(output_dir: Path, attempt_id: str, *, require_existing: bool) 
         preflight=attempt_dir / "preflight.json",
         resolved_config=attempt_dir / "resolved-train.toml",
         completion=attempt_dir / "completion.json",
+        completion_staging=attempt_dir / ".completion.json.stage",
         publication=attempt_dir / "publication.json",
+        publication_staging=attempt_dir / ".publication.stage",
         run_output=attempt_dir / "run-output",
     )
 
@@ -544,9 +550,23 @@ def write_training_preflight(
 def _remove_owned_staging(path: Path, attempt_id: str) -> None:
     if not os.path.lexists(path):
         return
-    if path.is_symlink() or path.name != f".training-publication-{attempt_id}.stage":
+    if path.is_symlink() or path.name != ".publication.stage" or path.parent.name != attempt_id:
         raise ValueError(f"refusing to remove unowned publication staging path: {path}")
-    shutil.rmtree(path)
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.is_file():
+        path.unlink()
+    else:
+        raise ValueError(f"refusing to remove non-file publication staging path: {path}")
+    fsync_directory(path.parent)
+
+
+def _remove_owned_json_staging(path: Path, *, expected_name: str) -> None:
+    if not os.path.lexists(path):
+        return
+    if path.name != expected_name or path.is_symlink() or not path.is_file():
+        raise ValueError(f"refusing to remove unsafe JSON staging path: {path}")
+    path.unlink()
     fsync_directory(path.parent)
 
 
@@ -555,23 +575,52 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
         raise FileExistsError(destination)
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        os.rename(source, destination)
+    if renameat2 is not None:
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            -100,
+            os.fsencode(source),
+            -100,
+            os.fsencode(destination),
+            LINUX_RENAME_NOREPLACE,
+        )
+    else:
+        renamex_np = getattr(libc, "renamex_np", None)
+        if renamex_np is not None:
+            renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+            renamex_np.restype = ctypes.c_int
+            result = renamex_np(os.fsencode(source), os.fsencode(destination), DARWIN_RENAME_EXCL)
+        elif source.is_file():
+            os.link(source, destination, follow_symlinks=False)
+            source.unlink()
+            return
+        else:
+            raise OSError(errno.ENOTSUP, "atomic no-replace directory rename is unavailable", destination)
+    if result == 0:
         return
-    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-    renameat2.restype = ctypes.c_int
-    result = renameat2(
-        -100,
-        os.fsencode(source),
-        -100,
-        os.fsencode(destination),
-        1,
-    )
-    if result != 0:
-        error = ctypes.get_errno()
-        if error == errno.EEXIST:
-            raise FileExistsError(destination)
-        raise OSError(error, os.strerror(error), destination)
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(destination)
+    raise OSError(error, os.strerror(error), destination)
+
+
+def _write_json_staged_noreplace(*, final_path: Path, staging_path: Path, payload: dict) -> None:
+    final_path = Path(final_path)
+    staging_path = Path(staging_path)
+    if final_path.parent != staging_path.parent:
+        if final_path.parent.stat().st_dev != staging_path.parent.stat().st_dev:
+            raise RuntimeError("JSON staging and destination must be on the same filesystem")
+    if os.path.lexists(final_path):
+        raise FileExistsError(final_path)
+    if os.path.lexists(staging_path):
+        if staging_path.is_symlink() or not staging_path.is_file():
+            raise ValueError(f"refusing to clean unsafe JSON staging path: {staging_path}")
+        staging_path.unlink()
+        fsync_directory(staging_path.parent)
+    write_json_exclusive(staging_path, payload)
+    _rename_noreplace(staging_path, final_path)
+    fsync_directory(final_path.parent)
 
 
 def _load_attempt_evidence(
@@ -686,8 +735,15 @@ def publish_training_result(
     attempt_id: str,
     expected_step: int,
     expected_rank: int,
+    recovery: bool = False,
 ) -> TrainingResult:
     output_dir = Path(output_dir).resolve(strict=True)
+    candidate_paths = attempt_paths(output_dir, attempt_id, require_existing=True)
+    if candidate_paths.completion.exists():
+        _remove_owned_json_staging(
+            candidate_paths.completion_staging,
+            expected_name=".completion.json.stage",
+        )
     (
         paths,
         preflight,
@@ -705,7 +761,7 @@ def publish_training_result(
     )
     result_path = output_dir / "training-result.json"
     final_adapter = output_dir / "final-adapter"
-    staging = output_dir / f".training-publication-{attempt_id}.stage"
+    staging = paths.publication_staging
     if os.path.lexists(result_path):
         result = TrainingResult.load(result_path)
         if result.attempt_id != attempt_id:
@@ -720,6 +776,10 @@ def publish_training_result(
         )
         _remove_owned_staging(staging, attempt_id)
         return result
+    existing_publication = None
+    publication_sha256 = None
+    if os.path.lexists(paths.publication):
+        existing_publication, publication_sha256 = TrainingPublicationEvidence.load(paths.publication)
     _remove_owned_staging(staging, attempt_id)
     step, source_adapter, source_digest = select_final_adapter(
         paths.run_output / "weights",
@@ -732,10 +792,16 @@ def publish_training_result(
     if source_manifest != attestation.source_adapter_files or source_manifest.aggregate_sha256 != source_digest:
         raise RuntimeError("source adapter changed after successful process attestation")
     if os.path.lexists(final_adapter):
+        if not recovery:
+            raise FileExistsError(
+                "final adapter already exists without a completed result; use explicit verified publication recovery"
+            )
         published_digest = validate_adapter_directory(final_adapter, expected_rank=expected_rank)
         if published_digest != source_digest:
             raise ValueError("incomplete final adapter does not match the fixed stable source checkpoint")
     else:
+        if existing_publication is not None:
+            raise ValueError("publication evidence exists but its final adapter is missing")
         staging.mkdir()
         if staging.stat().st_dev != output_dir.stat().st_dev:
             raise RuntimeError("publication staging and destination must be on the same filesystem")
@@ -764,14 +830,22 @@ def publish_training_result(
         final_adapter_path=str(final_adapter),
         final_adapter_files=published_manifest,
     )
-    if os.path.lexists(paths.publication):
-        existing_publication, publication_sha256 = TrainingPublicationEvidence.load(paths.publication)
+    if existing_publication is not None:
         if existing_publication != publication.model_copy(update={"created_at": existing_publication.created_at}):
             raise ValueError("existing attempt publication evidence does not match verified artifacts")
         publication = existing_publication
     else:
-        write_json_exclusive(paths.publication, publication.model_dump())
+        if not os.path.lexists(staging):
+            staging.mkdir()
+            fsync_directory(staging.parent)
+        _write_json_staged_noreplace(
+            final_path=paths.publication,
+            staging_path=staging / paths.publication.name,
+            payload=publication.model_dump(),
+        )
         _, publication_sha256 = load_json_with_sha256(paths.publication)
+    if publication_sha256 is None:
+        raise RuntimeError("publication evidence digest was not established")
     result = TrainingResult(
         attempt_id=attempt_id,
         created_at=datetime.now(timezone.utc).isoformat(),
@@ -797,9 +871,11 @@ def publish_training_result(
     if not os.path.lexists(staging):
         staging.mkdir()
     staged_result = staging / result_path.name
-    write_json_exclusive(staged_result, result.model_dump())
-    _rename_noreplace(staged_result, result_path)
-    fsync_directory(output_dir)
+    _write_json_staged_noreplace(
+        final_path=result_path,
+        staging_path=staged_result,
+        payload=result.model_dump(),
+    )
     staging.rmdir()
     fsync_directory(output_dir)
     return result

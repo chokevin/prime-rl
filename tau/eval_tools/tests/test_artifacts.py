@@ -1,5 +1,7 @@
 import hashlib
+import inspect
 import json
+import signal
 import stat
 import tomllib
 from datetime import datetime, timezone
@@ -10,6 +12,7 @@ import pytest
 from tau.eval_tools.artifacts import (
     TrainingCompletionAttestation,
     TrainingResult,
+    _write_json_staged_noreplace,
     attempt_paths,
     materialize_adapter_for_eval,
     publish_training_result,
@@ -19,10 +22,10 @@ from tau.eval_tools.artifacts import (
     write_training_preflight,
 )
 from tau.eval_tools.hashing import hash_text
-from tau.eval_tools.json_io import DuplicateKeyError, load_json_with_sha256, write_json_exclusive
+from tau.eval_tools.json_io import DuplicateKeyError, load_json_with_sha256
 from tau.eval_tools.live.training_supervisor_live import (
-    RLProcessResult,
     create_attempt_directory,
+    run_training_attempt,
     supervise_prepared_attempt,
 )
 from tau.eval_tools.live.validate_training_data_live import (
@@ -31,6 +34,8 @@ from tau.eval_tools.live.validate_training_data_live import (
     _bind_run_specific_config,
     _read_regular_file,
     _replace_runtime_paths,
+    resolve_effective_rl_config,
+    validate_resolved_rl_config,
     validate_source_toml_contract,
 )
 from tau.eval_tools.manifest import (
@@ -229,7 +234,11 @@ def _evidence(
             source_adapter_path=str(source_adapter),
             source_adapter_files=build_file_manifest(source_adapter),
         )
-        write_json_exclusive(paths.completion, completion.model_dump())
+        _write_json_staged_noreplace(
+            final_path=paths.completion,
+            staging_path=paths.completion_staging,
+            payload=completion.model_dump(),
+        )
     return preflight, paths
 
 
@@ -296,7 +305,7 @@ def test_publish_training_result_is_idempotent_after_completion(tmp_path, exact_
     _evidence(tmp_path, manifest, exact_config_validator(manifest))
     kwargs = _publication_kwargs(tmp_path, manifest)
     publish_training_result(**kwargs)
-    staging = tmp_path / f".training-publication-{ATTEMPT_1}.stage"
+    staging = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True).publication_staging
     staging.mkdir()
     (staging / "stale").write_text("interrupted after completion")
     retried = publish_training_result(**kwargs)
@@ -304,20 +313,52 @@ def test_publish_training_result_is_idempotent_after_completion(tmp_path, exact_
     assert not staging.exists()
 
 
-def test_publish_training_result_recovers_interrupted_final_install(tmp_path, exact_config_validator):
+def test_publish_training_result_recovers_adapter_install_and_partial_json_stage(tmp_path, exact_config_validator):
     manifest = _manifest()
     _evidence(tmp_path, manifest, exact_config_validator(manifest))
     kwargs = _publication_kwargs(tmp_path, manifest)
     publish_training_result(**kwargs)
     (tmp_path / "training-result.json").unlink()
-    staging = tmp_path / f".training-publication-{ATTEMPT_1}.stage"
+    paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
+    paths.publication.unlink()
+    staging = paths.publication_staging
     staging.mkdir()
-    (staging / "partial").write_text("interrupted")
+    (staging / "publication.json").write_text('{"status":"pub')
+    paths.completion_staging.write_text('{"status":"succ')
 
-    recovered = publish_training_result(**kwargs)
+    recovered = publish_training_result(**kwargs, recovery=True)
 
     assert recovered == TrainingResult.load(tmp_path / "training-result.json")
     assert not staging.exists()
+    assert not paths.completion_staging.exists()
+
+
+def test_publication_recovery_rejects_malformed_final_and_normal_cross_attempt_reuse(tmp_path, exact_config_validator):
+    manifest = _manifest()
+    exact_config = exact_config_validator(manifest)
+    _evidence(tmp_path, manifest, exact_config, attempt_id=ATTEMPT_1)
+    publish_training_result(**_publication_kwargs(tmp_path, manifest, ATTEMPT_1))
+    (tmp_path / "training-result.json").unlink()
+    attempt_1_paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
+    attempt_1_paths.publication.unlink()
+    _evidence(tmp_path, manifest, exact_config, attempt_id=ATTEMPT_2)
+
+    with pytest.raises(FileExistsError, match="explicit verified publication recovery"):
+        publish_training_result(**_publication_kwargs(tmp_path, manifest, ATTEMPT_2))
+    recovered = publish_training_result(
+        **_publication_kwargs(tmp_path, manifest, ATTEMPT_2),
+        recovery=True,
+    )
+    assert recovered.attempt_id == ATTEMPT_2
+
+    (tmp_path / "training-result.json").unlink()
+    attempt_2_paths = attempt_paths(tmp_path, ATTEMPT_2, require_existing=True)
+    attempt_2_paths.publication.write_text('{"status":"pub')
+    with pytest.raises(json.JSONDecodeError):
+        publish_training_result(
+            **_publication_kwargs(tmp_path, manifest, ATTEMPT_2),
+            recovery=True,
+        )
 
 
 def test_private_adapter_materialization_is_readonly_and_content_bound(tmp_path, exact_config_validator):
@@ -358,18 +399,44 @@ def test_publication_rejects_config_and_attestation_mismatch(tmp_path, exact_con
         publish_training_result(**kwargs)
 
 
-def _process_result(preflight, return_code: int) -> RLProcessResult:
-    return RLProcessResult(
-        argv=("uv", "run", "--no-sync", "rl", "@", preflight.private_config_path),
-        executable="/usr/bin/uv",
-        pid=456,
-        started_at="2026-01-01T00:00:00+00:00",
-        ended_at="2026-01-01T00:01:00+00:00",
-        return_code=return_code,
+def _install_fake_popen(monkeypatch, tmp_path, *, return_code: int, cancel_signal: int | None = None):
+    executable = tmp_path / "bin" / "uv"
+    executable.parent.mkdir(exist_ok=True)
+    executable.touch()
+    captured = {"signals": []}
+
+    class FakeProcess:
+        pid = 456
+
+        def __init__(self, argv, *, start_new_session):
+            assert start_new_session is True
+            captured["argv"] = tuple(argv)
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self):
+            if cancel_signal is not None:
+                signal.raise_signal(cancel_signal)
+            self.returncode = return_code
+            return return_code
+
+    monkeypatch.setattr(
+        "tau.eval_tools.live.training_supervisor_live.shutil.which",
+        lambda command: str(executable) if command == "uv" else None,
     )
+    monkeypatch.setattr("tau.eval_tools.live.training_supervisor_live.subprocess.Popen", FakeProcess)
+    monkeypatch.setattr(
+        "tau.eval_tools.live.training_supervisor_live._signal_process_group",
+        lambda pid, signum: captured["signals"].append((pid, signum)),
+    )
+    return captured
 
 
-def test_supervisor_nonzero_writes_no_attestation_and_fresh_attempt_succeeds(tmp_path, exact_config_validator):
+def test_supervisor_nonzero_writes_no_attestation_and_fresh_attempt_succeeds(
+    tmp_path, exact_config_validator, monkeypatch
+):
     manifest = _manifest()
     exact_config = exact_config_validator(manifest)
     failed_preflight, failed_paths = _evidence(
@@ -386,26 +453,20 @@ def test_supervisor_nonzero_writes_no_attestation_and_fresh_attempt_succeeds(tmp
         attempt_id=ATTEMPT_2,
         write_completion=False,
     )
+    _install_fake_popen(monkeypatch, tmp_path, return_code=7)
     with pytest.raises(RuntimeError, match="no completion attestation"):
-        supervise_prepared_attempt(
-            manifest=manifest,
-            preflight=failed_preflight,
-            process_runner=lambda _argv: _process_result(failed_preflight, 7),
-        )
+        supervise_prepared_attempt(manifest=manifest, preflight=failed_preflight)
     assert not failed_paths.completion.exists()
     assert not (tmp_path / "training-result.json").exists()
 
-    result = supervise_prepared_attempt(
-        manifest=manifest,
-        preflight=successful_preflight,
-        process_runner=lambda _argv: _process_result(successful_preflight, 0),
-    )
+    _install_fake_popen(monkeypatch, tmp_path, return_code=0)
+    result = supervise_prepared_attempt(manifest=manifest, preflight=successful_preflight)
     assert result.attempt_id == ATTEMPT_2
     assert successful_paths.completion.is_file()
     assert not failed_paths.completion.exists()
 
 
-def test_supervisor_attestation_supports_explicit_publication_recovery(tmp_path, exact_config_validator):
+def test_supervisor_attestation_supports_explicit_publication_recovery(tmp_path, exact_config_validator, monkeypatch):
     manifest = _manifest()
     preflight, paths = _evidence(
         tmp_path,
@@ -417,21 +478,23 @@ def test_supervisor_attestation_supports_explicit_publication_recovery(tmp_path,
     def interrupt_publication(**_kwargs):
         raise RuntimeError("simulated interruption after attestation")
 
+    paths.completion_staging.write_text('{"status":"succ')
+    _install_fake_popen(monkeypatch, tmp_path, return_code=0)
+    monkeypatch.setattr(
+        "tau.eval_tools.live.training_supervisor_live.publish_training_result",
+        interrupt_publication,
+    )
     with pytest.raises(RuntimeError, match="simulated interruption"):
-        supervise_prepared_attempt(
-            manifest=manifest,
-            preflight=preflight,
-            process_runner=lambda _argv: _process_result(preflight, 0),
-            publisher=interrupt_publication,
-        )
+        supervise_prepared_attempt(manifest=manifest, preflight=preflight)
     assert paths.completion.is_file()
+    assert not paths.completion_staging.exists()
     assert not (tmp_path / "training-result.json").exists()
 
-    recovered = publish_training_result(**_publication_kwargs(tmp_path, manifest))
+    recovered = publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
     assert recovered.attempt_id == ATTEMPT_1
 
 
-def test_supervisor_rejects_private_config_drift_and_false_process_attestation(tmp_path, exact_config_validator):
+def test_supervisor_rejects_private_config_drift_and_owns_exact_process(tmp_path, exact_config_validator, monkeypatch):
     manifest = _manifest()
     preflight, paths = _evidence(
         tmp_path,
@@ -441,34 +504,55 @@ def test_supervisor_rejects_private_config_drift_and_false_process_attestation(t
     )
     private_config = Path(preflight.private_config_path)
     private_config.write_text("[model]\nname = 'altered'\n")
-    invoked = False
-
-    def runner(_argv):
-        nonlocal invoked
-        invoked = True
-        return _process_result(preflight, 0)
-
+    captured = _install_fake_popen(monkeypatch, tmp_path, return_code=0)
     with pytest.raises(ValueError, match="canonical experiment contract"):
-        supervise_prepared_attempt(manifest=manifest, preflight=preflight, process_runner=runner)
-    assert not invoked
+        supervise_prepared_attempt(manifest=manifest, preflight=preflight)
+    assert "argv" not in captured
     assert not paths.completion.exists()
 
     private_config.write_bytes(paths.resolved_config.read_bytes())
-    false_result = _process_result(preflight, 0)
-    false_result = RLProcessResult(
-        **{
-            **false_result.__dict__,
-            "argv": ("uv", "run", "--no-sync", "rl", "@", "/tmp/not-the-private-config"),
-        }
+    result = supervise_prepared_attempt(manifest=manifest, preflight=preflight)
+    assert result.attempt_id == ATTEMPT_1
+    assert captured["argv"] == ("uv", "run", "--no-sync", "rl", "@", preflight.private_config_path)
+    assert "process_runner" not in inspect.signature(supervise_prepared_attempt).parameters
+    assert "process_runner" not in inspect.signature(run_training_attempt).parameters
+
+
+def test_supervisor_cancellation_forwards_to_rl_process_group_without_attestation(
+    tmp_path, exact_config_validator, monkeypatch
+):
+    manifest = _manifest()
+    preflight, paths = _evidence(
+        tmp_path,
+        manifest,
+        exact_config_validator(manifest),
+        write_completion=False,
     )
-    with pytest.raises(ValueError, match="exact trusted RL command"):
-        supervise_prepared_attempt(
-            manifest=manifest,
-            preflight=preflight,
-            process_runner=lambda _argv: false_result,
-        )
+    captured = _install_fake_popen(
+        monkeypatch,
+        tmp_path,
+        return_code=-signal.SIGTERM,
+        cancel_signal=signal.SIGTERM,
+    )
+    with pytest.raises(InterruptedError, match="cancelled by signal"):
+        supervise_prepared_attempt(manifest=manifest, preflight=preflight)
+    assert captured["signals"] == [(456, signal.SIGTERM)]
     assert not paths.completion.exists()
+    assert not paths.publication.exists()
     assert not (tmp_path / "training-result.json").exists()
+
+
+def test_training_wrapper_backgrounds_waits_and_propagates_supervisor_status():
+    script = (Path(__file__).parents[2] / "scripts/run-prime-rl.sh").read_text()
+    launch = script.index("tau.eval_tools.live.training_supervisor_live run")
+    background = script.index('--output-dir "$TAU_OUTPUT_DIR" &', launch)
+    capture_pid = script.index("CHILD_PID=$!", background)
+    wait = script.index('if wait "$CHILD_PID"; then', capture_pid)
+    clear_pid = script.index('CHILD_PID=""', wait)
+    propagate = script.index('exit "$supervisor_status"', clear_pid)
+    assert launch < background < capture_pid < wait < clear_pid < propagate
+    assert "trap 'forward_signal_and_exit INT 130' INT" in script
+    assert "trap 'forward_signal_and_exit TERM 143' TERM" in script
 
 
 def test_attempt_id_reuse_and_cross_attempt_evidence_fail_closed(tmp_path, exact_config_validator):
@@ -519,16 +603,10 @@ def test_completed_result_prevents_supervisor_rerun_and_handoff_never_lists_atte
     manifest = _manifest()
     preflight, _ = _evidence(tmp_path, manifest, exact_config_validator(manifest))
     result = publish_training_result(**_publication_kwargs(tmp_path, manifest))
-    invoked = False
-
-    def runner(_argv):
-        nonlocal invoked
-        invoked = True
-        return _process_result(preflight, 0)
-
+    captured = _install_fake_popen(monkeypatch, tmp_path, return_code=0)
     with pytest.raises(FileExistsError, match="refusing to rerun"):
-        supervise_prepared_attempt(manifest=manifest, preflight=preflight, process_runner=runner)
-    assert not invoked
+        supervise_prepared_attempt(manifest=manifest, preflight=preflight)
+    assert "argv" not in captured
 
     monkeypatch.setattr(Path, "iterdir", lambda _path: (_ for _ in ()).throw(AssertionError("listed")))
     validate_adapter_handoff(
@@ -615,10 +693,10 @@ def test_runtime_config_identity_normalizes_all_attempt_private_paths_and_reject
             "output_dir": attempt_output,
             "metrics": f"{attempt_output}/metrics.jsonl",
         },
-        model_path=model,
-        dataset_path=dataset,
-        output_dir=attempt_output,
-        logical_output_dir="/data/train",
+        model_path=Path(model),
+        dataset_path=Path(dataset),
+        output_dir=Path(attempt_output),
+        logical_output_dir=Path("/data/train"),
     )
     assert normalized == {
         "model": PRIVATE_MODEL_SENTINEL,
@@ -636,6 +714,101 @@ def test_runtime_config_identity_normalizes_all_attempt_private_paths_and_reject
     link.symlink_to(target)
     with pytest.raises(ValueError, match="symlink component"):
         _read_regular_file(link)
+
+
+def test_real_resolved_config_round_trip_preflight_publication_and_post_handoff(tmp_path):
+    source_config = Path(__file__).parents[3] / "configs/tau/math-7b-h200/train.toml"
+    output_dir = tmp_path / "train"
+    output_dir.mkdir()
+    create_attempt_directory(output_dir, ATTEMPT_1)
+    paths = attempt_paths(output_dir, ATTEMPT_1, require_existing=True)
+    run_root = tmp_path / "private"
+    run_root.mkdir()
+    model_path = run_root / "model"
+    dataset_path = run_root / "training-dataset"
+    model_path.mkdir()
+    dataset_path.mkdir()
+    private_config_path = run_root / "resolved-train.toml"
+
+    _, resolved_bytes, identity = resolve_effective_rl_config(
+        source_config,
+        _manifest(),
+        source_config_rel="configs/tau/math-7b-h200/train.toml",
+        model_path=model_path,
+        dataset_path=dataset_path,
+        output_dir=paths.run_output,
+        logical_output_dir=Path(RL_CONFIG.output_dir),
+        max_steps=50,
+    )
+    manifest = _manifest().model_copy(update={"rl_config": identity})
+    private_config_path.write_bytes(resolved_bytes)
+    paths.resolved_config.write_bytes(resolved_bytes)
+
+    _, parsed_bytes, parsed_identity = validate_resolved_rl_config(
+        paths.resolved_config,
+        manifest,
+        source_config_rel="configs/tau/math-7b-h200/train.toml",
+        model_path=model_path,
+        dataset_path=dataset_path,
+        output_dir=paths.run_output,
+        logical_output_dir=Path(RL_CONFIG.output_dir),
+        max_steps=50,
+    )
+    assert parsed_bytes == resolved_bytes
+    assert parsed_identity == identity
+
+    preflight = write_training_preflight(
+        output_path=paths.preflight,
+        attempt_id=ATTEMPT_1,
+        manifest=manifest,
+        artifact_output_dir=output_dir,
+        attempt_output_dir=paths.run_output,
+        run_root=run_root,
+        model_path=model_path,
+        dataset_path=dataset_path,
+        private_config_path=private_config_path,
+        resolved_config_path=paths.resolved_config,
+    )
+    source_adapter = _adapter(paths.run_output, 50)
+    _, preflight_sha256 = load_json_with_sha256(paths.preflight)
+    stable = source_adapter.parent / "STABLE"
+    completion = TrainingCompletionAttestation(
+        attempt_id=ATTEMPT_1,
+        manifest_identity_hash=manifest.identity_hash(),
+        preflight_sha256=preflight_sha256,
+        resolved_config_sha256=hashlib.sha256(resolved_bytes).hexdigest(),
+        rl_pid=123,
+        started_at="2026-01-01T00:00:00+00:00",
+        ended_at="2026-01-01T00:01:00+00:00",
+        command_argv=["uv", "run", "--no-sync", "rl", "@", str(private_config_path)],
+        executable="/usr/bin/uv",
+        rl_config=identity,
+        run_root=str(run_root),
+        private_config_path=str(private_config_path),
+        resolved_config_path=str(paths.resolved_config),
+        artifact_output_dir=str(output_dir),
+        attempt_output_dir=str(paths.run_output),
+        source_step=50,
+        stable_marker_path=str(stable),
+        stable_marker_sha256=hashlib.sha256(stable.read_bytes()).hexdigest(),
+        source_adapter_path=str(source_adapter),
+        source_adapter_files=build_file_manifest(source_adapter),
+    )
+    _write_json_staged_noreplace(
+        final_path=paths.completion,
+        staging_path=paths.completion_staging,
+        payload=completion.model_dump(),
+    )
+    result = publish_training_result(**_publication_kwargs(output_dir, manifest))
+    assert preflight.rl_config == parsed_identity
+    validate_adapter_handoff(
+        result=result,
+        manifest=manifest,
+        training_output_dir=output_dir,
+        expected_adapter_path=output_dir / "final-adapter",
+        expected_step=50,
+        expected_rank=16,
+    )
 
 
 def test_source_equivalent_config_contract_rejects_minimal_and_task_config_drift(tmp_path):

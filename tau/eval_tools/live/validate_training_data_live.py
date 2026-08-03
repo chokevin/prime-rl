@@ -14,7 +14,7 @@ from tau.eval_tools.manifest import (
     TrainingRecord,
 )
 
-CANONICAL_SOURCE_TOML_SHA256 = "53c5d11b03f4981d98ff4c72290edfcb636ca4eb27bbde4785f3ba9fc1d0db6b"
+CANONICAL_SOURCE_TOML_SHA256 = "c22b5221f7e11abe5b4f38c5cbd09ab0c3336a648cc8ab04f7737c7478b699de"
 PRIVATE_MODEL_SENTINEL = "/__prime_rl_private__/model"
 PRIVATE_DATASET_SENTINEL = "/__prime_rl_private__/training-dataset"
 EXPECTED_LORA_TARGET_MODULES = [
@@ -272,10 +272,13 @@ def _validate_effective_rl_config(
         or trainer_ckpt.skip_scheduler
     ):
         raise ValueError("resume/restart and partial checkpoint-state execution are forbidden")
+    orchestrator_ckpt = config.orchestrator.ckpt
+    if orchestrator_ckpt is None or orchestrator_ckpt.resume_step is not None or orchestrator_ckpt.skip_progress:
+        raise ValueError("orchestrator checkpointing must be enabled without resume/skip bypasses")
     if (
         config.output_dir != output_dir
         or config.trainer.output_dir != output_dir
-        or config.orchestrator.output_dir != output_dir
+        or config.orchestrator.output_dir != output_dir / "run_default"
         or config.trainer.model.seq_len != 16384
         or config.orchestrator.seq_len != 8192
         or config.inference.model.max_model_len != 8192
@@ -350,6 +353,10 @@ def _replace_runtime_paths(
     output_dir: str,
     logical_output_dir: str,
 ):
+    model_path = os.path.normpath(os.fspath(model_path))
+    dataset_path = os.path.normpath(os.fspath(dataset_path))
+    output_dir = os.path.normpath(os.fspath(output_dir))
+    logical_output_dir = os.path.normpath(os.fspath(logical_output_dir))
     if isinstance(value, dict):
         return {
             key: _replace_runtime_paths(
@@ -399,20 +406,24 @@ def _resolved_config_identity(
 
     from prime_rl.utils.config import to_toml_dict
 
+    model_path = os.path.normpath(os.fspath(model_path))
+    dataset_path = os.path.normpath(os.fspath(dataset_path))
+    output_dir = os.path.normpath(os.fspath(output_dir))
+    logical_output_dir = os.path.normpath(os.fspath(logical_output_dir))
     resolved_dict = to_toml_dict(config)
     resolved_bytes = tomli_w.dumps(resolved_dict).encode("utf-8")
     canonical_dict = _replace_runtime_paths(
         resolved_dict,
         model_path=model_path,
         dataset_path=dataset_path,
-        output_dir=str(output_dir),
-        logical_output_dir=str(logical_output_dir),
+        output_dir=output_dir,
+        logical_output_dir=logical_output_dir,
     )
     canonical_bytes = tomli_w.dumps(canonical_dict).encode("utf-8")
     identity = RLConfigIdentity(
         source_config_rel=source_config_rel,
         source_toml_sha256=CANONICAL_SOURCE_TOML_SHA256,
-        output_dir=str(logical_output_dir),
+        output_dir=logical_output_dir,
         max_steps=max_steps,
         canonical_resolved_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
     )
