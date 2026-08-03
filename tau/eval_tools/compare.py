@@ -14,7 +14,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from tau.eval_tools.json_io import load_json_with_sha256, write_json_exclusive
-from tau.eval_tools.manifest import SHA256_RE, FrozenEvalManifest
+from tau.eval_tools.manifest import SHA256_RE, FrozenEvalManifest, check_headroom
 
 #: The goal harness's fixed acceptance thresholds (see the parent plan's "Measured hill
 #: climb" done-check and decision ledger's "Metric default"). Not configurable via CLI
@@ -186,6 +186,16 @@ def compare_runs(
     ordered_ids = sorted(manifest_ids, key=int)
     baseline_values = np.array([baseline.rewards[i] for i in ordered_ids], dtype=float)
     post_values = np.array([post.rewards[i] for i in ordered_ids], dtype=float)
+    baseline_mean = float(baseline_values.mean())
+    if baseline_mean != manifest.baseline_mean:
+        raise IdentityMismatchError(
+            f"baseline artifact mean {baseline_mean} does not exactly match finalized "
+            f"manifest baseline_mean {manifest.baseline_mean}"
+        )
+    if not check_headroom(baseline_mean):
+        raise IdentityMismatchError(
+            f"bound baseline artifact mean {baseline_mean} is outside the accepted [0.10, 0.80] headroom band"
+        )
     deltas = post_values - baseline_values
 
     delta_mean = float(deltas.mean())
@@ -194,7 +204,7 @@ def compare_runs(
 
     return ComparisonResult(
         n=len(ordered_ids),
-        baseline_mean=float(baseline_values.mean()),
+        baseline_mean=baseline_mean,
         post_mean=float(post_values.mean()),
         delta=delta_mean,
         ci_lower=ci_lower,

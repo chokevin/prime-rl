@@ -44,12 +44,15 @@ from pathlib import Path
 
 from tau.eval_tools.compare import RewardRecord
 from tau.eval_tools.hashing import hash_text
+from tau.eval_tools.live.private_materialization_live import (
+    materialize_model_for_freeze,
+    materialize_training_dataset_for_freeze,
+)
 from tau.eval_tools.live.validate_training_data_live import resolve_effective_rl_config
 from tau.eval_tools.manifest import (
     EXPECTED_TRAIN_DATASET,
     EXPECTED_TRAIN_DATASET_REVISION,
     EXPECTED_TRAIN_DATASET_SUBSET,
-    GIT_SHA_RE,
     DecodingConfig,
     ExampleRecord,
     FrozenEvalManifest,
@@ -60,40 +63,15 @@ from tau.eval_tools.manifest import (
     build_manifest,
     check_disjoint,
     check_headroom,
-    materialize_regular_snapshot,
     validate_manifest_contract,
 )
 
 GRADER = "verifiers.v1.scoring.verify_boxed_math_answer"
 
 
-def _resolve_model_snapshot(model_name: str, model_revision: str, cache_dir: str) -> ModelSnapshot:
-    from huggingface_hub import model_info, snapshot_download
-
-    if not GIT_SHA_RE.fullmatch(model_revision):
-        raise ValueError("model revision must be an exact 40-character lowercase commit SHA")
-    info = model_info(model_name, revision=model_revision)
-    if info.sha != model_revision:
-        raise RuntimeError(f"huggingface_hub resolved {model_name}@{model_revision} to {info.sha!r}")
-    cache_root = Path(cache_dir).resolve()
-    downloaded_path = Path(
-        snapshot_download(
-            repo_id=model_name,
-            revision=model_revision,
-            cache_dir=cache_dir,
-        )
-    ).resolve()
-    if downloaded_path.name != model_revision or not (downloaded_path / "config.json").is_file():
-        raise RuntimeError(f"downloaded model path {downloaded_path} is not the exact {model_revision} snapshot")
-    local_path = cache_root / "prime-rl-trusted-models" / model_name.replace("/", "--") / model_revision
-    file_manifest = materialize_regular_snapshot(downloaded_path, cache_root, local_path)
-    return ModelSnapshot(
-        name=model_name,
-        revision=model_revision,
-        cache_root=str(cache_root),
-        local_path=str(local_path),
-        file_manifest=file_manifest,
-    )
+def _resolve_model_snapshot(model_name: str, model_revision: str, run_root: str) -> ModelSnapshot:
+    model, _ = materialize_model_for_freeze(model_name, model_revision, Path(run_root))
+    return model
 
 
 def _load_eval_examples(n: int, taskset_revision: str) -> tuple[TasksetRef, list[ExampleRecord]]:
@@ -112,39 +90,8 @@ def _load_eval_examples(n: int, taskset_revision: str) -> tuple[TasksetRef, list
         dataset_subset=None,
         dataset_split=DATASET_SPLIT,
         dataset_revision=DATASET_REVISION,
-        dataset_local_path=None,
     )
     return taskset_ref, examples
-
-
-def _materialize_training_snapshot(
-    dataset_name: str,
-    dataset_revision: str,
-    cache_dir: str,
-) -> Path:
-    from huggingface_hub import dataset_info, snapshot_download
-
-    if not GIT_SHA_RE.fullmatch(dataset_revision):
-        raise ValueError("training dataset revision must be an exact 40-character lowercase commit SHA")
-    info = dataset_info(dataset_name, revision=dataset_revision)
-    if info.sha != dataset_revision:
-        raise RuntimeError(f"huggingface_hub resolved {dataset_name}@{dataset_revision} to {info.sha!r}")
-    cache_root = Path(cache_dir).resolve()
-    downloaded_path = Path(
-        snapshot_download(
-            repo_id=dataset_name,
-            repo_type="dataset",
-            revision=dataset_revision,
-            cache_dir=cache_dir,
-        )
-    ).resolve()
-    if downloaded_path.name != dataset_revision:
-        raise RuntimeError(
-            f"downloaded training dataset path {downloaded_path} is not the exact {dataset_revision} snapshot"
-        )
-    local_path = cache_root / "prime-rl-trusted-datasets" / dataset_name.replace("/", "--") / dataset_revision
-    materialize_regular_snapshot(downloaded_path, cache_root, local_path)
-    return local_path
 
 
 def _load_training_records(
@@ -153,11 +100,16 @@ def _load_training_records(
     dataset_subset: str,
     dataset_split: str,
     taskset_revision: str,
-    cache_dir: str,
+    run_root: str,
 ) -> tuple[TasksetRef, TrainingDataIdentity]:
     from math_env_v1.taskset import MathConfig, MathTaskset
 
-    local_path = _materialize_training_snapshot(dataset_name, dataset_revision, cache_dir)
+    local_path, file_manifest = materialize_training_dataset_for_freeze(
+        dataset_name,
+        dataset_revision,
+        Path(run_root),
+    )
+    Path(run_root).chmod(0o555)
     config = MathConfig(
         dataset_name=str(local_path),
         dataset_subset=dataset_subset,
@@ -179,13 +131,12 @@ def _load_training_records(
         dataset_subset=dataset_subset,
         dataset_split=dataset_split,
         dataset_revision=dataset_revision,
-        dataset_local_path=str(local_path),
     )
-    return taskset_ref, TrainingDataIdentity.from_records(records)
+    return taskset_ref, TrainingDataIdentity.from_records(records, file_manifest=file_manifest)
 
 
 def _cmd_draft(args: argparse.Namespace) -> int:
-    model = _resolve_model_snapshot(args.model_name, args.model_revision, args.model_cache_dir)
+    model = _resolve_model_snapshot(args.model_name, args.model_revision, args.run_root)
     eval_taskset, examples = _load_eval_examples(args.n, args.tasksets_revision)
     train_taskset, training_data = _load_training_records(
         args.train_dataset_name,
@@ -193,7 +144,7 @@ def _cmd_draft(args: argparse.Namespace) -> int:
         args.train_dataset_subset,
         args.train_dataset_split,
         args.tasksets_revision,
-        args.model_cache_dir,
+        args.run_root,
     )
 
     eval_hashes = {e.prompt_hash for e in examples}
@@ -293,7 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
     draft = subparsers.add_parser("draft", help="Build the draft manifest and prove train/eval disjointness.")
     draft.add_argument("--model-name", required=True)
     draft.add_argument("--model-revision", required=True)
-    draft.add_argument("--model-cache-dir", required=True)
+    draft.add_argument("--run-root", required=True)
     draft.add_argument("--source-revision", required=True)
     draft.add_argument("--verifiers-revision", required=True)
     draft.add_argument("--tasksets-revision", required=True)

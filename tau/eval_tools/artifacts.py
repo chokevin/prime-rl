@@ -18,7 +18,9 @@ from tau.eval_tools.manifest import (
     FrozenEvalManifest,
     RLConfigIdentity,
     build_file_manifest,
+    make_tree_immutable,
     validate_file_manifest,
+    validate_tree_immutable,
 )
 
 ADAPTER_CONFIG = "adapter_config.json"
@@ -39,20 +41,40 @@ class SmokeResult(BaseModel):
 class TrainingPreflight(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     status: Literal["verified"] = "verified"
     created_at: str
+    source_revision: str
     manifest_identity_hash: str
+    model_name: str
+    model_revision: str
     model_files_sha256: str
     training_data_digest: str
     rl_config: RLConfigIdentity
+    run_root: str
+    model_path: str
+    dataset_path: str
+    resolved_config_path: str
+    resolved_config_sha256: str
 
-    @field_validator("manifest_identity_hash", "model_files_sha256", "training_data_digest")
+    @field_validator(
+        "manifest_identity_hash",
+        "model_files_sha256",
+        "training_data_digest",
+        "resolved_config_sha256",
+    )
     @classmethod
     def validate_sha256(cls, digest: str) -> str:
         if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
             raise ValueError("preflight digests must be lowercase SHA-256 hex")
         return digest
+
+    @field_validator("run_root", "model_path", "dataset_path", "resolved_config_path")
+    @classmethod
+    def validate_absolute_path(cls, path: str) -> str:
+        if not Path(path).is_absolute():
+            raise ValueError("preflight materialization paths must be absolute")
+        return path
 
     @classmethod
     def load(cls, path: Path) -> "TrainingPreflight":
@@ -60,20 +82,61 @@ class TrainingPreflight(BaseModel):
         return cls.model_validate(payload)
 
 
+class TrainingCompletionAttestation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    status: Literal["success"] = "success"
+    manifest_identity_hash: str
+    preflight_sha256: str
+    resolved_config_sha256: str
+    rl_pid: int = Field(gt=1)
+    started_at: str
+    ended_at: str
+    exit_code: Literal[0] = 0
+    run_root: str
+    resolved_config_path: str
+    output_dir: str
+    source_step: int = Field(gt=0)
+    source_adapter_path: str
+
+    @field_validator("manifest_identity_hash", "preflight_sha256", "resolved_config_sha256")
+    @classmethod
+    def validate_sha256(cls, digest: str) -> str:
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError("completion attestation digests must be lowercase SHA-256 hex")
+        return digest
+
+    @field_validator("run_root", "resolved_config_path", "output_dir", "source_adapter_path")
+    @classmethod
+    def validate_absolute_path(cls, path: str) -> str:
+        if not Path(path).is_absolute():
+            raise ValueError("completion attestation paths must be absolute")
+        return path
+
+    @classmethod
+    def load(cls, path: Path) -> tuple["TrainingCompletionAttestation", str]:
+        payload, digest = load_json_with_sha256(path)
+        return cls.model_validate(payload), digest
+
+
 class TrainingResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     status: Literal["success"] = "success"
     created_at: str
     source_revision: str
     manifest_identity_hash: str
     model_name: str
     model_revision: str
-    model_local_path: str
     model_files_sha256: str
     training_data_digest: str
     rl_config: RLConfigIdentity
+    preflight_sha256: str
+    completion_attestation_sha256: str
+    resolved_config_sha256: str
+    resolved_config_path: str
     source_step: int = Field(gt=0)
     source_adapter_path: str
     final_adapter_path: str
@@ -81,7 +144,15 @@ class TrainingResult(BaseModel):
     adapter_files: FileManifest
     lora_rank: int = Field(gt=0)
 
-    @field_validator("adapter_sha256", "model_files_sha256", "training_data_digest", "manifest_identity_hash")
+    @field_validator(
+        "adapter_sha256",
+        "model_files_sha256",
+        "training_data_digest",
+        "manifest_identity_hash",
+        "preflight_sha256",
+        "completion_attestation_sha256",
+        "resolved_config_sha256",
+    )
     @classmethod
     def validate_sha256(cls, digest: str) -> str:
         if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
@@ -95,7 +166,7 @@ class TrainingResult(BaseModel):
             raise ValueError("source and model revisions must be lowercase 40-character commit SHAs")
         return revision
 
-    @field_validator("model_local_path", "source_adapter_path", "final_adapter_path")
+    @field_validator("source_adapter_path", "final_adapter_path", "resolved_config_path")
     @classmethod
     def validate_absolute_path(cls, path: str) -> str:
         if not Path(path).is_absolute():
@@ -186,6 +257,29 @@ def copy_adapter_exclusive(source: Path, destination: Path) -> None:
     fsync_directory(destination)
 
 
+def materialize_adapter_for_eval(
+    *,
+    result: TrainingResult,
+    durable_adapter_path: Path,
+    run_root: Path,
+) -> Path:
+    run_root = Path(run_root).resolve(strict=True)
+    durable_adapter_path = Path(durable_adapter_path)
+    destination = run_root / "adapter"
+    copy_adapter_exclusive(durable_adapter_path, destination)
+    validate_file_manifest(destination, result.adapter_files)
+    make_tree_immutable(destination)
+    validate_tree_immutable(destination, result.adapter_files)
+    marker = run_root / "adapter-materialization-complete"
+    with marker.open("xb") as output:
+        output.write((result.adapter_sha256 + "\n").encode())
+        output.flush()
+        os.fsync(output.fileno())
+    marker.chmod(0o444)
+    fsync_directory(run_root)
+    return destination
+
+
 def select_final_adapter(
     weights_dir: Path,
     *,
@@ -232,12 +326,25 @@ def write_training_preflight(
     output_path: Path,
     manifest: FrozenEvalManifest,
     config_identity: RLConfigIdentity,
+    run_root: Path,
+    model_path: Path,
+    dataset_path: Path,
+    resolved_config_path: Path,
+    resolved_config_sha256: str,
 ) -> TrainingPreflight:
     expected = {
+        "source_revision": manifest.source_revision,
         "manifest_identity_hash": manifest.identity_hash(),
+        "model_name": manifest.model.name,
+        "model_revision": manifest.model.revision,
         "model_files_sha256": manifest.model.file_manifest.aggregate_sha256,
         "training_data_digest": manifest.training_data.record_digest,
         "rl_config": config_identity,
+        "run_root": str(run_root),
+        "model_path": str(model_path),
+        "dataset_path": str(dataset_path),
+        "resolved_config_path": str(resolved_config_path),
+        "resolved_config_sha256": resolved_config_sha256,
     }
     output_path = Path(output_path)
     if output_path.exists():
@@ -252,6 +359,79 @@ def write_training_preflight(
     )
     write_json_exclusive(output_path, result.model_dump())
     return result
+
+
+def write_training_completion_attestation(
+    *,
+    output_path: Path,
+    manifest: FrozenEvalManifest,
+    preflight_path: Path,
+    resolved_config_path: Path,
+    rl_pid: int,
+    started_at: str,
+    ended_at: str,
+    run_root: Path,
+    output_dir: Path,
+    source_step: int,
+) -> TrainingCompletionAttestation:
+    preflight_payload, preflight_sha256 = load_json_with_sha256(preflight_path)
+    preflight = TrainingPreflight.model_validate(preflight_payload)
+    resolved_config_sha256 = hashlib.sha256(Path(resolved_config_path).read_bytes()).hexdigest()
+    if preflight.manifest_identity_hash != manifest.identity_hash():
+        raise ValueError("completion preflight does not bind the supplied frozen manifest")
+    if Path(preflight.run_root) != Path(run_root):
+        raise ValueError("completion run root does not match preflight")
+    if Path(preflight.resolved_config_path) != Path(resolved_config_path):
+        raise ValueError("completion config path does not match preflight")
+    if preflight.resolved_config_sha256 != resolved_config_sha256:
+        raise ValueError("completion config bytes do not match preflight")
+    if datetime.fromisoformat(ended_at) < datetime.fromisoformat(started_at):
+        raise ValueError("completion end time precedes start time")
+    durable_config = Path(output_dir) / "training-resolved.toml"
+    _publish_resolved_config(
+        source=Path(resolved_config_path),
+        destination=durable_config,
+        expected_sha256=resolved_config_sha256,
+    )
+    source_adapter_path = Path(output_dir) / "weights" / f"step_{source_step}" / "lora_adapters"
+    result = TrainingCompletionAttestation(
+        manifest_identity_hash=manifest.identity_hash(),
+        preflight_sha256=preflight_sha256,
+        resolved_config_sha256=resolved_config_sha256,
+        rl_pid=rl_pid,
+        started_at=started_at,
+        ended_at=ended_at,
+        run_root=str(run_root),
+        resolved_config_path=str(resolved_config_path),
+        output_dir=str(output_dir),
+        source_step=source_step,
+        source_adapter_path=str(source_adapter_path),
+    )
+    write_json_exclusive(output_path, result.model_dump())
+    return result
+
+
+def _publish_resolved_config(*, source: Path, destination: Path, expected_sha256: str) -> None:
+    if os.path.lexists(destination):
+        if destination.is_symlink() or not destination.is_file():
+            raise ValueError("published resolved config must be a regular file")
+        if hashlib.sha256(destination.read_bytes()).hexdigest() != expected_sha256:
+            raise ValueError("existing published resolved config does not match the config consumed by RL")
+        return
+    staging = destination.parent / ".training-resolved.toml.stage"
+    if os.path.lexists(staging):
+        if staging.is_symlink() or not staging.is_file():
+            raise ValueError("refusing to clean an unowned resolved-config staging path")
+        staging.unlink()
+        fsync_directory(destination.parent)
+    with source.open("rb") as input_file, staging.open("xb") as output_file:
+        shutil.copyfileobj(input_file, output_file)
+        output_file.flush()
+        os.fsync(output_file.fileno())
+    if hashlib.sha256(staging.read_bytes()).hexdigest() != expected_sha256:
+        raise RuntimeError("staged resolved config digest changed")
+    _rename_noreplace(staging, destination)
+    fsync_directory(destination.parent)
 
 
 def _remove_owned_staging(path: Path) -> None:
@@ -291,21 +471,39 @@ def publish_training_result(
     *,
     output_dir: Path,
     manifest: FrozenEvalManifest,
-    source_revision: str,
+    preflight_path: Path,
+    completion_attestation_path: Path,
+    resolved_config_path: Path,
     expected_step: int,
     expected_rank: int,
 ) -> TrainingResult:
     output_dir = Path(output_dir)
-    if manifest.source_revision != source_revision:
-        raise ValueError(f"manifest source revision is {manifest.source_revision}, expected {source_revision}")
+    preflight_payload, preflight_sha256 = load_json_with_sha256(preflight_path)
+    preflight = TrainingPreflight.model_validate(preflight_payload)
+    attestation, attestation_sha256 = TrainingCompletionAttestation.load(completion_attestation_path)
+    resolved_config_path = Path(resolved_config_path)
+    resolved_config_sha256 = hashlib.sha256(resolved_config_path.read_bytes()).hexdigest()
+    validate_training_evidence(
+        manifest=manifest,
+        preflight=preflight,
+        preflight_sha256=preflight_sha256,
+        attestation=attestation,
+        resolved_config_path=resolved_config_path,
+        expected_output_dir=output_dir,
+        expected_step=expected_step,
+    )
     result_path = output_dir / "training-result.json"
     final_adapter = output_dir / "final-adapter"
+    published_config = output_dir / "training-resolved.toml"
     staging = output_dir / ".training-publication.stage"
     if os.path.lexists(result_path):
         result = TrainingResult.load(result_path)
         validate_adapter_handoff(
             result=result,
             manifest=manifest,
+            preflight_path=preflight_path,
+            completion_attestation_path=completion_attestation_path,
+            resolved_config_path=published_config,
             expected_adapter_path=final_adapter,
             expected_step=expected_step,
             expected_rank=expected_rank,
@@ -318,10 +516,17 @@ def publish_training_result(
         expected_step=expected_step,
         expected_rank=expected_rank,
     )
+    if step != attestation.source_step or source_adapter != Path(attestation.source_adapter_path):
+        raise ValueError("selected stable adapter does not match successful RL completion attestation")
     source_manifest = build_file_manifest(source_adapter)
     if source_manifest.aggregate_sha256 != source_digest:
         raise RuntimeError("source adapter changed while it was being selected")
 
+    if os.path.lexists(published_config):
+        if published_config.is_symlink() or not published_config.is_file():
+            raise ValueError("published resolved config must be a regular file")
+        if hashlib.sha256(published_config.read_bytes()).hexdigest() != resolved_config_sha256:
+            raise ValueError("partial published resolved config does not match the config consumed by RL")
     if os.path.lexists(final_adapter):
         published_digest = validate_adapter_directory(final_adapter, expected_rank=expected_rank)
         if published_digest != source_digest:
@@ -338,21 +543,36 @@ def publish_training_result(
         _rename_noreplace(staged_adapter, final_adapter)
         fsync_directory(output_dir)
         published_digest = validate_adapter_directory(final_adapter, expected_rank=expected_rank)
+    if not os.path.lexists(published_config):
+        if not os.path.lexists(staging):
+            staging.mkdir()
+        staged_config = staging / published_config.name
+        with resolved_config_path.open("rb") as source, staged_config.open("xb") as destination:
+            shutil.copyfileobj(source, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        if hashlib.sha256(staged_config.read_bytes()).hexdigest() != resolved_config_sha256:
+            raise RuntimeError("staged resolved config digest changed")
+        _rename_noreplace(staged_config, published_config)
+        fsync_directory(output_dir)
     if published_digest != source_digest:
         raise RuntimeError(f"published adapter digest {published_digest} does not match source digest {source_digest}")
     published_manifest = build_file_manifest(final_adapter)
     result = TrainingResult(
         created_at=datetime.now(timezone.utc).isoformat(),
-        source_revision=source_revision,
-        manifest_identity_hash=manifest.identity_hash(),
-        model_name=manifest.model.name,
-        model_revision=manifest.model.revision,
-        model_local_path=manifest.model.local_path,
-        model_files_sha256=manifest.model.file_manifest.aggregate_sha256,
-        training_data_digest=manifest.training_data.record_digest,
-        rl_config=manifest.rl_config,
-        source_step=step,
-        source_adapter_path=str(source_adapter),
+        source_revision=preflight.source_revision,
+        manifest_identity_hash=preflight.manifest_identity_hash,
+        model_name=preflight.model_name,
+        model_revision=preflight.model_revision,
+        model_files_sha256=preflight.model_files_sha256,
+        training_data_digest=preflight.training_data_digest,
+        rl_config=preflight.rl_config,
+        preflight_sha256=preflight_sha256,
+        completion_attestation_sha256=attestation_sha256,
+        resolved_config_sha256=resolved_config_sha256,
+        resolved_config_path=str(published_config),
+        source_step=attestation.source_step,
+        source_adapter_path=attestation.source_adapter_path,
         final_adapter_path=str(final_adapter),
         adapter_sha256=published_digest,
         adapter_files=published_manifest,
@@ -373,24 +593,46 @@ def validate_adapter_handoff(
     *,
     result: TrainingResult,
     manifest: FrozenEvalManifest,
+    preflight_path: Path,
+    completion_attestation_path: Path,
+    resolved_config_path: Path,
     expected_adapter_path: Path,
     expected_step: int,
     expected_rank: int,
 ) -> None:
+    preflight_payload, preflight_sha256 = load_json_with_sha256(preflight_path)
+    preflight = TrainingPreflight.model_validate(preflight_payload)
+    attestation, attestation_sha256 = TrainingCompletionAttestation.load(completion_attestation_path)
+    validate_training_evidence(
+        manifest=manifest,
+        preflight=preflight,
+        preflight_sha256=preflight_sha256,
+        attestation=attestation,
+        resolved_config_path=Path(resolved_config_path),
+        expected_output_dir=Path(expected_adapter_path).parent,
+        expected_step=expected_step,
+    )
     if result.manifest_identity_hash != manifest.identity_hash():
         raise ValueError("training result manifest identity does not match the frozen eval manifest")
     if result.source_revision != manifest.source_revision:
         raise ValueError("training result source revision does not match the frozen eval manifest")
     if result.model_name != manifest.model.name or result.model_revision != manifest.model.revision:
         raise ValueError("training result base model identity does not match the frozen eval manifest")
-    if result.model_local_path != manifest.model.local_path:
-        raise ValueError("training result model snapshot path does not match the frozen eval manifest")
     if result.model_files_sha256 != manifest.model.file_manifest.aggregate_sha256:
         raise ValueError("training result model file identity does not match the frozen eval manifest")
     if result.training_data_digest != manifest.training_data.record_digest:
         raise ValueError("training result training-data identity does not match the frozen eval manifest")
     if result.rl_config != manifest.rl_config:
         raise ValueError("training result effective RL config identity does not match the frozen eval manifest")
+    if result.preflight_sha256 != preflight_sha256:
+        raise ValueError("training result preflight digest does not match immutable preflight evidence")
+    if result.completion_attestation_sha256 != attestation_sha256:
+        raise ValueError("training result completion digest does not match immutable completion attestation")
+    resolved_digest = hashlib.sha256(Path(resolved_config_path).read_bytes()).hexdigest()
+    if result.resolved_config_sha256 != resolved_digest:
+        raise ValueError("training result resolved config digest does not match exact published bytes")
+    if Path(result.resolved_config_path) != Path(resolved_config_path):
+        raise ValueError("training result resolved config path is not the fixed published path")
     if result.source_step != expected_step:
         raise ValueError(f"training result source step is {result.source_step}, expected {expected_step}")
     if result.lora_rank != expected_rank:
@@ -409,3 +651,50 @@ def validate_adapter_handoff(
     if digest != result.adapter_sha256:
         raise ValueError(f"final adapter digest {digest} does not match training result digest {result.adapter_sha256}")
     validate_file_manifest(expected_adapter_path, result.adapter_files)
+
+
+def validate_training_evidence(
+    *,
+    manifest: FrozenEvalManifest,
+    preflight: TrainingPreflight,
+    preflight_sha256: str,
+    attestation: TrainingCompletionAttestation,
+    resolved_config_path: Path,
+    expected_output_dir: Path,
+    expected_step: int,
+) -> None:
+    if preflight.manifest_identity_hash != manifest.identity_hash():
+        raise ValueError("preflight manifest identity does not match frozen manifest")
+    if preflight.source_revision != manifest.source_revision:
+        raise ValueError("preflight source revision does not match frozen manifest")
+    if preflight.model_files_sha256 != manifest.model.file_manifest.aggregate_sha256:
+        raise ValueError("preflight model content identity does not match frozen manifest")
+    if preflight.model_name != manifest.model.name or preflight.model_revision != manifest.model.revision:
+        raise ValueError("preflight model identity does not match frozen manifest")
+    if preflight.training_data_digest != manifest.training_data.record_digest:
+        raise ValueError("preflight training identity does not match frozen manifest")
+    if preflight.rl_config != manifest.rl_config:
+        raise ValueError("preflight RL config identity does not match frozen manifest")
+    resolved_config_path = Path(resolved_config_path)
+    if resolved_config_path.is_symlink() or not resolved_config_path.is_file():
+        raise ValueError("resolved config evidence must be a regular non-symlink file")
+    resolved_digest = hashlib.sha256(resolved_config_path.read_bytes()).hexdigest()
+    if resolved_digest != preflight.resolved_config_sha256:
+        raise ValueError("resolved config bytes do not match preflight digest")
+    if attestation.manifest_identity_hash != preflight.manifest_identity_hash:
+        raise ValueError("completion manifest identity does not match preflight")
+    if attestation.preflight_sha256 != preflight_sha256:
+        raise ValueError("completion preflight digest does not match immutable preflight bytes")
+    if attestation.resolved_config_sha256 != resolved_digest:
+        raise ValueError("completion resolved config digest does not match exact bytes consumed by RL")
+    if attestation.run_root != preflight.run_root:
+        raise ValueError("completion run root does not match private preflight run root")
+    if attestation.resolved_config_path != preflight.resolved_config_path:
+        raise ValueError("completion config path does not match the exact private preflight config path")
+    if Path(attestation.output_dir) != Path(expected_output_dir):
+        raise ValueError("completion output path does not match the fixed training output")
+    if attestation.source_step != expected_step:
+        raise ValueError("completion source step does not match the fixed final step")
+    expected_source = Path(expected_output_dir) / "weights" / f"step_{expected_step}" / "lora_adapters"
+    if Path(attestation.source_adapter_path) != expected_source:
+        raise ValueError("completion source adapter path does not match the fixed final-step contract")

@@ -30,7 +30,6 @@ runtime:
     PRIME_RL_MAX_STEPS: "50"
     PRIME_RL_EVAL_TEMPERATURE: "0.0"
     PRIME_RL_EVAL_SEED: "0"
-    HF_HOME: /data/pretraining-data/prime-rl-math-7b-h200/hf-cache
 
 compute:
   gpus: 0

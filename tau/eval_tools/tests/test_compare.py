@@ -39,15 +39,17 @@ MODEL_FILES = FileManifest.from_records(
         FileRecord(path="model.safetensors", size=7, sha256="2" * 64),
     ]
 )
+DATASET_FILES = FileManifest.from_records([FileRecord(path="data/train.parquet", size=11, sha256="6" * 64)])
 RL_CONFIG = RLConfigIdentity(
     source_config_rel="configs/tau/math-7b-h200/train.toml",
+    source_toml_sha256="7" * 64,
     output_dir="/data/pretraining-data/prime-rl-math-7b-h200/train",
     max_steps=50,
-    resolved_toml_sha256="3" * 64,
+    canonical_resolved_sha256="3" * 64,
 )
 
 
-def _manifest(n: int = N, *, state: str = "finalized"):
+def _manifest(n: int = N, *, state: str = "finalized", baseline_mean: float = 0.4):
     examples = [
         ExampleRecord(id=i, prompt_hash=hash_text(f"problem {i}"), answer_hash=hash_text(f"answer {i}"))
         for i in range(n)
@@ -59,8 +61,6 @@ def _manifest(n: int = N, *, state: str = "finalized"):
         model=ModelSnapshot(
             name="Qwen/Qwen2.5-7B-Instruct",
             revision=MODEL_REVISION,
-            cache_root="/tmp/models",
-            local_path=f"/tmp/models/{MODEL_REVISION}",
             file_manifest=MODEL_FILES,
         ),
         eval_taskset=TasksetRef(
@@ -87,12 +87,13 @@ def _manifest(n: int = N, *, state: str = "finalized"):
                     answer_hash=hash_text(f"training answer {i}"),
                 )
                 for i in range(300)
-            ]
+            ],
+            file_manifest=DATASET_FILES,
         ),
         examples=examples,
         decoding=DecodingConfig(temperature=0.0, seed=0),
         grader="verifiers.v1.scoring.verify_boxed_math_answer",
-        baseline_mean=0.4 if state == "finalized" else None,
+        baseline_mean=baseline_mean if state == "finalized" else None,
         baseline_rewards_sha256=BASELINE_SHA256 if state == "finalized" else None,
         rl_config=RL_CONFIG if state == "finalized" else None,
         created_at=datetime.now(timezone.utc).isoformat(),
@@ -162,7 +163,7 @@ def test_compare_runs_fails_when_delta_meets_bar_but_ci_crosses_zero():
     """delta == +0.03 exactly meets the mean-delta gate, but the underlying per-example
     deltas are high-variance (+1/-1, nearly balanced) so the paired-bootstrap 95% CI
     lower bound is not > 0. The gate must fail on the CI condition alone."""
-    manifest = _manifest()
+    manifest = _manifest(baseline_mean=97 / N)
     # 103 examples improve (0 -> 1), 97 regress (1 -> 0): mean delta = 6/200 = 0.03.
     baseline_rewards = {i: (0.0 if i < 103 else 1.0) for i in range(N)}
     post_rewards = {i: (1.0 if i < 103 else 0.0) for i in range(N)}
@@ -253,7 +254,7 @@ def test_reward_record_rejects_noncanonical_example_id():
 
 def test_write_result_refuses_to_overwrite(tmp_path):
     manifest = _manifest()
-    baseline = _reward_record(manifest, {i: 0.0 for i in range(N)}, model_label="baseline")
+    baseline = _reward_record(manifest, {i: (1.0 if i < 80 else 0.0) for i in range(N)}, model_label="baseline")
     post = _reward_record(manifest, {i: 1.0 for i in range(N)}, model_label="post")
     result = _compare(manifest, baseline, post)
     path = tmp_path / "comparison.json"
@@ -298,3 +299,27 @@ def test_baseline_finalization_rejects_partial_or_wrong_label_evidence(tmp_path)
     write_json_exclusive(wrong_path, wrong.model_dump())
     with pytest.raises(ValueError, match="pre-finalization baseline"):
         validate_baseline_evidence(draft, wrong_path)
+
+
+def test_compare_rejects_all_zero_bound_baseline_with_false_manifest_mean():
+    manifest = _manifest(baseline_mean=0.4)
+    baseline = _reward_record(manifest, {i: 0.0 for i in range(N)}, model_label="baseline")
+    post = _reward_record(manifest, {i: 1.0 for i in range(N)}, model_label="post")
+    with pytest.raises(IdentityMismatchError, match="does not exactly match"):
+        _compare(manifest, baseline, post)
+
+
+def test_compare_rejects_valid_headroom_baseline_mean_mismatch():
+    manifest = _manifest(baseline_mean=0.4)
+    baseline = _reward_record(manifest, {i: (1.0 if i < 100 else 0.0) for i in range(N)}, model_label="baseline")
+    post = _reward_record(manifest, {i: 1.0 for i in range(N)}, model_label="post")
+    with pytest.raises(IdentityMismatchError, match="does not exactly match"):
+        _compare(manifest, baseline, post)
+
+
+def test_compare_accepts_exact_bound_baseline_mean():
+    manifest = _manifest(baseline_mean=0.4)
+    baseline = _reward_record(manifest, {i: (1.0 if i < 80 else 0.0) for i in range(N)}, model_label="baseline")
+    post = _reward_record(manifest, {i: 1.0 for i in range(N)}, model_label="post")
+    result = _compare(manifest, baseline, post)
+    assert result.baseline_mean == manifest.baseline_mean

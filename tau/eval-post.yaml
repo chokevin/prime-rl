@@ -1,7 +1,8 @@
 # 1 H200: frozen-eval post-training replay + comparison: `tau run eval-post`.
 #
-# Starts a bare `uv run inference --enable-lora` server for the base model, loads the
-# LoRA adapter checkpoint written by tau/train.yaml, replays the *frozen* eval manifest
+# Privately materializes and verifies the pinned base model and final adapter, starts a
+# bare `uv run inference --enable-lora` server using only those immutable private paths,
+# replays the *frozen* eval manifest
 # against it, writes rewards.json, then runs tau/eval_tools/cli.py compare against
 # tau/eval-baseline.yaml's rewards.json and this run's rewards, writing
 # comparison.json and exiting nonzero unless delta >= +0.03 and the paired-bootstrap
@@ -9,7 +10,8 @@
 #
 # Training publishes the exact bounded final-step rank-16 adapter to the fixed
 # final-adapter path and records its source step/hash in training-result.json. This
-# target verifies both before loading the adapter.
+# target strict-loads the preflight, completion attestation, resolved config, result, and
+# adapter hashes before making a private adapter copy and loading it.
 name: prime-rl-math-7b-h200-eval-post
 engine: job
 entrypoint: scripts/run-prime-rl.sh
@@ -29,12 +31,14 @@ runtime:
     PRIME_RL_MANIFEST_PATH: /data/pretraining-data/prime-rl-math-7b-h200/manifest/frozen-eval-manifest.json
     PRIME_RL_BASELINE_REWARDS_PATH: /data/pretraining-data/prime-rl-math-7b-h200/eval-baseline/rewards.json
     PRIME_RL_TRAINING_RESULT_PATH: /data/pretraining-data/prime-rl-math-7b-h200/train/training-result.json
+    PRIME_RL_TRAINING_PREFLIGHT_PATH: /data/pretraining-data/prime-rl-math-7b-h200/train/training-preflight.json
+    PRIME_RL_TRAINING_COMPLETION_PATH: /data/pretraining-data/prime-rl-math-7b-h200/train/training-completion.json
+    PRIME_RL_TRAINING_CONFIG_PATH: /data/pretraining-data/prime-rl-math-7b-h200/train/training-resolved.toml
     PRIME_RL_LORA_ADAPTER_PATH: /data/pretraining-data/prime-rl-math-7b-h200/train/final-adapter
     PRIME_RL_FINAL_STEP: "50"
     # Comparison-only retries must set PRIME_RL_COMPARE_ONLY=1 and an unused exact
     # PRIME_RL_COMPARISON_OUTPUT_PATH under this target's output directory.
     PRIME_RL_HEALTH_TIMEOUT_S: "1800"
-    HF_HOME: /data/pretraining-data/prime-rl-math-7b-h200/hf-cache
 
 compute:
   gpus: 1

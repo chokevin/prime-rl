@@ -22,11 +22,14 @@ from pathlib import Path
 
 from tau.eval_tools.artifacts import (
     TrainingResult,
+    materialize_adapter_for_eval,
     publish_training_result,
     validate_adapter_handoff,
     write_smoke_result,
+    write_training_completion_attestation,
 )
 from tau.eval_tools.compare import compare_from_paths, write_result
+from tau.eval_tools.live.private_materialization_live import validate_run_root
 from tau.eval_tools.manifest import (
     FrozenEvalManifest,
     LeakageError,
@@ -68,7 +71,7 @@ def _cmd_check_disjoint(args: argparse.Namespace) -> int:
 
 def _cmd_validate_manifest(args: argparse.Namespace) -> int:
     manifest = FrozenEvalManifest.load(Path(args.manifest))
-    model_path = validate_manifest_contract(
+    validate_manifest_contract(
         manifest,
         expected_source_revision=args.source_revision,
         expected_verifiers_revision=args.verifiers_revision,
@@ -77,7 +80,7 @@ def _cmd_validate_manifest(args: argparse.Namespace) -> int:
         expected_model_revision=args.model_revision,
         require_finalized=args.require_finalized,
     )
-    print(model_path)
+    print(f"ok: verified manifest identity {manifest.identity_hash()}")
     return 0
 
 
@@ -99,7 +102,9 @@ def _cmd_publish_training_result(args: argparse.Namespace) -> int:
     result = publish_training_result(
         output_dir=Path(args.output_dir),
         manifest=manifest,
-        source_revision=args.source_revision,
+        preflight_path=Path(args.preflight),
+        completion_attestation_path=Path(args.completion_attestation),
+        resolved_config_path=Path(args.resolved_config),
         expected_step=args.final_step,
         expected_rank=args.lora_rank,
     )
@@ -110,17 +115,44 @@ def _cmd_publish_training_result(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_write_training_completion(args: argparse.Namespace) -> int:
+    manifest = FrozenEvalManifest.load(Path(args.manifest))
+    result = write_training_completion_attestation(
+        output_path=Path(args.output),
+        manifest=manifest,
+        preflight_path=Path(args.preflight),
+        resolved_config_path=Path(args.resolved_config),
+        rl_pid=args.rl_pid,
+        started_at=args.started_at,
+        ended_at=args.ended_at,
+        run_root=Path(args.run_root),
+        output_dir=Path(args.output_dir),
+        source_step=args.final_step,
+    )
+    print(f"ok: recorded successful rl process {result.rl_pid}")
+    return 0
+
+
 def _cmd_validate_adapter_handoff(args: argparse.Namespace) -> int:
     manifest = FrozenEvalManifest.load(Path(args.manifest))
     result = TrainingResult.load(Path(args.training_result))
     validate_adapter_handoff(
         result=result,
         manifest=manifest,
+        preflight_path=Path(args.preflight),
+        completion_attestation_path=Path(args.completion_attestation),
+        resolved_config_path=Path(args.resolved_config),
         expected_adapter_path=Path(args.adapter_path),
         expected_step=args.final_step,
         expected_rank=args.lora_rank,
     )
-    print(f"ok: verified adapter handoff {args.adapter_path}", file=sys.stderr)
+    private_run_root = validate_run_root(Path(args.private_run_root))
+    private_adapter = materialize_adapter_for_eval(
+        result=result,
+        durable_adapter_path=Path(args.adapter_path),
+        run_root=private_run_root,
+    )
+    print(f"ok: verified and privately materialized adapter at {private_adapter}", file=sys.stderr)
     return 0
 
 
@@ -151,7 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_parser = subparsers.add_parser(
         "validate-manifest",
-        help="Strictly validate the experiment manifest and print its materialized model path.",
+        help="Strictly validate the frozen experiment identity.",
     )
     validate_parser.add_argument("--manifest", required=True)
     validate_parser.add_argument("--source-revision", required=True)
@@ -178,10 +210,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     training_parser.add_argument("--manifest", required=True)
     training_parser.add_argument("--output-dir", required=True)
-    training_parser.add_argument("--source-revision", required=True)
+    training_parser.add_argument("--preflight", required=True)
+    training_parser.add_argument("--completion-attestation", required=True)
+    training_parser.add_argument("--resolved-config", required=True)
     training_parser.add_argument("--final-step", type=int, required=True)
     training_parser.add_argument("--lora-rank", type=int, required=True)
     training_parser.set_defaults(func=_cmd_publish_training_result)
+
+    completion_parser = subparsers.add_parser(
+        "write-training-completion",
+        help="Exclusively attest a successful rl process before artifact publication.",
+    )
+    completion_parser.add_argument("--output", required=True)
+    completion_parser.add_argument("--manifest", required=True)
+    completion_parser.add_argument("--preflight", required=True)
+    completion_parser.add_argument("--resolved-config", required=True)
+    completion_parser.add_argument("--rl-pid", type=int, required=True)
+    completion_parser.add_argument("--started-at", required=True)
+    completion_parser.add_argument("--ended-at", required=True)
+    completion_parser.add_argument("--run-root", required=True)
+    completion_parser.add_argument("--output-dir", required=True)
+    completion_parser.add_argument("--final-step", type=int, required=True)
+    completion_parser.set_defaults(func=_cmd_write_training_completion)
 
     handoff_parser = subparsers.add_parser(
         "validate-adapter-handoff",
@@ -189,6 +239,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     handoff_parser.add_argument("--manifest", required=True)
     handoff_parser.add_argument("--training-result", required=True)
+    handoff_parser.add_argument("--preflight", required=True)
+    handoff_parser.add_argument("--completion-attestation", required=True)
+    handoff_parser.add_argument("--resolved-config", required=True)
+    handoff_parser.add_argument("--private-run-root", required=True)
     handoff_parser.add_argument("--adapter-path", required=True)
     handoff_parser.add_argument("--final-step", type=int, required=True)
     handoff_parser.add_argument("--lora-rank", type=int, required=True)

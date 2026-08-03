@@ -52,9 +52,24 @@ esac
 [ "$(stat -c %d "$OVERLAY_DIR")" = "$(stat -c %d "$TMP_ROOT")" ] || die "overlay must remain on the /tmp filesystem"
 OVERLAY_DEVICE="$(stat -c %d "$OVERLAY_DIR")"
 OVERLAY_INODE="$(stat -c %i "$OVERLAY_DIR")"
+run_root_raw="$(mktemp -d "${TMP_ROOT}/prime-rl-run-XXXXXXXX")"
+RUN_ROOT="$(realpath -e "$run_root_raw")"
+case "$RUN_ROOT" in
+"${TMP_ROOT}"/prime-rl-run-*) ;;
+*) die "mktemp returned unsafe private run root ${RUN_ROOT}" ;;
+esac
+[ ! -L "$RUN_ROOT" ] || die "private run root must not be a symlink"
+chmod 0700 "$RUN_ROOT"
+mkdir "${RUN_ROOT}/hf-home"
+chmod 0700 "${RUN_ROOT}/hf-home"
+RUN_ROOT_DEVICE="$(stat -c %d "$RUN_ROOT")"
+RUN_ROOT_INODE="$(stat -c %i "$RUN_ROOT")"
+[ "$RUN_ROOT_DEVICE" = "$(stat -c %d "$TMP_ROOT")" ] || die "private run root must remain on /tmp"
 if command -v findmnt >/dev/null 2>&1; then
     [ "$(findmnt -n -o TARGET -T "$OVERLAY_DIR")" = "$(findmnt -n -o TARGET -T "$TMP_ROOT")" ] ||
         die "overlay must not be a nested mount"
+    [ "$(findmnt -n -o TARGET -T "$RUN_ROOT")" = "$(findmnt -n -o TARGET -T "$TMP_ROOT")" ] ||
+        die "private run root must not be a nested mount"
 fi
 
 cleanup() {
@@ -76,6 +91,21 @@ cleanup() {
         fi
         ;;
     *) log "refusing to remove unsafe overlay path ${OVERLAY_DIR}" ;;
+    esac
+    canonical_run_root="$(realpath -e "$RUN_ROOT" 2>/dev/null || true)"
+    case "$canonical_run_root" in
+    "${TMP_ROOT}"/prime-rl-run-*)
+        if [ "$canonical_run_root" = "$RUN_ROOT" ] &&
+            [ ! -L "$RUN_ROOT" ] &&
+            [ "$(stat -c %d "$canonical_run_root")" = "$RUN_ROOT_DEVICE" ] &&
+            [ "$(stat -c %i "$canonical_run_root")" = "$RUN_ROOT_INODE" ]; then
+            chmod -R u+w -- "$canonical_run_root"
+            rm -rf -- "$canonical_run_root"
+        else
+            log "refusing to remove unsafe private run root ${canonical_run_root}"
+        fi
+        ;;
+    *) log "refusing to remove unsafe private run root ${RUN_ROOT}" ;;
     esac
 }
 trap cleanup EXIT INT TERM
@@ -153,6 +183,7 @@ fi
 
 cd /app
 export PYTHONPATH="$OVERLAY_DIR"
+export HF_HOME="${RUN_ROOT}/hf-home"
 
 # --- Step 2: child-process lifecycle helpers -----------------------------------------
 # Backgrounding the long-running child + trapping here (rather than running it in the
@@ -203,11 +234,10 @@ freeze-draft)
     : "${PRIME_RL_MODEL_REVISION:?PRIME_RL_MODEL_REVISION must be an exact HF commit SHA}"
     : "${PRIME_RL_MANIFEST_DIR:?PRIME_RL_MANIFEST_DIR must be set}"
     : "${PRIME_RL_TRAIN_DATASET_REVISION:?PRIME_RL_TRAIN_DATASET_REVISION must be an exact HF dataset commit SHA}"
-    : "${HF_HOME:?HF_HOME must point at durable storage for the materialized model snapshot}"
     uv run --no-sync python -m tau.eval_tools.live.freeze_manifest_live draft \
         --model-name "$PRIME_RL_MODEL_NAME" \
         --model-revision "$PRIME_RL_MODEL_REVISION" \
-        --model-cache-dir "$HF_HOME" \
+        --run-root "$RUN_ROOT" \
         --train-dataset-revision "$PRIME_RL_TRAIN_DATASET_REVISION" \
         --source-revision "$resolved_sha" \
         --verifiers-revision "$PRIME_RL_VERIFIERS_SHA" \
@@ -265,11 +295,19 @@ eval)
         : "${PRIME_RL_BASELINE_REWARDS_PATH:?PRIME_RL_BASELINE_REWARDS_PATH must be set for the post-training comparison}"
         : "${PRIME_RL_LORA_ADAPTER_PATH:?PRIME_RL_LORA_ADAPTER_PATH must be set for post eval}"
         : "${PRIME_RL_TRAINING_RESULT_PATH:?PRIME_RL_TRAINING_RESULT_PATH must be set for post eval}"
+        : "${PRIME_RL_TRAINING_PREFLIGHT_PATH:?PRIME_RL_TRAINING_PREFLIGHT_PATH must be set for post eval}"
+        : "${PRIME_RL_TRAINING_COMPLETION_PATH:?PRIME_RL_TRAINING_COMPLETION_PATH must be set for post eval}"
+        : "${PRIME_RL_TRAINING_CONFIG_PATH:?PRIME_RL_TRAINING_CONFIG_PATH must be set for post eval}"
         : "${PRIME_RL_FINAL_STEP:?PRIME_RL_FINAL_STEP must match the exact bounded final training step}"
         [[ "$PRIME_RL_FINAL_STEP" =~ ^[1-9][0-9]*$ ]] || die "PRIME_RL_FINAL_STEP must be a positive integer"
         manifest_args+=(--require-finalized)
     fi
-    model_snapshot_path="$(uv run --no-sync python -m tau.eval_tools.cli validate-manifest "${manifest_args[@]}")"
+    uv run --no-sync python -m tau.eval_tools.cli validate-manifest "${manifest_args[@]}" >/dev/null
+    uv run --no-sync python -m tau.eval_tools.live.private_materialization_live \
+        --manifest "$PRIME_RL_MANIFEST_PATH" \
+        --run-root "$RUN_ROOT" \
+        >/dev/null
+    model_snapshot_path="${RUN_ROOT}/model"
 
     # A standalone eval has one engine and needs no routing layer. Running the bare
     # engine keeps health, admin, and OpenAI requests on the same source-supported port.
@@ -279,12 +317,17 @@ eval)
         uv run --no-sync python -m tau.eval_tools.cli validate-adapter-handoff \
             --manifest "$PRIME_RL_MANIFEST_PATH" \
             --training-result "$PRIME_RL_TRAINING_RESULT_PATH" \
+            --preflight "$PRIME_RL_TRAINING_PREFLIGHT_PATH" \
+            --completion-attestation "$PRIME_RL_TRAINING_COMPLETION_PATH" \
+            --resolved-config "$PRIME_RL_TRAINING_CONFIG_PATH" \
             --adapter-path "$PRIME_RL_LORA_ADAPTER_PATH" \
+            --private-run-root "$RUN_ROOT" \
             --final-step "$PRIME_RL_FINAL_STEP" \
             --lora-rank 16
         inference_args+=(--enable-lora --max-lora-rank 16)
         lora_name="post-adapter"
     fi
+    chmod 0555 "$RUN_ROOT"
 
     rewards_path="${TAU_OUTPUT_DIR}/rewards.json"
     if [ "${PRIME_RL_COMPARE_ONLY:-0}" != "1" ]; then
@@ -297,10 +340,11 @@ eval)
         wait_for_health "http://localhost:8000/health" "${PRIME_RL_HEALTH_TIMEOUT_S:-1800}"
 
         if [ -n "$lora_name" ]; then
-            log "loading LoRA adapter ${PRIME_RL_LORA_ADAPTER_PATH} as ${lora_name}"
+            private_adapter_path="${RUN_ROOT}/adapter"
+            log "loading privately materialized LoRA adapter ${private_adapter_path} as ${lora_name}"
             curl -fsS -X POST "http://localhost:8000/load_lora_adapter" \
                 -H 'Content-Type: application/json' \
-                -d "{\"lora_name\": \"${lora_name}\", \"lora_path\": \"${PRIME_RL_LORA_ADAPTER_PATH}\"}" \
+                -d "{\"lora_name\": \"${lora_name}\", \"lora_path\": \"${private_adapter_path}\"}" \
                 >/dev/null
             curl -fsS -o /dev/null "http://localhost:8000/health"
         fi
@@ -348,18 +392,18 @@ train)
     if [ ! -f "$frozen_manifest" ]; then
         die "frozen eval manifest not found at ${frozen_manifest} — run freeze-draft, measure the baseline eval, then freeze-finalize before training. Refusing to start training without a pre-committed held-out eval (see tau/README.md's proof ladder)."
     fi
-    model_snapshot_path="$(
-        uv run --no-sync python -m tau.eval_tools.cli validate-manifest \
-            --manifest "$frozen_manifest" \
-            --source-revision "$resolved_sha" \
-            --verifiers-revision "$PRIME_RL_VERIFIERS_SHA" \
-            --tasksets-revision "$PRIME_RL_TASKSETS_SHA" \
-            --model-name "$PRIME_RL_MODEL_NAME" \
-            --model-revision "$PRIME_RL_MODEL_REVISION" \
-            --require-finalized
-    )"
-    export HF_DATASETS_OFFLINE=1
-    pinned_training_config="${TAU_OUTPUT_DIR}/resolved-train.toml"
+    uv run --no-sync python -m tau.eval_tools.cli validate-manifest \
+        --manifest "$frozen_manifest" \
+        --source-revision "$resolved_sha" \
+        --verifiers-revision "$PRIME_RL_VERIFIERS_SHA" \
+        --tasksets-revision "$PRIME_RL_TASKSETS_SHA" \
+        --model-name "$PRIME_RL_MODEL_NAME" \
+        --model-revision "$PRIME_RL_MODEL_REVISION" \
+        --require-finalized \
+        >/dev/null
+    pinned_training_config="${RUN_ROOT}/resolved-train.toml"
+    training_preflight="${TAU_OUTPUT_DIR}/training-preflight.json"
+    training_completion="${TAU_OUTPUT_DIR}/training-completion.json"
     uv run --no-sync python -m tau.eval_tools.live.validate_training_data_live \
         --manifest "$frozen_manifest" \
         --config "$config_path" \
@@ -367,19 +411,42 @@ train)
         --output-config "$pinned_training_config" \
         --output-dir "$TAU_OUTPUT_DIR" \
         --max-steps "$PRIME_RL_MAX_STEPS" \
-        --preflight "${TAU_OUTPUT_DIR}/training-preflight.json"
-    log "frozen manifest, model snapshot, and training-data identity verified — proceeding"
+        --preflight "$training_preflight" \
+        --run-root "$RUN_ROOT"
+    [ -f "${RUN_ROOT}/training-inputs-complete.json" ] || die "private training input completion marker is missing"
+    log "frozen manifest and immutable private model/data/config materializations verified — proceeding"
 
     log "starting bounded RL training: uv run rl @ ${pinned_training_config}"
+    rl_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     uv run --no-sync rl @ "$pinned_training_config" &
     CHILD_PID=$!
-    wait "$CHILD_PID"
+    rl_pid="$CHILD_PID"
+    if wait "$CHILD_PID"; then
+        rl_status=0
+    else
+        rl_status=$?
+    fi
     CHILD_PID=""
+    [ "$rl_status" -eq 0 ] || die "rl process ${rl_pid} failed with status ${rl_status}; no completion attestation will be written"
+    rl_ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     [ -s "${TAU_OUTPUT_DIR}/metrics.jsonl" ] || die "training completed without the configured metrics.jsonl artifact"
+    uv run --no-sync python -m tau.eval_tools.cli write-training-completion \
+        --output "$training_completion" \
+        --manifest "$frozen_manifest" \
+        --preflight "$training_preflight" \
+        --resolved-config "$pinned_training_config" \
+        --rl-pid "$rl_pid" \
+        --started-at "$rl_started_at" \
+        --ended-at "$rl_ended_at" \
+        --run-root "$RUN_ROOT" \
+        --output-dir "$TAU_OUTPUT_DIR" \
+        --final-step "$PRIME_RL_MAX_STEPS"
     uv run --no-sync python -m tau.eval_tools.cli publish-training-result \
         --manifest "$frozen_manifest" \
         --output-dir "$TAU_OUTPUT_DIR" \
-        --source-revision "$resolved_sha" \
+        --preflight "$training_preflight" \
+        --completion-attestation "$training_completion" \
+        --resolved-config "${TAU_OUTPUT_DIR}/training-resolved.toml" \
         --final-step "$PRIME_RL_MAX_STEPS" \
         --lora-rank 16
     ;;

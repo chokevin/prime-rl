@@ -1,6 +1,7 @@
 # 1 H200: frozen-eval baseline replay: `tau run eval-baseline`.
 #
-# Starts a bare `uv run inference` server for the un-fine-tuned base model, replays the
+# Materializes the pinned model directly into fresh immutable job-private storage, starts
+# a bare `uv run inference` server for that base model, replays the
 # frozen (or draft, for the very first pre-freeze measurement) eval manifest against it,
 # and writes rewards.json under this target's own output directory. See
 # tau/eval-post.yaml for the paired post-training run and comparison.
@@ -29,7 +30,6 @@ runtime:
     PRIME_RL_MANIFEST_PATH: /data/pretraining-data/prime-rl-math-7b-h200/manifest/draft-manifest.json
     PRIME_RL_BASELINE_REWARDS_PATH: /data/pretraining-data/prime-rl-math-7b-h200/eval-baseline/rewards.json
     PRIME_RL_HEALTH_TIMEOUT_S: "1800"
-    HF_HOME: /data/pretraining-data/prime-rl-math-7b-h200/hf-cache
 
 compute:
   gpus: 1

@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from tau.eval_tools.json_io import load_json_with_sha256, write_json_exclusive
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 EXPECTED_EVAL_TASKSET_ID = "math500-v1"
@@ -242,13 +242,49 @@ def materialize_regular_snapshot(source: Path, cache_root: Path, destination: Pa
     return source_manifest
 
 
+def make_tree_immutable(root: Path) -> None:
+    root = _assert_no_symlink_components(root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"immutable tree root is not a directory: {root}")
+    directories = [root]
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        for name in dirnames:
+            child = directory_path / name
+            if child.is_symlink():
+                raise ValueError(f"immutable tree contains a symlinked directory: {child}")
+            directories.append(child)
+        for name in filenames:
+            child = directory_path / name
+            if child.is_symlink() or not child.is_file():
+                raise ValueError(f"immutable tree contains a non-regular file: {child}")
+            child.chmod(0o444)
+    for directory in reversed(directories):
+        directory.chmod(0o555)
+
+
+def validate_tree_immutable(root: Path, expected: FileManifest) -> None:
+    root = _assert_no_symlink_components(root)
+    validate_file_manifest(root, expected)
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        if directory_path.stat().st_mode & 0o222:
+            raise ValueError(f"private materialization directory is writable: {directory_path}")
+        for name in [*dirnames, *filenames]:
+            child = directory_path / name
+            if child.is_symlink():
+                raise ValueError(f"private materialization contains a symlink: {child}")
+            if child.stat().st_mode & 0o222:
+                raise ValueError(f"private materialization entry is writable: {child}")
+
+
 class ModelSnapshot(BaseModel):
     """The exact model artifact the eval must be reproducible against."""
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    """HF model id or local path passed as the inference server's ``model.name``."""
+    """Pinned Hugging Face model id; serving uses only a verified private materialization."""
 
     revision: str
     """Exact resolved HF commit SHA for `name`."""
@@ -260,20 +296,7 @@ class ModelSnapshot(BaseModel):
             raise ValueError("model revision must be an exact 40-character lowercase commit SHA")
         return revision
 
-    cache_root: str
     file_manifest: FileManifest
-
-    @field_validator("local_path", "cache_root")
-    @classmethod
-    def validate_local_path(cls, local_path: str) -> str:
-        if not Path(local_path).is_absolute():
-            raise ValueError("model snapshot paths must be absolute")
-        return local_path
-
-    local_path: str
-    """Local filesystem path to the pinned snapshot, when one was pre-downloaded so the
-    exact revision above is guaranteed served (prime-rl's model config takes a name or a
-    local path, not a revision — see the W2 selection memo's caveat)."""
 
 
 class TasksetRef(BaseModel):
@@ -287,7 +310,6 @@ class TasksetRef(BaseModel):
     dataset_subset: str | None
     dataset_split: str
     dataset_revision: str
-    dataset_local_path: str | None = None
 
     @field_validator("taskset_revision", "dataset_revision")
     @classmethod
@@ -295,13 +317,6 @@ class TasksetRef(BaseModel):
         if not GIT_SHA_RE.fullmatch(revision):
             raise ValueError("taskset and dataset revisions must be exact 40-character lowercase commit SHAs")
         return revision
-
-    @field_validator("dataset_local_path")
-    @classmethod
-    def validate_dataset_local_path(cls, local_path: str | None) -> str | None:
-        if local_path is not None and not Path(local_path).is_absolute():
-            raise ValueError("dataset local path must be absolute")
-        return local_path
 
 
 class DecodingConfig(BaseModel):
@@ -374,6 +389,7 @@ class TrainingDataIdentity(BaseModel):
     n: int
     records: list[TrainingRecord]
     record_digest: str
+    file_manifest: FileManifest
 
     @model_validator(mode="after")
     def validate_identity(self):
@@ -397,21 +413,24 @@ class TrainingDataIdentity(BaseModel):
         return [record.prompt_hash for record in self.records]
 
     @classmethod
-    def from_records(cls, records: list[TrainingRecord]) -> "TrainingDataIdentity":
+    def from_records(cls, records: list[TrainingRecord], *, file_manifest: FileManifest) -> "TrainingDataIdentity":
         return cls(
             n=len(records),
             records=records,
             record_digest=_training_record_digest(records),
+            file_manifest=file_manifest,
         )
 
 
 class RLConfigIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    contract_version: Literal[1] = 1
     source_config_rel: Literal["configs/tau/math-7b-h200/train.toml"]
+    source_toml_sha256: str
     output_dir: str
     max_steps: int
-    resolved_toml_sha256: str
+    canonical_resolved_sha256: str
 
     @field_validator("output_dir")
     @classmethod
@@ -427,11 +446,11 @@ class RLConfigIdentity(BaseModel):
             raise ValueError("RL max_steps must be positive")
         return max_steps
 
-    @field_validator("resolved_toml_sha256")
+    @field_validator("source_toml_sha256", "canonical_resolved_sha256")
     @classmethod
     def validate_sha256(cls, digest: str) -> str:
         if not SHA256_RE.fullmatch(digest):
-            raise ValueError("resolved RL TOML digest must be a lowercase SHA-256 hex digest")
+            raise ValueError("RL config digests must be lowercase SHA-256 hex")
         return digest
 
 
@@ -629,18 +648,13 @@ def build_manifest(
     )
 
 
-def validate_model_snapshot(model: ModelSnapshot) -> Path:
-    cache_root = _assert_no_symlink_components(Path(model.cache_root))
-    path = _canonical_child(Path(model.local_path), cache_root)
-    expected_path = cache_root / "prime-rl-trusted-models" / model.name.replace("/", "--") / model.revision
-    if path != expected_path:
-        raise ValueError(f"materialized model snapshot path is {path}, expected fixed trusted path {expected_path}")
+def validate_model_materialization(model: ModelSnapshot, path: Path, run_root: Path) -> Path:
+    run_root = _assert_no_symlink_components(run_root)
+    path = _canonical_child(path, run_root)
+    if path != run_root / "model":
+        raise ValueError(f"private model path is {path}, expected {run_root / 'model'}")
     if not path.is_dir():
-        raise FileNotFoundError(f"materialized model snapshot directory not found: {path}")
-    if path.name != model.revision:
-        raise ValueError(
-            f"materialized model snapshot path {path} does not end in the pinned revision {model.revision}"
-        )
+        raise FileNotFoundError(f"private model snapshot directory not found: {path}")
     manifest_paths = {record.path for record in model.file_manifest.files}
     if "config.json" not in manifest_paths:
         raise ValueError("trusted model file manifest is missing config.json")
@@ -652,34 +666,18 @@ def validate_model_snapshot(model: ModelSnapshot) -> Path:
     return path
 
 
-def validate_training_snapshot(taskset: TasksetRef) -> Path:
-    if taskset.dataset_local_path is None:
-        raise ValueError("training taskset must record its materialized dataset snapshot path")
-    path = _assert_no_symlink_components(Path(taskset.dataset_local_path))
+def validate_training_materialization(manifest: FrozenEvalManifest, path: Path, run_root: Path) -> Path:
+    run_root = _assert_no_symlink_components(run_root)
+    path = _canonical_child(path, run_root)
+    if path != run_root / "training-dataset":
+        raise ValueError(f"private training dataset path is {path}, expected {run_root / 'training-dataset'}")
     if not path.is_dir():
-        raise FileNotFoundError(f"materialized training dataset snapshot directory not found: {path}")
-    if path.name != taskset.dataset_revision:
-        raise ValueError(
-            f"materialized training dataset path {path} does not end in the pinned revision {taskset.dataset_revision}"
-        )
+        raise FileNotFoundError(f"private training dataset snapshot directory not found: {path}")
     data_file = path / EXPECTED_TRAIN_DATA_FILE
     if not data_file.is_file():
         raise FileNotFoundError(f"materialized training dataset is missing pinned data file: {data_file}")
     _assert_no_symlink_components(data_file)
-    return path
-
-
-def validate_training_snapshot_location(manifest: FrozenEvalManifest) -> Path:
-    cache_root = _assert_no_symlink_components(Path(manifest.model.cache_root))
-    expected_path = (
-        cache_root
-        / "prime-rl-trusted-datasets"
-        / manifest.train_taskset.dataset_name.replace("/", "--")
-        / manifest.train_taskset.dataset_revision
-    )
-    path = validate_training_snapshot(manifest.train_taskset)
-    if path != expected_path:
-        raise ValueError(f"materialized training dataset path is {path}, expected fixed trusted path {expected_path}")
+    validate_file_manifest(path, manifest.training_data.file_manifest)
     return path
 
 
@@ -687,7 +685,10 @@ def validate_training_prompt_hashes(
     manifest: FrozenEvalManifest,
     actual_records: list[TrainingRecord],
 ) -> None:
-    actual = TrainingDataIdentity.from_records(actual_records)
+    actual = TrainingDataIdentity.from_records(
+        actual_records,
+        file_manifest=manifest.training_data.file_manifest,
+    )
     if actual != manifest.training_data:
         raise ValueError(
             "actual math-env-v1 ordered training records do not match the frozen training-data identity "
@@ -705,7 +706,7 @@ def validate_manifest_contract(
     expected_model_name: str,
     expected_model_revision: str,
     require_finalized: bool,
-) -> Path:
+) -> None:
     if require_finalized and manifest.state != "finalized":
         raise ValueError(f"manifest state is {manifest.state!r}, expected 'finalized'")
     if manifest.source_revision != expected_source_revision:
@@ -731,7 +732,6 @@ def validate_manifest_contract(
         dataset_subset=None,
         dataset_split="test",
         dataset_revision=EXPECTED_EVAL_DATASET_REVISION,
-        dataset_local_path=None,
     )
     if manifest.eval_taskset != expected_eval_ref:
         raise ValueError("manifest eval taskset identity does not match the pinned math500-v1 contract")
@@ -751,5 +751,3 @@ def validate_manifest_contract(
     if manifest.grader != EXPECTED_GRADER:
         raise ValueError(f"manifest grader is {manifest.grader!r}, expected {EXPECTED_GRADER!r}")
     validate_training_prompt_hashes(manifest, manifest.training_data.records)
-    validate_training_snapshot_location(manifest)
-    return validate_model_snapshot(manifest.model)

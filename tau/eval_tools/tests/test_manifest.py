@@ -1,5 +1,4 @@
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
 
@@ -21,10 +20,13 @@ from tau.eval_tools.manifest import (
     build_manifest,
     check_disjoint,
     check_headroom,
+    make_tree_immutable,
     materialize_regular_snapshot,
     validate_manifest_contract,
-    validate_model_snapshot,
+    validate_model_materialization,
+    validate_training_materialization,
     validate_training_prompt_hashes,
+    validate_tree_immutable,
 )
 
 N_EXAMPLES = 200
@@ -39,11 +41,13 @@ MODEL_FILES = FileManifest.from_records(
         FileRecord(path="model.safetensors", size=7, sha256="2" * 64),
     ]
 )
+DATASET_FILES = FileManifest.from_records([FileRecord(path="data/train.parquet", size=7, sha256="5" * 64)])
 RL_CONFIG = RLConfigIdentity(
     source_config_rel="configs/tau/math-7b-h200/train.toml",
+    source_toml_sha256="4" * 64,
     output_dir="/data/pretraining-data/prime-rl-math-7b-h200/train",
     max_steps=50,
-    resolved_toml_sha256="3" * 64,
+    canonical_resolved_sha256="3" * 64,
 )
 
 
@@ -63,7 +67,8 @@ def _manifest(**overrides) -> FrozenEvalManifest:
                 answer_hash=hash_text(f"training answer {i}"),
             )
             for i in range(300)
-        ]
+        ],
+        file_manifest=DATASET_FILES,
     )
     kwargs = dict(
         state="finalized",
@@ -72,8 +77,6 @@ def _manifest(**overrides) -> FrozenEvalManifest:
         model=ModelSnapshot(
             name="Qwen/Qwen2.5-7B-Instruct",
             revision=MODEL_REVISION,
-            cache_root="/tmp/models",
-            local_path=f"/tmp/models/{MODEL_REVISION}",
             file_manifest=MODEL_FILES,
         ),
         eval_taskset=TasksetRef(
@@ -91,7 +94,6 @@ def _manifest(**overrides) -> FrozenEvalManifest:
             dataset_subset="default",
             dataset_split="train",
             dataset_revision=TRAIN_DATASET_REVISION,
-            dataset_local_path=f"/datasets/{TRAIN_DATASET_REVISION}",
         ),
         training_data=training_data,
         examples=_examples(),
@@ -153,8 +155,6 @@ def test_identity_hash_changes_when_model_revision_changes():
         model=ModelSnapshot(
             name=m1.model.name,
             revision=revision,
-            cache_root="/tmp/models",
-            local_path=f"/tmp/models/{revision}",
             file_manifest=m1.model.file_manifest,
         )
     )
@@ -172,7 +172,8 @@ def test_identity_hash_changes_when_training_data_changes():
                     answer_hash=hash_text(f"training answer {i}"),
                 )
                 for i in range(300)
-            ]
+            ],
+            file_manifest=DATASET_FILES,
         )
     )
     assert m1.identity_hash() != m2.identity_hash()
@@ -280,53 +281,53 @@ def test_training_identity_rejects_duplicate_ids_and_prompts():
     records = list(_manifest().training_data.records)
     duplicate_id = records[1].model_copy(update={"id": records[0].id})
     with pytest.raises(ValueError, match="duplicate record ids"):
-        TrainingDataIdentity.from_records([records[0], duplicate_id])
+        TrainingDataIdentity.from_records([records[0], duplicate_id], file_manifest=DATASET_FILES)
     duplicate_prompt = records[1].model_copy(update={"prompt_hash": records[0].prompt_hash})
     with pytest.raises(ValueError, match="duplicate prompt hashes"):
-        TrainingDataIdentity.from_records([records[0], duplicate_prompt])
+        TrainingDataIdentity.from_records([records[0], duplicate_prompt], file_manifest=DATASET_FILES)
 
 
 def _materialized_model(tmp_path):
-    model_dir = tmp_path / "prime-rl-trusted-models" / "Qwen--Qwen2.5-7B-Instruct" / MODEL_REVISION
+    run_root = tmp_path / "prime-rl-run-test"
+    model_dir = run_root / "model"
     model_dir.mkdir(parents=True)
     (model_dir / "config.json").write_text("{}")
     (model_dir / "model.safetensors").write_bytes(b"weights")
-    return ModelSnapshot(
+    model = ModelSnapshot(
         name="Qwen/Qwen2.5-7B-Instruct",
         revision=MODEL_REVISION,
-        cache_root=str(tmp_path),
-        local_path=str(model_dir),
         file_manifest=build_file_manifest(model_dir),
     )
+    return model, model_dir, run_root
 
 
 def test_model_manifest_rejects_weight_mutation_missing_extra_and_path_swap(tmp_path):
-    model = _materialized_model(tmp_path)
-    weight = Path(model.local_path) / "model.safetensors"
+    model, model_dir, run_root = _materialized_model(tmp_path)
+    weight = model_dir / "model.safetensors"
     weight.write_bytes(b"modified")
     with pytest.raises(ValueError, match="changed=.*model.safetensors"):
-        validate_model_snapshot(model)
+        validate_model_materialization(model, model_dir, run_root)
 
     weight.write_bytes(b"weights")
     weight.unlink()
     with pytest.raises(ValueError, match="missing=.*model.safetensors"):
-        validate_model_snapshot(model)
+        validate_model_materialization(model, model_dir, run_root)
 
     weight.write_bytes(b"weights")
-    extra = Path(model.local_path) / "unexpected.txt"
+    extra = model_dir / "unexpected.txt"
     extra.write_text("extra")
     with pytest.raises(ValueError, match="extra=.*unexpected.txt"):
-        validate_model_snapshot(model)
+        validate_model_materialization(model, model_dir, run_root)
 
     extra.unlink()
     weight.unlink()
     weight.mkdir()
     with pytest.raises(ValueError, match="missing=.*model.safetensors"):
-        validate_model_snapshot(model)
+        validate_model_materialization(model, model_dir, run_root)
 
 
 def test_file_manifest_rejects_wrong_aggregate_digest(tmp_path):
-    model = _materialized_model(tmp_path)
+    model, _, _ = _materialized_model(tmp_path)
     payload = model.file_manifest.model_dump()
     payload["aggregate_sha256"] = "f" * 64
     with pytest.raises(ValueError, match="aggregate digest"):
@@ -334,26 +335,25 @@ def test_file_manifest_rejects_wrong_aggregate_digest(tmp_path):
 
 
 def test_model_snapshot_rejects_directory_path_swap(tmp_path):
-    model = _materialized_model(tmp_path)
-    wrong_path = tmp_path / MODEL_REVISION
+    model, _, run_root = _materialized_model(tmp_path)
+    wrong_path = run_root / "other"
     wrong_path.mkdir()
     (wrong_path / "config.json").write_text("{}")
     (wrong_path / "model.safetensors").write_bytes(b"weights")
-    swapped = model.model_copy(update={"local_path": str(wrong_path)})
-    with pytest.raises(ValueError, match="expected fixed trusted path"):
-        validate_model_snapshot(swapped)
+    with pytest.raises(ValueError, match="private model path"):
+        validate_model_materialization(model, wrong_path, run_root)
 
 
 def test_model_manifest_rejects_symlink_escape(tmp_path):
-    model = _materialized_model(tmp_path)
+    model, model_dir, run_root = _materialized_model(tmp_path)
     outside = tmp_path.parent / f"{tmp_path.name}-outside-weights"
     outside.write_bytes(b"weights")
-    weight = Path(model.local_path) / "model.safetensors"
+    weight = model_dir / "model.safetensors"
     weight.unlink()
     weight.symlink_to(outside)
     try:
         with pytest.raises(ValueError, match="symlink"):
-            validate_model_snapshot(model)
+            validate_model_materialization(model, model_dir, run_root)
     finally:
         outside.unlink()
 
@@ -371,21 +371,33 @@ def test_snapshot_materialization_rejects_symlink_escape(tmp_path):
         materialize_regular_snapshot(source, cache_root, destination)
 
 
+def test_private_training_materialization_is_path_bound_and_immutable(tmp_path):
+    run_root = tmp_path / "prime-rl-run-test"
+    dataset = run_root / "training-dataset"
+    (dataset / "data").mkdir(parents=True)
+    (dataset / "data" / "train-00000-of-00001.parquet").write_bytes(b"parquet")
+    actual_files = build_file_manifest(dataset)
+    manifest = _manifest(training_data=_manifest().training_data.model_copy(update={"file_manifest": actual_files}))
+    assert validate_training_materialization(manifest, dataset, run_root) == dataset.resolve()
+    (run_root / "other").mkdir()
+    with pytest.raises(ValueError, match="private training dataset path"):
+        validate_training_materialization(manifest, run_root / "other", run_root)
+
+    make_tree_immutable(dataset)
+    validate_tree_immutable(dataset, actual_files)
+    assert dataset.stat().st_mode & 0o222 == 0
+    assert all(path.stat().st_mode & 0o222 == 0 for path in dataset.rglob("*"))
+    (dataset / "data").chmod(0o755)
+    with pytest.raises(ValueError, match="writable"):
+        validate_tree_immutable(dataset, actual_files)
+
+
 def test_validate_manifest_contract_accepts_exact_finalized_identity(tmp_path):
-    model_dir = tmp_path / "prime-rl-trusted-models" / "Qwen--Qwen2.5-7B-Instruct" / MODEL_REVISION
-    model_dir.mkdir(parents=True)
-    (model_dir / "config.json").write_text("{}")
-    (model_dir / "model.safetensors").write_bytes(b"weights")
-    dataset_dir = tmp_path / "prime-rl-trusted-datasets" / "PrimeIntellect--Hendrycks-Math" / TRAIN_DATASET_REVISION
-    (dataset_dir / "data").mkdir(parents=True)
-    (dataset_dir / "data" / "train-00000-of-00001.parquet").write_bytes(b"parquet")
     manifest = _manifest(
         model=ModelSnapshot(
             name="Qwen/Qwen2.5-7B-Instruct",
             revision=MODEL_REVISION,
-            cache_root=str(tmp_path),
-            local_path=str(model_dir),
-            file_manifest=build_file_manifest(model_dir),
+            file_manifest=MODEL_FILES,
         ),
         train_taskset=TasksetRef(
             id="math-env-v1",
@@ -394,11 +406,10 @@ def test_validate_manifest_contract_accepts_exact_finalized_identity(tmp_path):
             dataset_subset="default",
             dataset_split="train",
             dataset_revision=TRAIN_DATASET_REVISION,
-            dataset_local_path=str(dataset_dir),
         ),
         examples=_examples(500),
     )
-    path = validate_manifest_contract(
+    result = validate_manifest_contract(
         manifest,
         expected_source_revision=SOURCE_REVISION,
         expected_verifiers_revision=VERIFIERS_REVISION,
@@ -407,7 +418,7 @@ def test_validate_manifest_contract_accepts_exact_finalized_identity(tmp_path):
         expected_model_revision=MODEL_REVISION,
         require_finalized=True,
     )
-    assert path == model_dir
+    assert result is None
 
 
 def test_validate_manifest_contract_rejects_draft(tmp_path):

@@ -156,7 +156,7 @@ Derived from `configs/basic/hendrycks-sanity/rl.toml` per the W2 selection memo:
 | `[inference].seed` | `0` | fixed resolved inference seed; the effective-config preflight rejects drift |
 | `[trainer.ckpt.weights].save_adapter_separately` | `true` | so `tau/eval-post.yaml` can load just the adapter |
 | `[file_monitor]` | enabled | writes the documented fixed `metrics.jsonl` artifact |
-| `[orchestrator.train.source.env.taskset]` | `math-env-v1`, `PrimeIntellect/Hendrycks-Math`, `default`, `train` | the freeze job materializes commit `3ed63f49541bdca4382fba28146aadf20d95cb38`; training rewrites only `dataset_name` to that fixed local snapshot before `rl` |
+| `[orchestrator.train.source.env.taskset]` | `math-env-v1`, `PrimeIntellect/Hendrycks-Math`, `default`, `train` | the manifest binds commit `3ed63f49541bdca4382fba28146aadf20d95cb38` and every dataset file; training rewrites only `dataset_name` to its verified job-private immutable copy |
 | `[orchestrator.train.source.env.taskset.task].judge` | `"None"` | disables `math-env-v1`'s LLM reference-judge fallback so training reward is purely deterministic (`"None"` → Python `None`, per `deps/pydantic-config/src/pydantic_config/cli.py`'s TOML-null convention) |
 | `[orchestrator.eval]` | `math500-v1`, all 500 examples, `group_size=1`, `interval=25` with `max_steps=50` | in-run startup(step 0)/periodic(25)/final(50) eval — a monitoring signal only, **not** the frozen comparison of record |
 
@@ -168,15 +168,15 @@ The handoff never enumerates a storage directory.
 
 ## Frozen eval manifest and the paired comparison gate
 
-- `tau/eval_tools/manifest.py` — schema-v4 `FrozenEvalManifest` pins the overlay,
-  verifiers, taskset, model, eval dataset, and training dataset revisions. Freeze copies
-  model and dataset snapshots into trusted regular-file trees. The model identity records
+- `tau/eval_tools/manifest.py` — schema-v5 `FrozenEvalManifest` pins the overlay,
+  verifiers, taskset, model, eval dataset, and training dataset revisions. Freeze builds
+  trusted job-private regular-file trees only long enough to record their identities. The model identity records
   every canonical path, byte size, per-file SHA-256, and an aggregate digest; baseline,
   train, and post-eval reject missing, extra, changed, path-escaping, or symlinked files.
-  Training identity binds ordered `{id, prompt_hash, answer_hash}` records, count, source
-  revision/config, and digest. Eval identity binds all 500 IDs and prompt/answer hashes,
-  decoding, and grader. Finalization additionally binds the exact resolved RL TOML,
-  materialized train path, and baseline reward artifact SHA-256.
+  Training identity binds every dataset file plus ordered `{id, prompt_hash, answer_hash}`
+  records, count, source revision/config, and digest. Eval identity binds all 500 IDs and prompt/answer hashes,
+  decoding, and grader. Finalization additionally binds the versioned canonical full
+  `RLConfig` contract/digest and baseline reward artifact SHA-256.
 - `tau/eval_tools/compare.py` — strict JSON loading rejects duplicate keys; reward files
   must carry the expected `baseline`/`post` labels, exact example IDs, and finite binary
   rewards (the pinned grader is source-proven to return exactly `0.0` or `1.0`).
@@ -188,12 +188,14 @@ The handoff never enumerates a storage directory.
 - Standalone baseline/post eval disables prime-rl's default router. The one vLLM engine
   serves health, LoRA admin, and OpenAI traffic on port 8000; startup and adapter-load
   failures are fatal before any reward evidence can be written.
-- `tau/eval_tools/live/` materializes exact model commit
+- `tau/eval_tools/live/` directly materializes exact model commit
   `a09a35458c702b33eeacc393d103063234e8bc28` and exact training dataset commit
-  `3ed63f49541bdca4382fba28146aadf20d95cb38`. Immediately before RL, offline mode
-  revalidates the full model and ordered training identities, validates the final
-  repository `RLConfig`, writes the exact resolved TOML consumed by `rl`, and emits
-  immutable `training-preflight.json` evidence bound to that TOML digest.
+  `3ed63f49541bdca4382fba28146aadf20d95cb38` beneath a fresh owned
+  `/tmp/prime-rl-run-<nonce>/`. It verifies hashes after copying regular files, removes
+  write permission, and writes completion markers last. RL consumes only the exact
+  private dataset/config/model paths. After RL exits zero, `training-completion.json`
+  attests its PID, times, preflight/config digests, output path, and fixed final step.
+  Publication strict-loads that evidence and writes `training-result.json` last.
 
 ### Proof ladder (in order)
 
@@ -238,14 +240,17 @@ tau run --config tau/.rendered/train.yaml --context aks-ai-runtime-eastus2-admin
 tau run get prime-rl-math-7b-h200-train -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact training-preflight.json
 tau run get prime-rl-math-7b-h200-train -n pretraining-data \
-  --context aks-ai-runtime-eastus2-admin --artifact resolved-train.toml
+  --context aks-ai-runtime-eastus2-admin --artifact training-completion.json
+tau run get prime-rl-math-7b-h200-train -n pretraining-data \
+  --context aks-ai-runtime-eastus2-admin --artifact training-resolved.toml
 tau run get prime-rl-math-7b-h200-train -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact training-result.json
 tau run get prime-rl-math-7b-h200-train -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact metrics.jsonl
 
 # 6. Post-training eval + comparison (1 GPU) — consumes only the fixed verified
-#    train/final-adapter + train/training-result.json handoff.
+#    all fixed training evidence, then copies train/final-adapter into job-private
+#    immutable storage before loading it.
 tau run --config tau/.rendered/eval-post.yaml --context aks-ai-runtime-eastus2-admin
 tau run get prime-rl-math-7b-h200-eval-post -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact rewards.json
@@ -278,7 +283,7 @@ storage proof) — fetch each by its exact name with `--artifact <file>`.
 | `freeze-manifest` | `.../prime-rl-math-7b-h200/manifest` | `draft-manifest.json`, `frozen-eval-manifest.json` | unfrozen draft (pass 1) and the immutable frozen manifest (pass 2) `tau/eval_tools/manifest.py` reads/writes |
 | `eval-baseline` | `.../prime-rl-math-7b-h200/eval-baseline` | `rewards.json`, `inference.log` | baseline per-example rewards (`RewardRecord`) `tau/eval_tools/compare.py` consumes |
 | `eval-post` | `.../prime-rl-math-7b-h200/eval-post` | `rewards.json`, `comparison.json`, `inference.log` | post-training rewards + the `ComparisonResult` (delta, bootstrap CI, pass/fail) |
-| `train` | `.../prime-rl-math-7b-h200/train` | `training-preflight.json`, `resolved-train.toml`, `training-result.json`, `metrics.jsonl`; fixed handoff path `final-adapter/` | validates the exact config/data/model identity before launch; after successful RL, stages only fixed adapter files from the exact `STABLE` final step, fsyncs and atomically installs `final-adapter/` without replacement, then writes `training-result.json` last |
+| `train` | `.../prime-rl-math-7b-h200/train` | `training-preflight.json`, `training-completion.json`, `training-resolved.toml`, `training-result.json`, `metrics.jsonl`; fixed handoff path `final-adapter/` | binds private immutable inputs and the exact config consumed by RL; attests a zero-exit process; then stages only fixed adapter/config files from the exact `STABLE` final step, fsyncs and atomically installs without replacement, and writes `training-result.json` last |
 
 Explicit-file fetch while the run's Workload/Job still exists (the proven, reliable path):
 
@@ -302,9 +307,10 @@ tau run get <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admi
 **Before every submit:** replace `REPLACE_WITH_EXACT_COMMIT_SHA` with the full integrated
 commit being run. W4c must do this only after the additive review-fix commit is integrated.
 The pinned `Qwen/Qwen2.5-7B-Instruct` revision is
-`a09a35458c702b33eeacc393d103063234e8bc28`; the draft freeze materializes it under the
-durable `HF_HOME`, and baseline, training, and post-eval all validate and serve the
-manifest's local snapshot path.
+`a09a35458c702b33eeacc393d103063234e8bc28`. Every model-serving phase downloads that
+exact revision directly into a fresh job-private cache, validates the complete frozen
+file manifest, and serves only the non-writable private regular-file tree. Post-eval does
+the same for the durable final adapter after verifying all training evidence.
 
 ```bash
 sed -i '' "s/REPLACE_WITH_EXACT_COMMIT_SHA/$(git rev-parse HEAD)/" tau/<target>.yaml
