@@ -2,7 +2,14 @@ from collections.abc import Mapping
 from typing import Any
 
 import pytest
-from harder_math_v1.catalog import SourceManifest, source_manifest_from_dict
+from harder_math_v1.catalog import (
+    CatalogContract,
+    SourceManifest,
+    catalog_contract_from_records,
+    normalize_math_row,
+    source_manifest_from_dict,
+)
+from harder_math_v1.partition import Partition
 
 
 @pytest.fixture
@@ -78,3 +85,25 @@ def rows_by_split() -> Mapping[str, list[dict[str, Any]]]:
             },
         ],
     }
+
+
+@pytest.fixture
+def expected_catalog_contracts(
+    source_manifest: SourceManifest,
+    rows_by_split: Mapping[str, list[dict[str, Any]]],
+) -> Mapping[Partition, CatalogContract]:
+    source = source_manifest.sources[0]
+    contracts = {}
+    for partition, split in (("train", "train"), ("eval", "test")):
+        records = tuple(
+            normalize_math_row(
+                row,
+                source=source,
+                config="algebra",
+                upstream_split=split,
+                partition=partition,
+            )
+            for row in rows_by_split[split]
+        )
+        contracts[partition] = catalog_contract_from_records(records, source_manifest)
+    return contracts

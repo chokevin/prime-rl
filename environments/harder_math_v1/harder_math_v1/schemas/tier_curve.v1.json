@@ -6,6 +6,7 @@
   "additionalProperties": false,
   "required": [
     "schema_version",
+    "baseline_id",
     "package_name",
     "package_version",
     "package_commit",
@@ -17,7 +18,7 @@
     "decoding",
     "renderer",
     "grader",
-    "taskset_config",
+    "taskset_configs",
     "settings_digest",
     "ordered_records",
     "tiers",
@@ -27,6 +28,10 @@
   "properties": {
     "schema_version": {
       "const": "tier-curve.v1"
+    },
+    "baseline_id": {
+      "type": "string",
+      "minLength": 1
     },
     "package_name": {
       "const": "harder-math-v1"
@@ -69,15 +74,33 @@
     "grader": {
       "type": "object"
     },
-    "taskset_config": {
-      "type": "object"
+    "taskset_configs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "base",
+        "core",
+        "hard"
+      ],
+      "properties": {
+        "base": {
+          "$ref": "#/$defs/tasksetConfig"
+        },
+        "core": {
+          "$ref": "#/$defs/tasksetConfig"
+        },
+        "hard": {
+          "$ref": "#/$defs/tasksetConfig"
+        }
+      }
     },
     "settings_digest": {
       "$ref": "#/$defs/sha256"
     },
     "ordered_records": {
       "type": "array",
-      "minItems": 3,
+      "minItems": 5030,
+      "maxItems": 5030,
       "items": {
         "$ref": "#/$defs/record"
       }
@@ -113,7 +136,9 @@
       "required": ["threshold", "passed"],
       "properties": {
         "threshold": {
-          "const": 0.15
+          "type": "number",
+          "minimum": 0.15,
+          "maximum": 1
         },
         "passed": {
           "type": "boolean"
@@ -132,6 +157,7 @@
       "required": [
         "record_id",
         "content_sha256",
+        "prompt_sha256",
         "partition",
         "tier",
         "reward",
@@ -143,6 +169,9 @@
           "minLength": 1
         },
         "content_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "prompt_sha256": {
           "$ref": "#/$defs/sha256"
         },
         "partition": {
@@ -165,6 +194,29 @@
           "type": [
             "string",
             "null"
+          ]
+        }
+      }
+    },
+    "tasksetConfig": {
+      "type": "object",
+      "required": [
+        "id",
+        "partition",
+        "tier"
+      ],
+      "properties": {
+        "id": {
+          "const": "harder-math-v1"
+        },
+        "partition": {
+          "const": "eval"
+        },
+        "tier": {
+          "enum": [
+            "base",
+            "core",
+            "hard"
           ]
         }
       }

@@ -46,6 +46,13 @@ The distribution and taskset ID are `harder-math-v1`; the import package is
 | `tier = "core"` | Either partition | Levels 3-4 |
 | `tier = "hard"` | MATH Level 5; eval also includes AIME | Highest tier |
 
+The trusted final catalog contract is:
+
+| Partition | Total | Base | Core | Hard | Catalog digest |
+|---|---:|---:|---:|---:|---|
+| `train` | 7,495 | 1,912 | 3,282 | 2,301 | `f51df30441c419d3e569c6a9a4588bab9da55c16e13988e627d299fe0314eb8f` |
+| `eval` | 5,030 | 1,331 | 2,345 | 1,354 | `ebe68009a7104d960d15e890489bdb6485476d56fe89407babbcc1532608285b` |
+
 Use the null harness with the subprocess runtime:
 
 ```toml
@@ -66,11 +73,15 @@ The loader always reads every pinned source needed to verify train/eval
 disjointness, checks every per-config raw count and exact row schema, normalizes
 the complete presented prompt and gold answer with Unicode NFKC and LF line
 endings, rejects missing boxed golds, sorts source-qualified record IDs, and
-rejects duplicate content across sources and partitions. If
+rejects duplicate prompts or prompt/gold content across sources and partitions.
+It checks the final partition count, tier counts, catalog digest, source-manifest
+digest, and source revisions against the package constants before returning a
+catalog. If
 `catalog_manifest_path` is set, it writes ordered IDs/hashes, counts, the source
 pins/licenses, source-manifest digest, and aggregate catalog digest. The output
 covers the whole selected partition, so all three tier runs share one catalog
-digest.
+digest. Each catalog/task row carries both `content_sha256` (prompt plus gold)
+and `prompt_sha256` (presented prompt only).
 
 `catalog.py` and `partition.py` contain deterministic row, hash, duplicate, and
 tier logic. `loader.py` is the only module that invokes a dataset loader, so
@@ -90,10 +101,48 @@ missing cache entries or source/schema/count drift fail loudly.
 ## Tier-curve acceptance
 
 `harder_math_v1.tier_curve` produces and validates `tier-curve.v1` artifacts
-with source/catalog digests, package and model revisions, taskset config,
-decoding/renderer/grader settings, ordered per-record binary rewards, and
-per-tier means, Wilson 95% confidence intervals, failure counts, and
-`base_minus_hard`. Aggregation rejects mixed manifests or run settings.
+with source/catalog digests, baseline/package/model revisions, per-tier taskset
+configs, decoding/renderer/grader settings, ordered per-record binary rewards,
+and per-tier means, Wilson 95% confidence intervals, failure counts, and
+`base_minus_hard`. Aggregation requires the trusted full eval catalog and an
+out-of-band `TierCurveRunContract`; observation strings are never accepted as
+authority for catalog, baseline, model, or decoding identity. Every one of the
+5,030 expected record IDs must appear exactly once with its trusted prompt hash,
+content hash, and tier.
+
+For W4c, build one run contract with the common taskset config omitting `tier`,
+then provide the full config on each observation:
+
+```python
+from harder_math_v1.catalog import EXPECTED_CATALOG_CONTRACTS
+from harder_math_v1.tier_curve import TierCurveRunContract, aggregate_tier_curve
+
+run_contract = TierCurveRunContract(
+    baseline_id=baseline_id,
+    package_name="harder-math-v1",
+    package_version=package_version,
+    package_commit=package_commit,
+    model=model,
+    model_revision=model_revision,
+    decoding=decoding,
+    renderer=renderer,
+    grader=grader,
+    taskset_config={"id": "harder-math-v1", "partition": "eval", **common_taskset_settings},
+)
+artifact = aggregate_tier_curve(
+    observations,
+    eval_catalog,
+    run_contract,
+    expected_catalog_contract=EXPECTED_CATALOG_CONTRACTS["eval"],
+)
+```
+
+Each observation must include `baseline_id`, package/model/settings fields,
+trusted catalog identity fields, `taskset_config` with `tier` equal to the
+record's tier, `record_id`, `content_sha256`, `prompt_sha256`, `partition`,
+`tier`, binary `reward`, and nullable `failure`. The only taskset field allowed
+to differ across base/core/hard runs is `tier`. The artifact stores these as
+`taskset_configs.{base,core,hard}`.
 
 Environment acceptance requires the same frozen model revision, decoding,
 renderer, and grader settings across all tiers and:
@@ -101,5 +150,8 @@ renderer, and grader settings across all tiers and:
 ```text
 base_mean - hard_mean >= 0.15
 ```
+
+The API rejects thresholds below `0.15`; callers may request a stricter
+threshold up to `1.0`.
 
 The empirical model run is intentionally outside this package.

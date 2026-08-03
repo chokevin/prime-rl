@@ -20,6 +20,7 @@ class HarderMathData(vf.TaskData):
     answer: str
     record_id: str
     content_sha256: str
+    prompt_sha256: str
     source_sha256: str
     source: str
     revision: str
@@ -70,6 +71,7 @@ def _to_task(record: CatalogRecord, idx: int, config: HarderMathTaskConfig) -> H
             answer=record.gold,
             record_id=record.record_id,
             content_sha256=record.content_sha256,
+            prompt_sha256=record.prompt_sha256,
             source_sha256=record.source_sha256,
             source=record.source,
             revision=record.revision,

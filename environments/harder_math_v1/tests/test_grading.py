@@ -19,6 +19,7 @@ def task() -> HarderMathTask:
             answer="\\frac{1}{2}",
             record_id="fixture@aaaaaaaa:algebra:test:0000000000000000",
             content_sha256="0" * 64,
+            prompt_sha256="2" * 64,
             source_sha256="1" * 64,
             source="fixture",
             revision="a" * 40,

@@ -77,6 +77,41 @@ def test_duplicate_content_and_partition_overlap_fail_loudly(source_manifest) ->
         validate_partition_disjointness([train], [eval_record])
 
 
+def test_same_prompt_with_different_gold_fails_prompt_disjointness(source_manifest) -> None:
+    source = source_manifest.sources[0]
+    train = normalize_math_row(
+        {
+            "problem": "Same prompt, disputed answer",
+            "level": "Level 5",
+            "type": "Algebra",
+            "solution": "\\boxed{41}",
+        },
+        source=source,
+        config="algebra",
+        upstream_split="train",
+        partition="train",
+    )
+    eval_record = normalize_math_row(
+        {
+            "problem": "Same prompt, disputed answer",
+            "level": "Level 5",
+            "type": "Algebra",
+            "solution": "\\boxed{42}",
+        },
+        source=source,
+        config="algebra",
+        upstream_split="test",
+        partition="eval",
+    )
+
+    assert train.content_sha256 != eval_record.content_sha256
+    assert train.prompt_sha256 == eval_record.prompt_sha256
+    with pytest.raises(ValueError, match="duplicate prompt hash"):
+        build_catalog([train, eval_record])
+    with pytest.raises(ValueError, match="train/eval prompt hash overlap"):
+        validate_partition_disjointness([train], [eval_record])
+
+
 def test_plugin_export_and_config_narrowing() -> None:
     assert harder_math_v1.__all__ == ["HarderMathTaskset"]
     assert issubclass(harder_math_v1.HarderMathTaskset, vf.Taskset)

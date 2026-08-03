@@ -4,11 +4,13 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from harder_math_v1.catalog import (
+    EXPECTED_CATALOG_CONTRACTS,
+    CatalogContract,
     CatalogRecord,
     SourceManifest,
     _source_row_sha256,
-    build_catalog,
     normalize_source_row,
+    validate_catalog_contract,
     validate_partition_disjointness,
 )
 from harder_math_v1.partition import PARTITIONS, Partition
@@ -20,6 +22,8 @@ def load_partition_records(
     manifest: SourceManifest,
     partition: Partition,
     load_dataset: DatasetLoader,
+    *,
+    expected_contract: CatalogContract | None = None,
 ) -> tuple[CatalogRecord, ...]:
     records: list[CatalogRecord] = []
     for source in manifest.sources:
@@ -80,7 +84,12 @@ def load_partition_records(
                 f"{source.id}/{upstream_split} reviewed exclusions drifted: "
                 f"{sorted(expected_exclusions - seen_exclusions)}"
             )
-    return build_catalog(records)
+    return validate_catalog_contract(
+        records,
+        manifest,
+        partition=partition,
+        expected=expected_contract or EXPECTED_CATALOG_CONTRACTS[partition],
+    )
 
 
 def _validate_exclusion(
@@ -124,7 +133,19 @@ def _validate_exclusion(
 def load_verified_catalogs(
     manifest: SourceManifest,
     load_dataset: DatasetLoader,
+    *,
+    expected_contracts: Mapping[Partition, CatalogContract] = EXPECTED_CATALOG_CONTRACTS,
 ) -> Mapping[Partition, tuple[CatalogRecord, ...]]:
-    catalogs = {partition: load_partition_records(manifest, partition, load_dataset) for partition in PARTITIONS}
+    if set(expected_contracts) != set(PARTITIONS):
+        raise ValueError(f"catalog contracts must cover exactly {list(PARTITIONS)}")
+    catalogs = {
+        partition: load_partition_records(
+            manifest,
+            partition,
+            load_dataset,
+            expected_contract=expected_contracts[partition],
+        )
+        for partition in PARTITIONS
+    }
     validate_partition_disjointness(catalogs["train"], catalogs["eval"])
     return catalogs

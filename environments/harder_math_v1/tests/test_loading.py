@@ -5,8 +5,10 @@ from typing import Any
 
 import pytest
 from harder_math_v1.catalog import (
+    EXPECTED_CATALOG_CONTRACTS,
     build_catalog_manifest,
     canonical_text,
+    catalog_contract_from_records,
     extract_gold,
     load_source_manifest,
     normalize_aime_row,
@@ -37,6 +39,7 @@ def test_row_normalization_and_gold_extraction(source_manifest) -> None:
     assert record.tier == "base"
     assert record.record_id.startswith(f"fixture_math@{'a' * 40}:algebra:train:")
     assert len(record.content_sha256) == 64
+    assert len(record.prompt_sha256) == 64
 
 
 def test_canonical_text_normalizes_nfkc_lf_and_edge_whitespace() -> None:
@@ -55,6 +58,7 @@ def test_gold_extraction_rejects_missing_or_unclosed_box() -> None:
 def test_fixture_loader_validates_counts_and_builds_manifest(
     source_manifest,
     rows_by_split: Mapping[str, list[dict[str, Any]]],
+    expected_catalog_contracts,
 ) -> None:
     def load_dataset(
         dataset: str,
@@ -66,7 +70,11 @@ def test_fixture_loader_validates_counts_and_builds_manifest(
         assert (dataset, config, revision) == ("fixture/math", "algebra", "a" * 40)
         return rows_by_split[split]
 
-    catalogs = load_verified_catalogs(source_manifest, load_dataset)
+    catalogs = load_verified_catalogs(
+        source_manifest,
+        load_dataset,
+        expected_contracts=expected_catalog_contracts,
+    )
     artifact = build_catalog_manifest(
         (*catalogs["train"], *catalogs["eval"]),
         source_manifest,
@@ -85,12 +93,17 @@ def test_fixture_loader_validates_counts_and_builds_manifest(
 def test_loader_rejects_schema_and_count_drift(
     source_manifest,
     rows_by_split: Mapping[str, list[dict[str, Any]]],
+    expected_catalog_contracts,
 ) -> None:
     def short_loader(*args: Any, split: str, **kwargs: Any) -> list[dict[str, Any]]:
         return rows_by_split[split][:-1]
 
     with pytest.raises(ValueError, match="count drift"):
-        load_verified_catalogs(source_manifest, short_loader)
+        load_verified_catalogs(
+            source_manifest,
+            short_loader,
+            expected_contracts=expected_catalog_contracts,
+        )
 
     source = source_manifest.sources[0]
     with pytest.raises(ValueError, match="schema drift"):
@@ -122,6 +135,26 @@ def test_packaged_manifest_has_verified_source_pins_licenses_and_exclusions() ->
     assert sources["aime_2025"].license == "CC-BY-NC-SA-4.0"
     assert [entry["id"] for entry in manifest.blocked_sources] == ["aime_2024"]
     assert Path(__file__).parents[1].joinpath("harder_math_v1/schemas/tier_curve.v1.json").is_file()
+    assert EXPECTED_CATALOG_CONTRACTS["train"].total == 7_495
+    assert EXPECTED_CATALOG_CONTRACTS["train"].tier_counts == {
+        "base": 1_912,
+        "core": 3_282,
+        "hard": 2_301,
+    }
+    assert (
+        EXPECTED_CATALOG_CONTRACTS["train"].catalog_digest
+        == "f51df30441c419d3e569c6a9a4588bab9da55c16e13988e627d299fe0314eb8f"
+    )
+    assert EXPECTED_CATALOG_CONTRACTS["eval"].total == 5_030
+    assert EXPECTED_CATALOG_CONTRACTS["eval"].tier_counts == {
+        "base": 1_331,
+        "core": 2_345,
+        "hard": 1_354,
+    }
+    assert (
+        EXPECTED_CATALOG_CONTRACTS["eval"].catalog_digest
+        == "ebe68009a7104d960d15e890489bdb6485476d56fe89407babbcc1532608285b"
+    )
 
 
 def test_active_source_requires_verified_license(source_manifest) -> None:
@@ -175,6 +208,22 @@ def test_manifest_pinned_exclusion_rejects_source_drift(
         }
     ]
     manifest = source_manifest_from_dict(raw)
+    expected_contracts = {}
+    for partition, split, rows in (
+        ("train", "train", rows_by_split["train"][1:]),
+        ("eval", "test", rows_by_split["test"]),
+    ):
+        records = tuple(
+            normalize_math_row(
+                row,
+                source=manifest.sources[0],
+                config="algebra",
+                upstream_split=split,
+                partition=partition,
+            )
+            for row in rows
+        )
+        expected_contracts[partition] = catalog_contract_from_records(records, manifest)
 
     def load_dataset(
         dataset: str,
@@ -185,7 +234,11 @@ def test_manifest_pinned_exclusion_rejects_source_drift(
     ) -> list[dict[str, Any]]:
         return rows_by_split[split]
 
-    catalogs = load_verified_catalogs(manifest, load_dataset)
+    catalogs = load_verified_catalogs(
+        manifest,
+        load_dataset,
+        expected_contracts=expected_contracts,
+    )
     assert len(catalogs["train"]) == 2
 
     tampered = copy.deepcopy(rows_by_split)
@@ -201,4 +254,33 @@ def test_manifest_pinned_exclusion_rejects_source_drift(
         return tampered[split]
 
     with pytest.raises(ValueError, match="exclusion .* source drift"):
-        load_verified_catalogs(manifest, tampered_loader)
+        load_verified_catalogs(
+            manifest,
+            tampered_loader,
+            expected_contracts=expected_contracts,
+        )
+
+
+def test_loader_rejects_same_count_final_catalog_drift(
+    source_manifest,
+    rows_by_split: Mapping[str, list[dict[str, Any]]],
+    expected_catalog_contracts,
+) -> None:
+    tampered = copy.deepcopy(rows_by_split)
+    tampered["test"][0]["problem"] = "Same count, different eval problem."
+
+    def load_dataset(
+        dataset: str,
+        config: str,
+        *,
+        split: str,
+        revision: str,
+    ) -> list[dict[str, Any]]:
+        return tampered[split]
+
+    with pytest.raises(ValueError, match="eval catalog record contract drift"):
+        load_verified_catalogs(
+            source_manifest,
+            load_dataset,
+            expected_contracts=expected_catalog_contracts,
+        )

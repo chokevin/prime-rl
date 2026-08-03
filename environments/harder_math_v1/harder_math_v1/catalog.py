@@ -59,6 +59,7 @@ class CatalogRecord:
     gold: str
     record_id: str
     content_sha256: str
+    prompt_sha256: str
     source_sha256: str
     source: str
     revision: str
@@ -67,6 +68,36 @@ class CatalogRecord:
     partition: Partition
     tier: Tier
     level: str
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogContract:
+    total: int
+    tier_counts: Mapping[Tier, int]
+    catalog_digest: str
+    source_manifest_digest: str
+    source_revisions: Mapping[str, str]
+
+
+EXPECTED_CATALOG_CONTRACTS: Mapping[Partition, CatalogContract] = {
+    "train": CatalogContract(
+        total=7_495,
+        tier_counts={"base": 1_912, "core": 3_282, "hard": 2_301},
+        catalog_digest="f51df30441c419d3e569c6a9a4588bab9da55c16e13988e627d299fe0314eb8f",
+        source_manifest_digest="9e2a0777612d4dd41f5ad0594db314c2a15aff2b9e7730762941da8bb1a5c2ab",
+        source_revisions={"hendrycks_math": "21a5633873b6a120296cce3e2df9d5550074f4a3"},
+    ),
+    "eval": CatalogContract(
+        total=5_030,
+        tier_counts={"base": 1_331, "core": 2_345, "hard": 1_354},
+        catalog_digest="ebe68009a7104d960d15e890489bdb6485476d56fe89407babbcc1532608285b",
+        source_manifest_digest="9e2a0777612d4dd41f5ad0594db314c2a15aff2b9e7730762941da8bb1a5c2ab",
+        source_revisions={
+            "hendrycks_math": "21a5633873b6a120296cce3e2df9d5550074f4a3",
+            "aime_2025": "c94da77eb22bbd6439e62a323bec18493a421302",
+        },
+    ),
+}
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -286,6 +317,7 @@ def normalize_math_row(
     gold = extract_gold(row["solution"])
     prompt = canonical_text(INSTRUCTION + question)
     content_sha256 = _sha256(f"{prompt}\0{gold}")
+    prompt_sha256 = _sha256(prompt)
     record_id = f"{source.id}@{source.revision}:{config}:{upstream_split}:{content_sha256[:16]}"
     source_sha256 = _source_row_sha256(row, source.fields)
     return CatalogRecord(
@@ -294,6 +326,7 @@ def normalize_math_row(
         gold=gold,
         record_id=record_id,
         content_sha256=content_sha256,
+        prompt_sha256=prompt_sha256,
         source_sha256=source_sha256,
         source=source.id,
         revision=source.revision,
@@ -326,6 +359,7 @@ def normalize_aime_row(
         raise ValueError(f"{source.id}/{config}/{upstream_split} has a non-integer AIME answer") from error
     prompt = canonical_text(INSTRUCTION + question)
     content_sha256 = _sha256(f"{prompt}\0{gold}")
+    prompt_sha256 = _sha256(prompt)
     record_id = f"{source.id}@{source.revision}:{config}:{upstream_split}:{content_sha256[:16]}"
     source_sha256 = _source_row_sha256(row, source.fields)
     return CatalogRecord(
@@ -334,6 +368,7 @@ def normalize_aime_row(
         gold=gold,
         record_id=record_id,
         content_sha256=content_sha256,
+        prompt_sha256=prompt_sha256,
         source_sha256=source_sha256,
         source=source.id,
         revision=source.revision,
@@ -373,19 +408,31 @@ def normalize_source_row(
 def build_catalog(records: Iterable[CatalogRecord]) -> tuple[CatalogRecord, ...]:
     ordered = tuple(sorted(records, key=lambda record: record.record_id))
     ids: dict[str, CatalogRecord] = {}
-    hashes: dict[str, CatalogRecord] = {}
+    content_hashes: dict[str, CatalogRecord] = {}
+    prompt_hashes: dict[str, CatalogRecord] = {}
     for record in ordered:
+        expected_prompt_hash = _sha256(record.prompt)
+        if record.prompt_sha256 != expected_prompt_hash:
+            raise ValueError(f"record {record.record_id!r} prompt hash does not match its presented prompt")
+        expected_content_hash = _sha256(f"{record.prompt}\0{record.gold}")
+        if record.content_sha256 != expected_content_hash:
+            raise ValueError(f"record {record.record_id!r} content hash does not match its prompt and gold")
         if previous := ids.get(record.record_id):
             raise ValueError(
                 f"duplicate record id {record.record_id!r}: "
                 f"{previous.source}/{previous.partition} and {record.source}/{record.partition}"
             )
-        if previous := hashes.get(record.content_sha256):
+        if previous := content_hashes.get(record.content_sha256):
             raise ValueError(
                 f"duplicate content hash {record.content_sha256}: {previous.record_id} and {record.record_id}"
             )
+        if previous := prompt_hashes.get(record.prompt_sha256):
+            raise ValueError(
+                f"duplicate prompt hash {record.prompt_sha256}: {previous.record_id} and {record.record_id}"
+            )
         ids[record.record_id] = record
-        hashes[record.content_sha256] = record
+        content_hashes[record.content_sha256] = record
+        prompt_hashes[record.prompt_sha256] = record
     return ordered
 
 
@@ -403,6 +450,11 @@ def validate_partition_disjointness(
     if overlap := train_hashes & eval_hashes:
         raise ValueError(f"train/eval content hash overlap: {sorted(overlap)[:3]}")
 
+    train_prompt_hashes = {record.prompt_sha256 for record in train}
+    eval_prompt_hashes = {record.prompt_sha256 for record in eval}
+    if overlap := train_prompt_hashes & eval_prompt_hashes:
+        raise ValueError(f"train/eval prompt hash overlap: {sorted(overlap)[:3]}")
+
 
 def select_records(
     records: Sequence[CatalogRecord],
@@ -419,25 +471,12 @@ def build_catalog_manifest(
     source_manifest: SourceManifest,
 ) -> dict[str, Any]:
     ordered = build_catalog(records)
-    entries = [
-        {
-            "record_id": record.record_id,
-            "content_sha256": record.content_sha256,
-            "source_sha256": record.source_sha256,
-            "source": record.source,
-            "revision": record.revision,
-            "config": record.config,
-            "upstream_split": record.upstream_split,
-            "partition": record.partition,
-            "tier": record.tier,
-            "level": record.level,
-        }
-        for record in ordered
-    ]
+    entries = [_catalog_manifest_entry(record) for record in ordered]
+    digest_entries = [{key: value for key, value in entry.items() if key != "prompt_sha256"} for entry in entries]
     return {
         "schema_version": CATALOG_MANIFEST_SCHEMA,
         "source_manifest_digest": source_manifest_digest(source_manifest),
-        "catalog_digest": _sha256(_canonical_json(entries)),
+        "catalog_digest": _sha256(_canonical_json(digest_entries)),
         "sources": [
             {
                 "id": source.id,
@@ -456,6 +495,102 @@ def build_catalog_manifest(
         },
         "ordered_records": entries,
     }
+
+
+def _catalog_manifest_entry(record: CatalogRecord) -> dict[str, Any]:
+    return {
+        "record_id": record.record_id,
+        "content_sha256": record.content_sha256,
+        "prompt_sha256": record.prompt_sha256,
+        "source_sha256": record.source_sha256,
+        "source": record.source,
+        "revision": record.revision,
+        "config": record.config,
+        "upstream_split": record.upstream_split,
+        "partition": record.partition,
+        "tier": record.tier,
+        "level": record.level,
+    }
+
+
+def catalog_digest(records: Sequence[CatalogRecord]) -> str:
+    entries = [
+        {key: value for key, value in _catalog_manifest_entry(record).items() if key != "prompt_sha256"}
+        for record in build_catalog(records)
+    ]
+    return _sha256(_canonical_json(entries))
+
+
+def catalog_contract_from_records(
+    records: Sequence[CatalogRecord],
+    source_manifest: SourceManifest,
+) -> CatalogContract:
+    ordered = build_catalog(records)
+    partitions = {record.partition for record in ordered}
+    if len(partitions) != 1:
+        raise ValueError(f"catalog contract requires one partition, got {sorted(partitions)}")
+    return CatalogContract(
+        total=len(ordered),
+        tier_counts={tier: sum(record.tier == tier for record in ordered) for tier in TIERS},
+        catalog_digest=catalog_digest(ordered),
+        source_manifest_digest=source_manifest_digest(source_manifest),
+        source_revisions={
+            source.id: source.revision
+            for source in source_manifest.sources
+            if next(iter(partitions)) in source.partitions
+        },
+    )
+
+
+def validate_catalog_records_contract(
+    records: Sequence[CatalogRecord],
+    *,
+    partition: Partition,
+    expected: CatalogContract,
+) -> tuple[CatalogRecord, ...]:
+    ordered = build_catalog(records)
+    if wrong_partitions := sorted({record.partition for record in ordered} - {partition}):
+        raise ValueError(f"{partition} catalog contains records from partitions {wrong_partitions}")
+    source_revisions: dict[str, str] = {}
+    for record in ordered:
+        if previous := source_revisions.get(record.source):
+            if previous != record.revision:
+                raise ValueError(f"{partition} catalog mixes revisions for source {record.source!r}")
+        source_revisions[record.source] = record.revision
+    actual_identity = {
+        "total": len(ordered),
+        "tier_counts": {tier: sum(record.tier == tier for record in ordered) for tier in TIERS},
+        "catalog_digest": catalog_digest(ordered),
+        "source_revisions": source_revisions,
+    }
+    expected_identity = {
+        "total": expected.total,
+        "tier_counts": dict(expected.tier_counts),
+        "catalog_digest": expected.catalog_digest,
+        "source_revisions": dict(expected.source_revisions),
+    }
+    if actual_identity != expected_identity:
+        raise ValueError(
+            f"{partition} catalog record contract drift: expected {expected_identity!r}, got {actual_identity!r}"
+        )
+    return ordered
+
+
+def validate_catalog_contract(
+    records: Sequence[CatalogRecord],
+    source_manifest: SourceManifest,
+    *,
+    partition: Partition,
+    expected: CatalogContract,
+) -> tuple[CatalogRecord, ...]:
+    ordered = validate_catalog_records_contract(records, partition=partition, expected=expected)
+    actual_manifest_digest = source_manifest_digest(source_manifest)
+    if actual_manifest_digest != expected.source_manifest_digest:
+        raise ValueError(
+            f"{partition} source manifest contract drift: "
+            f"expected {expected.source_manifest_digest}, got {actual_manifest_digest}"
+        )
+    return ordered
 
 
 def write_catalog_manifest(
