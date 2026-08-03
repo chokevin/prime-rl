@@ -354,6 +354,50 @@ def test_recovery_promotes_valid_fsynced_completion_stage(tmp_path, exact_config
     assert not paths.completion_staging.exists()
 
 
+@pytest.mark.parametrize(
+    ("window", "operation"),
+    [
+        ("before-promotion", "mutate"),
+        ("before-promotion", "swap"),
+        ("after-promotion", "mutate"),
+        ("after-promotion", "swap"),
+    ],
+)
+def test_recovery_binds_completion_promotion_to_validated_handle(
+    tmp_path,
+    exact_config_validator,
+    monkeypatch,
+    window,
+    operation,
+):
+    manifest = _manifest()
+    _evidence(tmp_path, manifest, exact_config_validator(manifest))
+    paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
+    original = paths.completion.read_bytes()
+    paths.completion.rename(paths.completion_staging)
+
+    def alter(path):
+        path = Path(path)
+        if operation == "mutate":
+            path.write_bytes(original + b" ")
+        else:
+            replacement = path.with_name(f"{path.name}.replacement")
+            replacement.write_bytes(original)
+            os.replace(replacement, path)
+
+    if window == "before-promotion":
+        monkeypatch.setattr(artifacts_module, "_before_completion_stage_promotion", alter)
+    else:
+        monkeypatch.setattr(artifacts_module, "_after_completion_stage_promotion", alter)
+
+    with pytest.raises(ValueError, match="completion"):
+        publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+
+    assert not paths.publication.exists()
+    assert not (tmp_path / "training-result.json").exists()
+    assert not (tmp_path / "final-adapter").exists()
+
+
 def test_recovery_removes_malformed_completion_stage_without_other_changes(tmp_path, exact_config_validator):
     manifest = _manifest()
     _evidence(tmp_path, manifest, exact_config_validator(manifest))
@@ -371,6 +415,51 @@ def test_recovery_removes_malformed_completion_stage_without_other_changes(tmp_p
     assert paths.resolved_config.read_bytes() == config_before
     assert not paths.publication.exists()
     assert not (tmp_path / "training-result.json").exists()
+
+
+@pytest.mark.parametrize("staged_payload", [b'{"status":"succ', b'{"not":"a completion attestation"}'])
+def test_recovery_with_valid_final_removes_malformed_stage_then_requires_retry(
+    tmp_path,
+    exact_config_validator,
+    staged_payload,
+):
+    manifest = _manifest()
+    _evidence(tmp_path, manifest, exact_config_validator(manifest))
+    paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
+    final_before = paths.completion.read_bytes()
+    paths.completion_staging.write_bytes(staged_payload)
+
+    with pytest.raises(ValueError, match="malformed staged completion was removed"):
+        publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+
+    assert paths.completion.read_bytes() == final_before
+    assert not paths.completion_staging.exists()
+    assert not paths.publication.exists()
+    recovered = publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+    assert recovered.attempt_id == ATTEMPT_1
+
+
+def test_recovery_with_valid_final_rejects_symlink_stage_without_following_or_removing_target(
+    tmp_path,
+    exact_config_validator,
+):
+    manifest = _manifest()
+    _evidence(tmp_path, manifest, exact_config_validator(manifest))
+    paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
+    target = tmp_path / "outside-stage-target.json"
+    target.write_bytes(paths.completion.read_bytes())
+    paths.completion_staging.symlink_to(target)
+
+    with pytest.raises(ValueError, match="unsafe staging path was not removed"):
+        publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+
+    assert paths.completion.is_file()
+    assert paths.completion_staging.is_symlink()
+    assert target.read_bytes() == paths.completion.read_bytes()
+    assert not paths.publication.exists()
+    paths.completion_staging.unlink()
+    recovered = publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+    assert recovered.attempt_id == ATTEMPT_1
 
 
 def test_recovery_removes_matching_stage_only_after_validating_final(tmp_path, exact_config_validator):
@@ -665,6 +754,77 @@ def test_supervisor_post_wait_cancellation_aborts_entire_transaction(
     assert not paths.publication_staging.exists()
     assert not (tmp_path / "training-result.json").exists()
     assert not (tmp_path / "final-adapter").exists()
+
+
+def test_later_cancelled_attempt_preserves_identical_adapter_owned_by_earlier_attempt(
+    tmp_path,
+    exact_config_validator,
+    monkeypatch,
+):
+    manifest = _manifest()
+    exact_config = exact_config_validator(manifest)
+    _, first_paths = _evidence(tmp_path, manifest, exact_config, attempt_id=ATTEMPT_1)
+    publish_training_result(**_publication_kwargs(tmp_path, manifest, ATTEMPT_1))
+    (tmp_path / "training-result.json").unlink()
+    adapter_inode = (tmp_path / "final-adapter").stat().st_ino
+    first_completion = first_paths.completion.read_bytes()
+    first_publication = first_paths.publication.read_bytes()
+    second_preflight, second_paths = _evidence(
+        tmp_path,
+        manifest,
+        exact_config,
+        attempt_id=ATTEMPT_2,
+        write_completion=False,
+    )
+    _install_fake_popen(monkeypatch, tmp_path, return_code=0)
+
+    def cancel_before_reusing_prior_adapter(**_kwargs):
+        signal.raise_signal(signal.SIGTERM)
+
+    monkeypatch.setattr(supervisor_module, "publish_training_result", cancel_before_reusing_prior_adapter)
+
+    with pytest.raises(SupervisorCancelled):
+        supervise_prepared_attempt(manifest=manifest, preflight=second_preflight)
+
+    assert (tmp_path / "final-adapter").stat().st_ino == adapter_inode
+    assert first_paths.completion.read_bytes() == first_completion
+    assert first_paths.publication.read_bytes() == first_publication
+    assert not second_paths.completion.exists()
+    assert not second_paths.publication.exists()
+
+
+def test_cancellation_after_publication_transfers_adapter_ownership_to_durable_evidence(
+    tmp_path,
+    exact_config_validator,
+    monkeypatch,
+):
+    manifest = _manifest()
+    preflight, paths = _evidence(
+        tmp_path,
+        manifest,
+        exact_config_validator(manifest),
+        write_completion=False,
+    )
+    _install_fake_popen(monkeypatch, tmp_path, return_code=0)
+    original_rename = artifacts_module._rename_noreplace
+
+    def cancel_after_publication_install(source, destination):
+        original_rename(source, destination)
+        if Path(destination) == paths.publication:
+            signal.raise_signal(signal.SIGTERM)
+
+    monkeypatch.setattr(artifacts_module, "_rename_noreplace", cancel_after_publication_install)
+
+    with pytest.raises(SupervisorCancelled):
+        supervise_prepared_attempt(manifest=manifest, preflight=preflight)
+
+    assert paths.completion.is_file()
+    assert paths.publication.is_file()
+    assert (tmp_path / "final-adapter").is_dir()
+    assert not (tmp_path / "training-result.json").exists()
+    monkeypatch.setattr(artifacts_module, "_rename_noreplace", original_rename)
+    recovered = publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
+    assert recovered.attempt_id == ATTEMPT_1
 
 
 @pytest.mark.parametrize(("signum", "expected_exit"), [(signal.SIGINT, 130), (signal.SIGTERM, 143)])

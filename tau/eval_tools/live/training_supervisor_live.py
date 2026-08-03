@@ -7,16 +7,18 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
 from tau.eval_tools.artifacts import (
     SOURCE_CONFIG_REL,
+    AdapterPublicationState,
     TrainingCompletionAttestation,
     TrainingPreflight,
     TrainingPublicationEvidence,
@@ -77,6 +79,7 @@ class SupervisorCancelled(InterruptedError):
 class _CancellationState:
     signum: int | None = None
     process: object | None = None
+    adapter_publication: AdapterPublicationState = field(default_factory=AdapterPublicationState)
 
     def handle_signal(self, signum: int, _frame: object) -> None:
         if self.signum is None:
@@ -107,7 +110,7 @@ def _supervisor_cancellation() -> Iterator[_CancellationState]:
         signum: signal.signal(signum, state.handle_signal) for signum in (signal.SIGINT, signal.SIGTERM)
     }
     try:
-        with _cancellation_scope(state.check):
+        with _cancellation_scope(state.check, state.adapter_publication):
             yield state
     finally:
         for signum, handler in previous_handlers.items():
@@ -385,46 +388,52 @@ def _write_completion_from_process(
     return attestation
 
 
-def _cleanup_cancelled_attempt(preflight: TrainingPreflight) -> None:
+def _remove_untransferred_adapter(adapter_state: AdapterPublicationState) -> None:
+    installation = adapter_state.installation
+    if installation is None or adapter_state.ownership_transferred:
+        return
+    final_adapter = installation.path
+    metadata = os.lstat(final_adapter)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_dev != installation.device
+        or metadata.st_ino != installation.inode
+    ):
+        raise ValueError("refusing to remove final adapter without its exact in-memory installation token")
+    for current, directories, files in os.walk(final_adapter):
+        current_path = Path(current)
+        for name in [*directories, *files]:
+            if (current_path / name).is_symlink():
+                raise ValueError("refusing to remove symlinked adapter installed by the failed transaction")
+        current_path.chmod(0o700)
+    shutil.rmtree(final_adapter)
+    fsync_directory(final_adapter.parent)
+    adapter_state.installation = None
+
+
+def _cleanup_cancelled_attempt(preflight: TrainingPreflight, adapter_state: AdapterPublicationState) -> None:
     paths = attempt_paths(preflight.artifact_output_dir, preflight.attempt_id, require_existing=True)
     result_path = Path(preflight.artifact_output_dir) / "training-result.json"
-    final_adapter = Path(preflight.artifact_output_dir) / "final-adapter"
-    owned_adapter_files = None
-    if os.path.lexists(result_path):
-        result = TrainingResult.load(result_path)
-        if result.attempt_id != preflight.attempt_id:
-            raise ValueError("refusing to remove another attempt's training result during cancellation")
-        owned_adapter_files = result.adapter_files
-        result_path.unlink()
-        fsync_directory(result_path.parent)
-    if os.path.lexists(paths.publication):
-        publication, _ = TrainingPublicationEvidence.load(paths.publication)
-        if publication.attempt_id != preflight.attempt_id:
-            raise ValueError("refusing to remove another attempt's publication during cancellation")
-        owned_adapter_files = publication.final_adapter_files
-        paths.publication.unlink()
-        fsync_directory(paths.directory)
-    if os.path.lexists(paths.completion):
-        completion, _ = TrainingCompletionAttestation.load(paths.completion)
-        if completion.attempt_id != preflight.attempt_id:
-            raise ValueError("refusing to remove another attempt's completion during cancellation")
-        if owned_adapter_files is None:
-            owned_adapter_files = completion.source_adapter_files
-        paths.completion.unlink()
-        fsync_directory(paths.directory)
-    if os.path.lexists(final_adapter) and owned_adapter_files is not None:
-        if final_adapter.is_symlink() or not final_adapter.is_dir():
-            raise ValueError("refusing to remove unsafe cancelled final adapter")
-        if build_file_manifest(final_adapter) != owned_adapter_files:
-            raise ValueError("refusing to remove final adapter not owned by the cancelled attempt")
-        for current, directories, files in os.walk(final_adapter):
-            current_path = Path(current)
-            for name in [*directories, *files]:
-                if (current_path / name).is_symlink():
-                    raise ValueError("refusing to remove symlinked cancelled final adapter")
-            current_path.chmod(0o700)
-        shutil.rmtree(final_adapter)
-        fsync_directory(final_adapter.parent)
+    if not adapter_state.ownership_transferred:
+        _remove_untransferred_adapter(adapter_state)
+        if os.path.lexists(result_path):
+            result = TrainingResult.load(result_path)
+            if result.attempt_id != preflight.attempt_id:
+                raise ValueError("refusing to remove another attempt's training result during cancellation")
+            result_path.unlink()
+            fsync_directory(result_path.parent)
+        if os.path.lexists(paths.publication):
+            publication, _ = TrainingPublicationEvidence.load(paths.publication)
+            if publication.attempt_id != preflight.attempt_id:
+                raise ValueError("refusing to remove another attempt's publication during cancellation")
+            paths.publication.unlink()
+            fsync_directory(paths.directory)
+        if os.path.lexists(paths.completion):
+            completion, _ = TrainingCompletionAttestation.load(paths.completion)
+            if completion.attempt_id != preflight.attempt_id:
+                raise ValueError("refusing to remove another attempt's completion during cancellation")
+            paths.completion.unlink()
+            fsync_directory(paths.directory)
     _remove_owned_json_staging(
         paths.completion_staging,
         expected_name=".completion.json.stage",
@@ -438,6 +447,11 @@ def _cleanup_recovery_staging(output_dir: Path, attempt_id: str) -> None:
         paths.completion_staging,
         expected_name=".completion.json.stage",
     )
+    _remove_owned_staging(paths.publication_staging, attempt_id)
+
+
+def _cleanup_publication_staging(output_dir: Path, attempt_id: str) -> None:
+    paths = attempt_paths(output_dir, attempt_id, require_existing=True)
     _remove_owned_staging(paths.publication_staging, attempt_id)
 
 
@@ -457,10 +471,14 @@ def supervise_prepared_attempt(
             )
         except SupervisorCancelled as error:
             try:
-                _cleanup_cancelled_attempt(preflight)
+                _cleanup_cancelled_attempt(preflight, cancellation.adapter_publication)
             except Exception as cleanup_error:
                 error.add_note(f"cancelled-attempt cleanup failed: {cleanup_error}")
                 raise error from cleanup_error
+            raise
+        except Exception:
+            _remove_untransferred_adapter(cancellation.adapter_publication)
+            _cleanup_publication_staging(preflight.artifact_output_dir, preflight.attempt_id)
             raise
 
 
@@ -531,13 +549,15 @@ def _supervise_prepared_attempt(
         expected_rank=expected_rank,
     )
     cancellation.check()
-    return publish_training_result(
+    result = publish_training_result(
         output_dir=Path(preflight.artifact_output_dir),
         manifest=manifest,
         attempt_id=preflight.attempt_id,
         expected_step=manifest.rl_config.max_steps,
         expected_rank=expected_rank,
     )
+    cancellation.check()
+    return result
 
 
 def run_training_attempt(
@@ -590,7 +610,7 @@ def run_training_attempt(
         except SupervisorCancelled as error:
             try:
                 if preflight is not None:
-                    _cleanup_cancelled_attempt(preflight)
+                    _cleanup_cancelled_attempt(preflight, cancellation.adapter_publication)
                 else:
                     paths = attempt_paths(artifact_output_dir, attempt_id, require_existing=True)
                     _remove_owned_json_staging(
@@ -601,6 +621,11 @@ def run_training_attempt(
             except Exception as cleanup_error:
                 error.add_note(f"cancelled-attempt cleanup failed: {cleanup_error}")
                 raise error from cleanup_error
+            raise
+        except Exception:
+            _remove_untransferred_adapter(cancellation.adapter_publication)
+            if preflight is not None:
+                _cleanup_publication_staging(artifact_output_dir, attempt_id)
             raise
         finally:
             if os.path.lexists(run_root):
@@ -634,6 +659,10 @@ def recover_publish(
             except Exception as cleanup_error:
                 error.add_note(f"recovery staging cleanup failed: {cleanup_error}")
                 raise error from cleanup_error
+            raise
+        except Exception:
+            _remove_untransferred_adapter(cancellation.adapter_publication)
+            _cleanup_publication_staging(artifact_output_dir, attempt_id)
             raise
 
 

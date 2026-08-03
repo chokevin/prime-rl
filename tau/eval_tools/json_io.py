@@ -21,6 +21,10 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def parse_json_bytes(raw: bytes) -> Any:
+    return json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+
+
 def load_json_with_sha256(path: Path) -> tuple[Any, str]:
     path = Path(os.path.abspath(path))
     current = Path(path.anchor)
@@ -50,7 +54,7 @@ def load_json_with_sha256(path: Path) -> tuple[Any, str]:
     finally:
         os.close(descriptor)
     raw = b"".join(chunks)
-    payload = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    payload = parse_json_bytes(raw)
     return payload, hashlib.sha256(raw).hexdigest()
 
 

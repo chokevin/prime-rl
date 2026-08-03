@@ -17,7 +17,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from tau.eval_tools.json_io import fsync_directory, load_json_with_sha256, write_json_exclusive
+from tau.eval_tools.json_io import fsync_directory, load_json_with_sha256, parse_json_bytes, write_json_exclusive
 from tau.eval_tools.manifest import (
     FileManifest,
     FrozenEvalManifest,
@@ -40,19 +40,62 @@ _CANCELLATION_CHECK: ContextVar[Callable[[], None] | None] = ContextVar(
 )
 
 
+@dataclass(frozen=True)
+class AdapterInstallationToken:
+    path: Path
+    device: int
+    inode: int
+
+
+@dataclass
+class AdapterPublicationState:
+    installation: AdapterInstallationToken | None = None
+    ownership_transferred: bool = False
+
+
+_ADAPTER_PUBLICATION_STATE: ContextVar[AdapterPublicationState | None] = ContextVar(
+    "adapter_publication_state",
+    default=None,
+)
+
+
 @contextmanager
-def _cancellation_scope(check: Callable[[], None]) -> Iterator[None]:
-    token = _CANCELLATION_CHECK.set(check)
+def _cancellation_scope(check: Callable[[], None], adapter_state: AdapterPublicationState) -> Iterator[None]:
+    cancellation_token = _CANCELLATION_CHECK.set(check)
+    adapter_token = _ADAPTER_PUBLICATION_STATE.set(adapter_state)
     try:
         yield
     finally:
-        _CANCELLATION_CHECK.reset(token)
+        _ADAPTER_PUBLICATION_STATE.reset(adapter_token)
+        _CANCELLATION_CHECK.reset(cancellation_token)
 
 
 def _check_cancelled() -> None:
     check = _CANCELLATION_CHECK.get()
     if check is not None:
         check()
+
+
+def _record_adapter_installation(path: Path) -> None:
+    state = _ADAPTER_PUBLICATION_STATE.get()
+    if state is None:
+        return
+    if state.installation is not None:
+        raise RuntimeError("adapter installation ownership was already recorded")
+    metadata = os.lstat(path)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("installed final adapter must be a regular directory")
+    state.installation = AdapterInstallationToken(
+        path=Path(path),
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+    )
+
+
+def _transfer_adapter_ownership() -> None:
+    state = _ADAPTER_PUBLICATION_STATE.get()
+    if state is not None and state.installation is not None:
+        state.ownership_transferred = True
 
 
 @dataclass(frozen=True)
@@ -586,10 +629,43 @@ def _remove_owned_staging(path: Path, attempt_id: str) -> None:
 def _remove_owned_json_staging(path: Path, *, expected_name: str) -> None:
     if not os.path.lexists(path):
         return
-    if path.name != expected_name or path.is_symlink() or not path.is_file():
+    if (
+        path.name != expected_name
+        or not ATTEMPT_ID_RE.fullmatch(path.parent.name)
+        or path.parent.parent.name != "attempts"
+    ):
         raise ValueError(f"refusing to remove unsafe JSON staging path: {path}")
-    path.unlink()
-    fsync_directory(path.parent)
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    parent_descriptor = os.open(path.parent, directory_flags)
+    try:
+        pathname_metadata = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if not stat.S_ISREG(pathname_metadata.st_mode):
+            raise ValueError(f"refusing to remove unsafe JSON staging path: {path}")
+        file_flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            file_flags |= os.O_NOFOLLOW
+        descriptor = os.open(path.name, file_flags, dir_fd=parent_descriptor)
+        try:
+            opened_metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened_metadata.st_mode)
+                or opened_metadata.st_dev != pathname_metadata.st_dev
+                or opened_metadata.st_ino != pathname_metadata.st_ino
+            ):
+                raise RuntimeError(f"JSON staging path changed while being opened: {path}")
+            current_metadata = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if current_metadata.st_dev != opened_metadata.st_dev or current_metadata.st_ino != opened_metadata.st_ino:
+                raise RuntimeError(f"JSON staging path changed before removal: {path}")
+            os.unlink(path.name, dir_fd=parent_descriptor)
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_descriptor)
 
 
 def _rename_noreplace(source: Path, destination: Path) -> None:
@@ -627,7 +703,13 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
     raise OSError(error, os.strerror(error), destination)
 
 
-def _write_json_staged_noreplace(*, final_path: Path, staging_path: Path, payload: dict) -> None:
+def _write_json_staged_noreplace(
+    *,
+    final_path: Path,
+    staging_path: Path,
+    payload: dict,
+    on_installed: Callable[[], None] | None = None,
+) -> None:
     final_path = Path(final_path)
     staging_path = Path(staging_path)
     _check_cancelled()
@@ -646,20 +728,83 @@ def _write_json_staged_noreplace(*, final_path: Path, staging_path: Path, payloa
     _check_cancelled()
     _rename_noreplace(staging_path, final_path)
     fsync_directory(final_path.parent)
+    if on_installed is not None:
+        on_installed()
     _check_cancelled()
 
 
-def _fsync_regular_file(path: Path) -> None:
+@dataclass(frozen=True)
+class _CompletionEvidenceSnapshot:
+    raw: bytes
+    digest: str
+    attestation: TrainingCompletionAttestation
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+@contextmanager
+def _open_completion_evidence(path: Path) -> Iterator[_CompletionEvidenceSnapshot]:
+    path = Path(path)
+    pathname_metadata = os.lstat(path)
+    if not stat.S_ISREG(pathname_metadata.st_mode):
+        raise ValueError(f"completion evidence path must be a regular non-symlink file: {path}")
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(path, flags)
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ValueError(f"staged evidence must be a regular file: {path}")
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"completion evidence must be a regular file: {path}")
+        if (before.st_dev, before.st_ino) != (pathname_metadata.st_dev, pathname_metadata.st_ino):
+            raise RuntimeError(f"completion evidence path changed while being opened: {path}")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        metadata = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != metadata:
+            raise RuntimeError(f"completion evidence changed while being read: {path}")
+        raw = b"".join(chunks)
+        attestation = TrainingCompletionAttestation.model_validate(parse_json_bytes(raw))
         os.fsync(descriptor)
+        yield _CompletionEvidenceSnapshot(
+            raw=raw,
+            digest=hashlib.sha256(raw).hexdigest(),
+            attestation=attestation,
+            device=after.st_dev,
+            inode=after.st_ino,
+            size=after.st_size,
+            mtime_ns=after.st_mtime_ns,
+            ctime_ns=after.st_ctime_ns,
+        )
     finally:
         os.close(descriptor)
+
+
+def _require_snapshot_path(path: Path, snapshot: _CompletionEvidenceSnapshot) -> None:
+    metadata = os.lstat(path)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"completion staging path is no longer a regular file: {path}")
+    if (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns) != (
+        snapshot.device,
+        snapshot.inode,
+        snapshot.size,
+        snapshot.mtime_ns,
+        snapshot.ctime_ns,
+    ):
+        raise RuntimeError("completion staging path changed after handle-bound validation")
+
+
+def _before_completion_stage_promotion(_path: Path) -> None:
+    pass
+
+
+def _after_completion_stage_promotion(_path: Path) -> None:
+    pass
 
 
 def _load_attempt_evidence(
@@ -670,6 +815,7 @@ def _load_attempt_evidence(
     expected_step: int,
     expected_rank: int,
     completion_path: Path | None = None,
+    completion_evidence: tuple[TrainingCompletionAttestation, str] | None = None,
 ) -> tuple[
     AttemptPaths,
     TrainingPreflight,
@@ -688,7 +834,10 @@ def _load_attempt_evidence(
         raise ValueError("attempt run output must be the fixed canonical directory")
     preflight_payload, preflight_sha256 = load_json_with_sha256(paths.preflight)
     preflight = TrainingPreflight.model_validate(preflight_payload)
-    attestation, attestation_sha256 = TrainingCompletionAttestation.load(completion_path or paths.completion)
+    if completion_evidence is None:
+        attestation, attestation_sha256 = TrainingCompletionAttestation.load(completion_path or paths.completion)
+    else:
+        attestation, attestation_sha256 = completion_evidence
     if preflight.attempt_id != attempt_id or attestation.attempt_id != attempt_id:
         raise ValueError("attempt evidence IDs do not match the requested attempt")
     output_dir = Path(output_dir).resolve(strict=True)
@@ -802,14 +951,29 @@ def _load_or_recover_attempt_evidence(
         )
         _check_cancelled()
         if stage_exists:
-            staged_evidence = _load_attempt_evidence(
-                output_dir=output_dir,
-                manifest=manifest,
-                attempt_id=attempt_id,
-                expected_step=expected_step,
-                expected_rank=expected_rank,
-                completion_path=paths.completion_staging,
-            )
+            try:
+                with _open_completion_evidence(paths.completion_staging) as staged_snapshot:
+                    staged_evidence = _load_attempt_evidence(
+                        output_dir=output_dir,
+                        manifest=manifest,
+                        attempt_id=attempt_id,
+                        expected_step=expected_step,
+                        expected_rank=expected_rank,
+                        completion_evidence=(staged_snapshot.attestation, staged_snapshot.digest),
+                    )
+            except Exception as error:
+                try:
+                    _remove_owned_json_staging(
+                        paths.completion_staging,
+                        expected_name=".completion.json.stage",
+                    )
+                except Exception as cleanup_error:
+                    raise ValueError(
+                        "final completion is valid but its unsafe staging path was not removed"
+                    ) from cleanup_error
+                raise ValueError(
+                    "final completion is valid; malformed staged completion was removed and recovery must be retried"
+                ) from error
             _check_cancelled()
             if staged_evidence[3] != final_evidence[3] or staged_evidence[4] != final_evidence[4]:
                 raise ValueError("staged completion attestation does not match finalized completion evidence")
@@ -830,29 +994,55 @@ def _load_or_recover_attempt_evidence(
         )
 
     _check_cancelled()
+    promoted = False
     try:
-        staged_evidence = _load_attempt_evidence(
-            output_dir=output_dir,
-            manifest=manifest,
-            attempt_id=attempt_id,
-            expected_step=expected_step,
-            expected_rank=expected_rank,
-            completion_path=paths.completion_staging,
-        )
+        with _open_completion_evidence(paths.completion_staging) as staged_snapshot:
+            staged_evidence = _load_attempt_evidence(
+                output_dir=output_dir,
+                manifest=manifest,
+                attempt_id=attempt_id,
+                expected_step=expected_step,
+                expected_rank=expected_rank,
+                completion_evidence=(staged_snapshot.attestation, staged_snapshot.digest),
+            )
+            _check_cancelled()
+            _before_completion_stage_promotion(paths.completion_staging)
+            _require_snapshot_path(paths.completion_staging, staged_snapshot)
+            _check_cancelled()
+            _rename_noreplace(paths.completion_staging, paths.completion)
+            promoted = True
+            fsync_directory(paths.directory)
+            _after_completion_stage_promotion(paths.completion)
+            with _open_completion_evidence(paths.completion) as final_snapshot:
+                if (
+                    final_snapshot.raw != staged_snapshot.raw
+                    or final_snapshot.digest != staged_snapshot.digest
+                    or final_snapshot.attestation != staged_snapshot.attestation
+                    or (final_snapshot.device, final_snapshot.inode) != (staged_snapshot.device, staged_snapshot.inode)
+                ):
+                    raise RuntimeError("promoted completion evidence does not match its validated staging handle")
+                final_evidence = _load_attempt_evidence(
+                    output_dir=output_dir,
+                    manifest=manifest,
+                    attempt_id=attempt_id,
+                    expected_step=expected_step,
+                    expected_rank=expected_rank,
+                    completion_evidence=(final_snapshot.attestation, final_snapshot.digest),
+                )
+            if final_evidence != staged_evidence:
+                raise RuntimeError("promoted completion validation changed after atomic installation")
     except Exception as error:
-        _remove_owned_json_staging(
-            paths.completion_staging,
-            expected_name=".completion.json.stage",
-        )
+        if not promoted:
+            _remove_owned_json_staging(
+                paths.completion_staging,
+                expected_name=".completion.json.stage",
+            )
         _check_cancelled()
+        if promoted:
+            raise ValueError("promoted completion attestation failed strict handle-bound reload") from error
         raise ValueError("staged completion attestation is incomplete or invalid") from error
     _check_cancelled()
-    _fsync_regular_file(paths.completion_staging)
-    _check_cancelled()
-    _rename_noreplace(paths.completion_staging, paths.completion)
-    fsync_directory(paths.directory)
-    _check_cancelled()
-    return staged_evidence
+    return final_evidence
 
 
 def publish_training_result(
@@ -944,6 +1134,7 @@ def publish_training_result(
             raise RuntimeError(f"staged adapter digest {staged_digest} does not match source digest {source_digest}")
         _check_cancelled()
         _rename_noreplace(staged_adapter, final_adapter)
+        _record_adapter_installation(final_adapter)
         fsync_directory(output_dir)
         _check_cancelled()
         published_digest = validate_adapter_directory(final_adapter, expected_rank=expected_rank)
@@ -977,6 +1168,7 @@ def publish_training_result(
             final_path=paths.publication,
             staging_path=staging / paths.publication.name,
             payload=publication.model_dump(),
+            on_installed=_transfer_adapter_ownership,
         )
         _check_cancelled()
         _, publication_sha256 = load_json_with_sha256(paths.publication)

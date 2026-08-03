@@ -291,8 +291,12 @@ then removes only that attempt's stale staging and completes atomic publication 
 launching RL. This includes the adapter-installed/publication-not-yet-installed
 interruption point. It also accepts an fsynced `.completion.json.stage` only when
 `completion.json` is absent and the staged attestation passes the same full validation,
-then atomically promotes it without replacement. A malformed stage is removed and fails;
-when both names exist, the strict-valid final wins only if the stage matches exactly.
+then atomically promotes it without replacement. Validation, fsync, and promotion remain
+bound to one no-follow regular-file handle and captured inode; the installed final is
+strict-reopened and must reproduce the exact bytes, digest, object, and inode before
+publication. A malformed regular stage is removed and fails once; when both names exist,
+the strict-valid final wins only if the stage matches exactly. An unsafe symlink stage is
+never followed or removed.
 A malformed final publication fails rather than being replaced. A
 different attempt can reuse an exactly matching installed adapter only through this
 explicit recovery command; normal training fails. A mismatched/reused ID fails, and an
@@ -304,9 +308,11 @@ supervisor owns a new RL process group, forwards the same signal to that entire 
 waits/reaps it, and keeps the handlers active through all post-wait validation and
 publication. A signal at any point before the fixed result is complete aborts as 143/130,
 cleans only the current attempt's staging/success evidence (including a content-verified
-adapter installed by that attempt), and cannot create later publication or result evidence.
-Cancellation remains failure even if the child reports zero; the next normal submission
-receives a fresh attempt ID.
+adapter only when an in-memory inode token proves this invocation installed it), and cannot
+create later publication or result evidence. A verified adapter reused from an earlier
+attempt is never considered owned. Durable publication transfers ownership, so later
+cancellation preserves the adapter and recovery evidence. Cancellation remains failure
+even if the child reports zero; the next normal submission receives a fresh attempt ID.
 
 Every fetch above names an explicit `--artifact <file>` rather than listing the output
 directory: W1's storage proof found directory listing on `blob-training` unreliable
@@ -438,7 +444,7 @@ output):
   field-by-field against `packages/prime-rl-configs/src/prime_rl/configs/{rl,orchestrator,trainer}.py`.
 - `PYTHONPATH=.:src uv run --no-project` with editable `prime-rl-configs`,
   `verifiers`, `math-env-v1`, and `math500-v1`, then
-  `pytest -q tau/eval_tools/tests` — 105 tests covering content manifests,
+  `pytest -q tau/eval_tools/tests` — 114 tests covering content manifests,
   path/symlink rejection, ordered train identity, immutable attempt/process evidence,
   a non-mocked real-`RLConfig` TOML round trip, fixed bootstrap, cancellation, and
   retry/recovery-safe atomic publication.
