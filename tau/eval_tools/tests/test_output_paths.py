@@ -1,7 +1,9 @@
+import os
 from pathlib import Path
 
 import pytest
 
+from tau.eval_tools.live.inference_launcher_live import open_inference_log
 from tau.eval_tools.output_paths import (
     evidence_generation,
     expected_output_path,
@@ -287,6 +289,42 @@ def test_prepare_output_directory_preserves_existing_artifacts(tmp_path):
     assert rewards.read_bytes() == b"immutable"
 
 
+def test_inference_log_is_created_exclusively_and_remains_bound_to_open_descriptor(tmp_path):
+    output_dir = tmp_path / "eval-baseline"
+    output_dir.mkdir()
+    descriptor = open_inference_log(output_dir)
+    os.write(descriptor, b"ready\n")
+    replacement = output_dir / "replacement.log"
+    (output_dir / "inference.log").rename(replacement)
+    (output_dir / "inference.log").write_bytes(b"replacement")
+    os.write(descriptor, b"running\n")
+    os.close(descriptor)
+
+    assert replacement.read_bytes() == b"ready\nrunning\n"
+    assert (output_dir / "inference.log").read_bytes() == b"replacement"
+    with pytest.raises(FileExistsError):
+        open_inference_log(output_dir)
+
+
+@pytest.mark.parametrize("dangling", [False, True])
+def test_inference_log_rejects_symlink_without_touching_target(tmp_path, dangling):
+    output_dir = tmp_path / "eval-baseline"
+    output_dir.mkdir()
+    target = tmp_path / "external.log"
+    if not dangling:
+        target.write_bytes(b"external")
+    (output_dir / "inference.log").symlink_to(target)
+
+    with pytest.raises(FileExistsError):
+        open_inference_log(output_dir)
+
+    if dangling:
+        assert not target.exists()
+    else:
+        assert target.read_bytes() == b"external"
+    assert (output_dir / "inference.log").is_symlink()
+
+
 def test_wrapper_passes_verified_source_and_prepares_generation_before_mode_first_use():
     script = (Path(__file__).parents[2] / "scripts/run-prime-rl.sh").read_text()
     verified = script.index('[ "$resolved_sha" = "$PRIME_RL_REPO_SHA" ]')
@@ -294,10 +332,10 @@ def test_wrapper_passes_verified_source_and_prepares_generation_before_mode_firs
     source_argument = script.index('--source-revision "$resolved_sha"', prepare)
     dispatch = script.index('case "$PRIME_RL_RUN_MODE" in', source_argument)
     finalize_train_path = script.index('--output-dir "${GENERATION_ROOT}/train"', dispatch)
-    inference_redirect = script.index('>"${TAU_OUTPUT_DIR}/inference.log"', dispatch)
+    inference_launcher = script.index("tau.eval_tools.live.inference_launcher_live", dispatch)
     training_supervisor = script.index("tau.eval_tools.live.training_supervisor_live run", dispatch)
 
     assert verified < prepare < source_argument < dispatch
     assert dispatch < finalize_train_path
-    assert dispatch < inference_redirect
+    assert dispatch < inference_launcher
     assert dispatch < training_supervisor

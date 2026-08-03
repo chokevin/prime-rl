@@ -353,9 +353,10 @@ eval)
     rewards_path="${TAU_OUTPUT_DIR}/rewards.json"
     if [ "${PRIME_RL_COMPARE_ONLY:-0}" != "1" ]; then
         [ ! -e "$rewards_path" ] || die "${rewards_path} already exists; reward evidence is immutable"
-        [ ! -e "${TAU_OUTPUT_DIR}/inference.log" ] || die "${TAU_OUTPUT_DIR}/inference.log already exists"
         log "starting inference server: uv run inference ${inference_args[*]}"
-        uv run --no-sync inference "${inference_args[@]}" >"${TAU_OUTPUT_DIR}/inference.log" 2>&1 &
+        uv run --no-sync python -m tau.eval_tools.live.inference_launcher_live \
+            --output-dir "$TAU_OUTPUT_DIR" -- \
+            uv run --no-sync inference "${inference_args[@]}" &
         CHILD_PID=$!
 
         wait_for_health "http://localhost:8000/health" "${PRIME_RL_HEALTH_TIMEOUT_S:-1800}"
