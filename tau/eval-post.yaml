@@ -10,8 +10,9 @@
 #
 # Training publishes the exact bounded final-step rank-16 adapter to the fixed
 # final-adapter path and records its source step/hash in training-result.json. This
-# target strict-loads the preflight, completion attestation, resolved config, result, and
-# adapter hashes before making a private adapter copy and loading it.
+# target derives the attempt from training-result.json, strict-loads its preflight,
+# completion attestation, resolved config, publication evidence, and adapter hashes,
+# then makes a private adapter copy before loading it.
 name: prime-rl-math-7b-h200-eval-post
 engine: job
 entrypoint: scripts/run-prime-rl.sh
@@ -31,11 +32,8 @@ runtime:
     PRIME_RL_MANIFEST_PATH: /data/pretraining-data/prime-rl-math-7b-h200/manifest/frozen-eval-manifest.json
     PRIME_RL_BASELINE_REWARDS_PATH: /data/pretraining-data/prime-rl-math-7b-h200/eval-baseline/rewards.json
     PRIME_RL_TRAINING_RESULT_PATH: /data/pretraining-data/prime-rl-math-7b-h200/train/training-result.json
-    PRIME_RL_TRAINING_PREFLIGHT_PATH: /data/pretraining-data/prime-rl-math-7b-h200/train/training-preflight.json
-    PRIME_RL_TRAINING_COMPLETION_PATH: /data/pretraining-data/prime-rl-math-7b-h200/train/training-completion.json
-    PRIME_RL_TRAINING_CONFIG_PATH: /data/pretraining-data/prime-rl-math-7b-h200/train/training-resolved.toml
+    PRIME_RL_TRAINING_OUTPUT_DIR: /data/pretraining-data/prime-rl-math-7b-h200/train
     PRIME_RL_LORA_ADAPTER_PATH: /data/pretraining-data/prime-rl-math-7b-h200/train/final-adapter
-    PRIME_RL_FINAL_STEP: "50"
     # Comparison-only retries must set PRIME_RL_COMPARE_ONLY=1 and an unused exact
     # PRIME_RL_COMPARISON_OUTPUT_PATH under this target's output directory.
     PRIME_RL_HEALTH_TIMEOUT_S: "1800"

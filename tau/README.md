@@ -26,14 +26,15 @@ tau/
     hashing.py
     json_io.py             # duplicate-key rejection + exclusive JSON evidence writes
     manifest.py
-    artifacts.py           # fixed smoke/training evidence and adapter handoff
+    artifacts.py           # attempt-scoped evidence, atomic publication, adapter handoff
     compare.py
     cli.py
     tests/                 # focused pytest cases, no GPU/network required
     live/                   # GPU-container-only: real dataset/model/inference-server scripts
       freeze_manifest_live.py
       run_frozen_eval_live.py
-      validate_training_data_live.py
+      validate_training_data_live.py # canonical resolved-config parser/identity
+      training_supervisor_live.py    # owns private inputs, RL child, attestation, publication
 configs/tau/math-7b-h200/
   train.toml             # derived from configs/basic/hendrycks-sanity/rl.toml
 ```
@@ -74,9 +75,9 @@ curl -sD - -o /dev/null --oauth2-bearer "$TOKEN" \
 The manifest's `org.opencontainers.image.revision` annotation is
 `bbb90a1b4132c351cbe8b0ed1fa808dde99f0318` — exactly this branch's merge-base commit (the
 sync branch's tree is byte-identical to upstream `bbb90a1b4`; see the `/goal` plan's
-Baseline section). So the baked `/app/.venv` already satisfies this branch's locked
-dependencies for any commit that only adds TOML/scripts/docs, which is everything on
-this branch so far.
+Baseline section). The overlay changes code/config only and does not change
+`pyproject.toml` or `uv.lock`, so the baked `/app/.venv` still satisfies the exact locked
+dependency set.
 
 **Why a pin file + render step instead of hardcoding the digest 5×:** every checked-in
 `tau/*.yaml` carries the sentinel `RENDER_REQUIRED__see_tau/render_image.py` instead of
@@ -107,7 +108,7 @@ byte-for-byte. This is deliberately narrower than the base image's own built-in
 `docker-entrypoint.sh` override path (`PRIME_RL_REF`/`PRIME_RL_REPO` env vars), which
 re-seeds a venv and runs `uv sync --inexact --all-packages ...` — correct for a commit
 that *does* change dependencies, but heavier than this branch needs. If a future commit
-on this branch adds a Python dependency, switch to that built-in mechanism (or add an
+adds a Python dependency, switch to that built-in mechanism (or add an
 explicit `uv sync --inexact` step to this wrapper) instead of silently going stale.
 
 **Narrow package-install escape hatch:** W4c may set
@@ -161,10 +162,10 @@ Derived from `configs/basic/hendrycks-sanity/rl.toml` per the W2 selection memo:
 | `[orchestrator.eval]` | `math500-v1`, all 500 examples, `group_size=1`, `interval=25` with `max_steps=50` | in-run startup(step 0)/periodic(25)/final(50) eval — a monitoring signal only, **not** the frozen comparison of record |
 
 `max_steps = 50` is a placeholder pending a real throughput measurement (see "What is
-not proven yet"). `runtime.env.PRIME_RL_MAX_STEPS` is required and passed as
-`--max-steps`; it also identifies the one source-proven final checkpoint path
-`weights/step_<N>/lora_adapters`. `eval-post.yaml`'s `PRIME_RL_FINAL_STEP` must match.
-The handoff never enumerates a storage directory.
+not proven yet"). Finalization binds it in the canonical config identity. Training and
+post-eval derive the one source-proven final checkpoint path
+`weights/step_<max_steps>/lora_adapters` from that frozen identity; there is no runtime
+step override. The handoff never enumerates a storage directory.
 
 ## Frozen eval manifest and the paired comparison gate
 
@@ -193,9 +194,13 @@ The handoff never enumerates a storage directory.
   `3ed63f49541bdca4382fba28146aadf20d95cb38` beneath a fresh owned
   `/tmp/prime-rl-run-<nonce>/`. It verifies hashes after copying regular files, removes
   write permission, and writes completion markers last. RL consumes only the exact
-  private dataset/config/model paths. After RL exits zero, `training-completion.json`
-  attests its PID, times, preflight/config digests, output path, and fixed final step.
-  Publication strict-loads that evidence and writes `training-result.json` last.
+  private dataset/config/model paths. One Python supervisor creates and logs a durable
+  attempt ID, launches the exact `uv run --no-sync rl @ <private-config>` child, streams
+  its output, captures its real PID/times/return code, and writes
+  `attempts/<attempt-id>/completion.json` only after a zero exit and a verified fixed
+  `STABLE` checkpoint. Publication re-parses the durable resolved TOML through the full
+  canonical config validator, recomputes its identity, verifies all attempt evidence,
+  and writes fixed `training-result.json` last.
 
 ### Proof ladder (in order)
 
@@ -235,18 +240,21 @@ tau run --config tau/.rendered/freeze-manifest.yaml --context aks-ai-runtime-eas
 tau run get prime-rl-math-7b-h200-freeze-manifest -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact frozen-eval-manifest.json
 
-# 5. Train (2 GPU) — strict manifest/data/model/config validation runs immediately before RL.
+# 5. Train (2 GPU). Save the exact attempt_id printed by the supervisor in Tau logs.
 tau run --config tau/.rendered/train.yaml --context aks-ai-runtime-eastus2-admin
+tau run logs prime-rl-math-7b-h200-train -n pretraining-data \
+  --context aks-ai-runtime-eastus2-admin | grep '\[training-supervisor\] attempt_id='
+ATTEMPT_ID='<copy-the-exact-logged-id>'
 tau run get prime-rl-math-7b-h200-train -n pretraining-data \
-  --context aks-ai-runtime-eastus2-admin --artifact training-preflight.json
+  --context aks-ai-runtime-eastus2-admin --artifact "attempts/${ATTEMPT_ID}/preflight.json"
 tau run get prime-rl-math-7b-h200-train -n pretraining-data \
-  --context aks-ai-runtime-eastus2-admin --artifact training-completion.json
+  --context aks-ai-runtime-eastus2-admin --artifact "attempts/${ATTEMPT_ID}/completion.json"
 tau run get prime-rl-math-7b-h200-train -n pretraining-data \
-  --context aks-ai-runtime-eastus2-admin --artifact training-resolved.toml
+  --context aks-ai-runtime-eastus2-admin --artifact "attempts/${ATTEMPT_ID}/resolved-train.toml"
 tau run get prime-rl-math-7b-h200-train -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact training-result.json
 tau run get prime-rl-math-7b-h200-train -n pretraining-data \
-  --context aks-ai-runtime-eastus2-admin --artifact metrics.jsonl
+  --context aks-ai-runtime-eastus2-admin --artifact "attempts/${ATTEMPT_ID}/run-output/metrics.jsonl"
 
 # 6. Post-training eval + comparison (1 GPU) — consumes only the fixed verified
 #    all fixed training evidence, then copies train/final-adapter into job-private
@@ -258,14 +266,34 @@ tau run get prime-rl-math-7b-h200-eval-post -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact comparison.json
 ```
 
+If a job is interrupted **before** `completion.json`, submit the unchanged train target
+again. The supervisor creates a new attempt ID and ignores stale attempt evidence; it
+never reuses or enumerates attempts. If interruption occurs **after** the logged
+attempt's `completion.json` was durably written but before `training-result.json`, do not
+rerun RL. Use the exact logged ID to recover publication:
+
+```bash
+uv run --no-sync python -m tau.eval_tools.cli recover-publish \
+  --manifest /data/pretraining-data/prime-rl-math-7b-h200/manifest/frozen-eval-manifest.json \
+  --output-dir /data/pretraining-data/prime-rl-math-7b-h200/train \
+  --attempt-id "$ATTEMPT_ID"
+```
+
+Run that command only in the same pinned image/overlay with `blob-training` mounted.
+It derives exact paths from the supplied ID, strict-verifies the existing preflight,
+canonical resolved TOML, real-process attestation, STABLE marker, and adapter hashes,
+then completes atomic publication without launching RL. A mismatched/reused ID fails,
+and an existing fixed `training-result.json` prevents a normal training rerun.
+
 Every fetch above names an explicit `--artifact <file>` rather than listing the output
 directory: W1's storage proof found directory listing on `blob-training` unreliable
 (exact-file write/fetch/re-fetch passed; listing did not), so every script in this
 implementation writes its results to a fixed, predictable filename inside its own
 `storage.output` (`draft-manifest.json`, `frozen-eval-manifest.json`, `rewards.json`,
 `comparison.json`, `inference.log`) specifically so callers never have to list a
-directory to find them. Reward, comparison, smoke, training, and manifest evidence is
-created exclusively; an existing filename fails instead of being overwritten.
+directory to find them. Attempt artifacts are found only from the ID printed in logs,
+never by enumerating `attempts/`. Reward, comparison, smoke, training, and manifest
+evidence is created exclusively; an existing filename fails instead of being overwritten.
 
 `eval-baseline` binds the stable evaluation identity available in the draft. Finalization
 then binds that exact artifact digest and the effective training configuration into the
@@ -283,7 +311,7 @@ storage proof) — fetch each by its exact name with `--artifact <file>`.
 | `freeze-manifest` | `.../prime-rl-math-7b-h200/manifest` | `draft-manifest.json`, `frozen-eval-manifest.json` | unfrozen draft (pass 1) and the immutable frozen manifest (pass 2) `tau/eval_tools/manifest.py` reads/writes |
 | `eval-baseline` | `.../prime-rl-math-7b-h200/eval-baseline` | `rewards.json`, `inference.log` | baseline per-example rewards (`RewardRecord`) `tau/eval_tools/compare.py` consumes |
 | `eval-post` | `.../prime-rl-math-7b-h200/eval-post` | `rewards.json`, `comparison.json`, `inference.log` | post-training rewards + the `ComparisonResult` (delta, bootstrap CI, pass/fail) |
-| `train` | `.../prime-rl-math-7b-h200/train` | `training-preflight.json`, `training-completion.json`, `training-resolved.toml`, `training-result.json`, `metrics.jsonl`; fixed handoff path `final-adapter/` | binds private immutable inputs and the exact config consumed by RL; attests a zero-exit process; then stages only fixed adapter/config files from the exact `STABLE` final step, fsyncs and atomically installs without replacement, and writes `training-result.json` last |
+| `train` | `.../prime-rl-math-7b-h200/train` | fixed `training-result.json` and `final-adapter/`; exact logged `attempts/<attempt-id>/{preflight.json,resolved-train.toml,completion.json,publication.json,run-output/metrics.jsonl}` | the trusted supervisor owns launch and attestation; attempt evidence binds the exact config/process/STABLE adapter, publication fsyncs and atomically installs without replacement, and writes the fixed result last |
 
 Explicit-file fetch while the run's Workload/Job still exists (the proven, reliable path):
 
@@ -385,9 +413,10 @@ output):
 - `bash -n` and `shellcheck` (zero warnings) on `tau/scripts/run-prime-rl.sh`.
 - stdlib JSON/TOML parsing of the image pin and training config, cross-referenced
   field-by-field against `packages/prime-rl-configs/src/prime_rl/configs/{rl,orchestrator,trainer}.py`.
-- `PYTHONPATH=. uv run --no-sync pytest -q tau/eval_tools/tests` — 70 tests covering
-  content manifests, path/symlink rejection, ordered train identity, immutable evidence,
-  fixed bootstrap, config drift, and retry-safe adapter publication.
+- `PYTHONPATH=. uv run --no-project --with pytest --with pydantic --with numpy pytest -q tau/eval_tools/tests`
+  — 92 tests covering content manifests,
+  path/symlink rejection, ordered train identity, immutable attempt/process evidence,
+  full resolved-config rebinding, fixed bootstrap, and retry/recovery-safe publication.
 - `ruff check` / `ruff format --check` clean on every new Python file under `tau/`.
 - `uv run --no-sync python -m py_compile` on the `live/` scripts (syntax only — they import
   `verifiers`/`datasets`/`openai`/`huggingface_hub`, unavailable here).

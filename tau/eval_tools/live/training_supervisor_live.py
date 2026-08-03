@@ -1,0 +1,474 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import secrets
+import shutil
+import signal
+import subprocess
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+from tau.eval_tools.artifacts import (
+    SOURCE_CONFIG_REL,
+    TrainingCompletionAttestation,
+    TrainingPreflight,
+    attempt_paths,
+    publish_training_result,
+    select_final_adapter,
+    write_training_preflight,
+)
+from tau.eval_tools.json_io import fsync_directory, load_json_with_sha256, write_json_exclusive
+from tau.eval_tools.live.private_materialization_live import (
+    materialize_model,
+    materialize_training_dataset,
+    validate_run_root,
+)
+from tau.eval_tools.live.run_frozen_eval_live import _reload_and_verify_examples
+from tau.eval_tools.live.validate_training_data_live import (
+    _reload_training_records,
+    resolve_effective_rl_config,
+    validate_resolved_rl_config,
+)
+from tau.eval_tools.manifest import (
+    FrozenEvalManifest,
+    build_file_manifest,
+    validate_manifest_contract,
+    validate_model_materialization,
+    validate_training_prompt_hashes,
+)
+
+
+@dataclass(frozen=True)
+class RLProcessResult:
+    argv: tuple[str, ...]
+    executable: str
+    pid: int
+    started_at: str
+    ended_at: str
+    return_code: int
+
+
+ProcessRunner = Callable[[Sequence[str]], RLProcessResult]
+Publisher = Callable[..., object]
+PRIVATE_RUN_ROOT_RE = re.compile(r"^prime-rl-run-[0-9a-f]{32}$")
+
+
+def generate_attempt_id() -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{timestamp}-{secrets.token_hex(8)}"
+
+
+def run_streaming_process(argv: Sequence[str]) -> RLProcessResult:
+    argv = tuple(argv)
+    executable = shutil.which(argv[0])
+    if executable is None:
+        raise FileNotFoundError(f"trusted RL executable is unavailable: {argv[0]}")
+    executable = str(Path(executable).resolve(strict=True))
+    started_at = datetime.now(timezone.utc).isoformat()
+    process = subprocess.Popen(argv)
+    previous_handlers: dict[int, object] = {}
+
+    def forward_signal(signum, _frame):
+        if process.poll() is None:
+            process.send_signal(signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.signal(signum, forward_signal)
+    try:
+        return_code = process.wait()
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+    ended_at = datetime.now(timezone.utc).isoformat()
+    return RLProcessResult(
+        argv=argv,
+        executable=executable,
+        pid=process.pid,
+        started_at=started_at,
+        ended_at=ended_at,
+        return_code=return_code,
+    )
+
+
+def _write_bytes_exclusive(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("xb") as output:
+        output.write(payload)
+        output.flush()
+        os.fsync(output.fileno())
+    fsync_directory(path.parent)
+
+
+def create_attempt_directory(output_dir: Path, attempt_id: str) -> Path:
+    output_dir = Path(output_dir).resolve(strict=True)
+    attempts_dir = output_dir / "attempts"
+    attempts_dir.mkdir(mode=0o755, exist_ok=True)
+    if attempts_dir.is_symlink() or attempts_dir.resolve(strict=True).parent != output_dir:
+        raise ValueError("attempts directory must be a canonical child of the training output")
+    paths = attempt_paths(output_dir, attempt_id, require_existing=False)
+    paths.directory.mkdir(mode=0o755, exist_ok=False)
+    paths.run_output.mkdir(mode=0o755)
+    fsync_directory(paths.directory)
+    fsync_directory(attempts_dir)
+    return paths.directory
+
+
+def create_private_run_root() -> Path:
+    tmp_root = Path("/tmp").resolve(strict=True)
+    for _ in range(8):
+        run_root = tmp_root / f"prime-rl-run-{secrets.token_hex(16)}"
+        try:
+            run_root.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        return validate_run_root(run_root)
+    raise FileExistsError("could not allocate a fresh private training run root")
+
+
+def remove_private_run_root(run_root: Path) -> None:
+    run_root = Path(run_root)
+    if run_root.is_symlink():
+        raise ValueError("refusing to remove a symlinked private run root")
+    canonical = run_root.resolve(strict=True)
+    if canonical.parent != Path("/tmp").resolve(strict=True) or not PRIVATE_RUN_ROOT_RE.fullmatch(canonical.name):
+        raise ValueError(f"refusing to remove unsafe private run root: {canonical}")
+    for current, directories, files in os.walk(canonical):
+        current_path = Path(current)
+        for name in [*directories, *files]:
+            if (current_path / name).is_symlink():
+                raise ValueError(f"refusing to remove private run root containing symlink: {current_path / name}")
+        current_path.chmod(0o700)
+    shutil.rmtree(canonical)
+
+
+def prepare_training_attempt(
+    *,
+    manifest: FrozenEvalManifest,
+    source_config_path: Path,
+    artifact_output_dir: Path,
+    run_root: Path,
+    attempt_id: str,
+) -> TrainingPreflight:
+    if manifest.rl_config is None:
+        raise ValueError("training requires a finalized RL config identity")
+    artifact_output_dir = Path(artifact_output_dir).resolve(strict=True)
+    paths = attempt_paths(artifact_output_dir, attempt_id, require_existing=True)
+    run_root = validate_run_root(run_root)
+    model_path = materialize_model(manifest.model, run_root)
+    validate_model_materialization(manifest.model, model_path, run_root)
+    dataset_path = materialize_training_dataset(manifest, run_root)
+    _reload_and_verify_examples(manifest)
+    records = _reload_training_records(manifest, dataset_path)
+    validate_training_prompt_hashes(manifest, records)
+    private_config_path = run_root / "resolved-train.toml"
+    _, resolved_bytes, config_identity = resolve_effective_rl_config(
+        source_config_path,
+        manifest,
+        source_config_rel=SOURCE_CONFIG_REL,
+        model_path=model_path,
+        dataset_path=dataset_path,
+        output_dir=paths.run_output,
+        logical_output_dir=Path(manifest.rl_config.output_dir),
+        max_steps=manifest.rl_config.max_steps,
+    )
+    if config_identity != manifest.rl_config:
+        raise ValueError("attempt resolved config identity does not match frozen manifest")
+    _write_bytes_exclusive(private_config_path, resolved_bytes)
+    private_config_path.chmod(0o444)
+    _write_bytes_exclusive(paths.resolved_config, resolved_bytes)
+    paths.resolved_config.chmod(0o444)
+    preflight = write_training_preflight(
+        output_path=paths.preflight,
+        attempt_id=attempt_id,
+        manifest=manifest,
+        artifact_output_dir=artifact_output_dir,
+        attempt_output_dir=paths.run_output,
+        run_root=run_root,
+        model_path=model_path,
+        dataset_path=dataset_path,
+        private_config_path=private_config_path,
+        resolved_config_path=paths.resolved_config,
+    )
+    validate_training_prompt_hashes(manifest, _reload_training_records(manifest, dataset_path))
+    marker = run_root / "training-inputs-complete.json"
+    write_json_exclusive(
+        marker,
+        {
+            "schema_version": 1,
+            "status": "verified",
+            "attempt_id": attempt_id,
+            "manifest_identity_hash": manifest.identity_hash(),
+            "resolved_config_sha256": preflight.resolved_config_sha256,
+        },
+    )
+    marker.chmod(0o444)
+    fsync_directory(run_root)
+    run_root.chmod(0o555)
+    fsync_directory(run_root.parent)
+    return preflight
+
+
+def _write_completion_from_process(
+    *,
+    manifest: FrozenEvalManifest,
+    preflight: TrainingPreflight,
+    process_result: RLProcessResult,
+    expected_step: int,
+    expected_rank: int,
+) -> TrainingCompletionAttestation:
+    paths = attempt_paths(preflight.artifact_output_dir, preflight.attempt_id, require_existing=True)
+    expected_argv = ("uv", "run", "--no-sync", "rl", "@", preflight.private_config_path)
+    if process_result.argv != expected_argv:
+        raise ValueError("process runner did not execute the exact trusted RL command")
+    if Path(process_result.executable).name != "uv" or not Path(process_result.executable).is_absolute():
+        raise ValueError("process runner did not bind the resolved uv executable")
+    if process_result.pid <= 1:
+        raise ValueError("process runner returned an invalid RL PID")
+    if process_result.return_code != 0:
+        raise RuntimeError(f"rl process exited with status {process_result.return_code}")
+    if datetime.fromisoformat(process_result.ended_at) < datetime.fromisoformat(process_result.started_at):
+        raise ValueError("RL process end time precedes start time")
+    preflight_payload, preflight_sha256 = load_json_with_sha256(paths.preflight)
+    loaded_preflight = TrainingPreflight.model_validate(preflight_payload)
+    if loaded_preflight != preflight:
+        raise ValueError("preflight changed while RL was running")
+    _, resolved_bytes, config_identity = validate_resolved_rl_config(
+        paths.resolved_config,
+        manifest,
+        source_config_rel=SOURCE_CONFIG_REL,
+        model_path=Path(preflight.model_path),
+        dataset_path=Path(preflight.dataset_path),
+        output_dir=paths.run_output,
+        logical_output_dir=Path(manifest.rl_config.output_dir),
+        max_steps=manifest.rl_config.max_steps,
+    )
+    _, private_bytes, private_identity = validate_resolved_rl_config(
+        Path(preflight.private_config_path),
+        manifest,
+        source_config_rel=SOURCE_CONFIG_REL,
+        model_path=Path(preflight.model_path),
+        dataset_path=Path(preflight.dataset_path),
+        output_dir=paths.run_output,
+        logical_output_dir=Path(manifest.rl_config.output_dir),
+        max_steps=manifest.rl_config.max_steps,
+    )
+    if config_identity != manifest.rl_config or config_identity != preflight.rl_config:
+        raise ValueError("post-process config identity does not match frozen/preflight identity")
+    if (
+        private_identity != config_identity
+        or private_bytes != resolved_bytes
+        or hashlib.sha256(resolved_bytes).hexdigest() != preflight.resolved_config_sha256
+    ):
+        raise ValueError("post-process private/durable config bytes or identity changed")
+    validate_model_materialization(
+        manifest.model,
+        Path(preflight.model_path),
+        Path(preflight.run_root),
+    )
+    validate_training_prompt_hashes(
+        manifest,
+        _reload_training_records(manifest, Path(preflight.dataset_path)),
+    )
+    _, source_adapter, _ = select_final_adapter(
+        paths.run_output / "weights",
+        expected_step=expected_step,
+        expected_rank=expected_rank,
+    )
+    stable_marker = source_adapter.parent / "STABLE"
+    attestation = TrainingCompletionAttestation(
+        attempt_id=preflight.attempt_id,
+        manifest_identity_hash=manifest.identity_hash(),
+        preflight_sha256=preflight_sha256,
+        resolved_config_sha256=preflight.resolved_config_sha256,
+        rl_pid=process_result.pid,
+        started_at=process_result.started_at,
+        ended_at=process_result.ended_at,
+        return_code=0,
+        command_argv=list(process_result.argv),
+        executable=process_result.executable,
+        rl_config=config_identity,
+        run_root=preflight.run_root,
+        private_config_path=preflight.private_config_path,
+        resolved_config_path=preflight.resolved_config_path,
+        artifact_output_dir=preflight.artifact_output_dir,
+        attempt_output_dir=preflight.attempt_output_dir,
+        source_step=expected_step,
+        stable_marker_path=str(stable_marker),
+        stable_marker_sha256=hashlib.sha256(stable_marker.read_bytes()).hexdigest(),
+        source_adapter_path=str(source_adapter),
+        source_adapter_files=build_file_manifest(source_adapter),
+    )
+    write_json_exclusive(paths.completion, attestation.model_dump())
+    return attestation
+
+
+def supervise_prepared_attempt(
+    *,
+    manifest: FrozenEvalManifest,
+    preflight: TrainingPreflight,
+    process_runner: ProcessRunner = run_streaming_process,
+    publisher: Publisher = publish_training_result,
+    expected_rank: int = 16,
+) -> object:
+    if manifest.rl_config is None:
+        raise ValueError("training supervision requires the frozen RL config identity")
+    if Path(preflight.artifact_output_dir, "training-result.json").exists():
+        raise FileExistsError("training-result.json already exists; refusing to rerun completed training")
+    paths = attempt_paths(preflight.artifact_output_dir, preflight.attempt_id, require_existing=True)
+    private_config = Path(preflight.private_config_path)
+    run_root = Path(preflight.run_root).resolve(strict=True)
+    if private_config.is_symlink() or private_config.resolve(strict=True) != run_root / "resolved-train.toml":
+        raise ValueError("RL launch config is not the fixed private non-symlink config")
+    _, private_bytes, private_identity = validate_resolved_rl_config(
+        private_config,
+        manifest,
+        source_config_rel=SOURCE_CONFIG_REL,
+        model_path=Path(preflight.model_path),
+        dataset_path=Path(preflight.dataset_path),
+        output_dir=paths.run_output,
+        logical_output_dir=Path(manifest.rl_config.output_dir),
+        max_steps=manifest.rl_config.max_steps,
+    )
+    _, durable_bytes, durable_identity = validate_resolved_rl_config(
+        paths.resolved_config,
+        manifest,
+        source_config_rel=SOURCE_CONFIG_REL,
+        model_path=Path(preflight.model_path),
+        dataset_path=Path(preflight.dataset_path),
+        output_dir=paths.run_output,
+        logical_output_dir=Path(manifest.rl_config.output_dir),
+        max_steps=manifest.rl_config.max_steps,
+    )
+    if (
+        private_identity != manifest.rl_config
+        or private_identity != preflight.rl_config
+        or durable_identity != private_identity
+        or private_bytes != durable_bytes
+        or hashlib.sha256(private_bytes).hexdigest() != preflight.resolved_config_sha256
+    ):
+        raise ValueError("private RL launch config does not match durable preflight/config identity")
+    command = ("uv", "run", "--no-sync", "rl", "@", preflight.private_config_path)
+    process_result = process_runner(command)
+    if process_result.return_code != 0:
+        raise RuntimeError(
+            f"rl process {process_result.pid} exited with status {process_result.return_code}; "
+            "no completion attestation or result was written"
+        )
+    metrics_path = Path(preflight.attempt_output_dir) / "metrics.jsonl"
+    if metrics_path.is_symlink() or not metrics_path.is_file() or metrics_path.stat().st_size == 0:
+        raise FileNotFoundError("successful RL process did not produce the configured attempt metrics.jsonl")
+    _write_completion_from_process(
+        manifest=manifest,
+        preflight=preflight,
+        process_result=process_result,
+        expected_step=manifest.rl_config.max_steps,
+        expected_rank=expected_rank,
+    )
+    return publisher(
+        output_dir=Path(preflight.artifact_output_dir),
+        manifest=manifest,
+        attempt_id=preflight.attempt_id,
+        expected_step=manifest.rl_config.max_steps,
+        expected_rank=expected_rank,
+    )
+
+
+def run_training_attempt(
+    *,
+    manifest_path: Path,
+    source_config_path: Path,
+    artifact_output_dir: Path,
+    attempt_id_factory: Callable[[], str] = generate_attempt_id,
+    process_runner: ProcessRunner = run_streaming_process,
+    publisher: Publisher = publish_training_result,
+) -> object:
+    artifact_output_dir = Path(artifact_output_dir).resolve(strict=True)
+    if (artifact_output_dir / "training-result.json").exists():
+        raise FileExistsError("training-result.json already exists; training is already complete")
+    manifest = FrozenEvalManifest.load(manifest_path)
+    if manifest.state != "finalized" or manifest.rl_config is None:
+        raise ValueError("training supervisor requires a finalized manifest")
+    validate_manifest_contract(
+        manifest,
+        expected_source_revision=manifest.source_revision,
+        expected_verifiers_revision=manifest.verifiers_revision,
+        expected_tasksets_revision=manifest.eval_taskset.taskset_revision,
+        expected_model_name=manifest.model.name,
+        expected_model_revision=manifest.model.revision,
+        require_finalized=True,
+    )
+    attempt_id = attempt_id_factory()
+    create_attempt_directory(artifact_output_dir, attempt_id)
+    print(f"[training-supervisor] attempt_id={attempt_id}", flush=True)
+    run_root = create_private_run_root()
+    try:
+        preflight = prepare_training_attempt(
+            manifest=manifest,
+            source_config_path=source_config_path,
+            artifact_output_dir=artifact_output_dir,
+            run_root=run_root,
+            attempt_id=attempt_id,
+        )
+        return supervise_prepared_attempt(
+            manifest=manifest,
+            preflight=preflight,
+            process_runner=process_runner,
+            publisher=publisher,
+        )
+    finally:
+        if os.path.lexists(run_root):
+            remove_private_run_root(run_root)
+
+
+def recover_publish(
+    *,
+    manifest_path: Path,
+    artifact_output_dir: Path,
+    attempt_id: str,
+) -> object:
+    manifest = FrozenEvalManifest.load(manifest_path)
+    if manifest.state != "finalized" or manifest.rl_config is None:
+        raise ValueError("publication recovery requires a finalized manifest")
+    return publish_training_result(
+        output_dir=artifact_output_dir,
+        manifest=manifest,
+        attempt_id=attempt_id,
+        expected_step=manifest.rl_config.max_steps,
+        expected_rank=16,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    run_parser = subparsers.add_parser("run")
+    run_parser.add_argument("--manifest", required=True)
+    run_parser.add_argument("--config", required=True)
+    run_parser.add_argument("--output-dir", required=True)
+    recover_parser = subparsers.add_parser("recover-publish")
+    recover_parser.add_argument("--manifest", required=True)
+    recover_parser.add_argument("--output-dir", required=True)
+    recover_parser.add_argument("--attempt-id", required=True)
+    args = parser.parse_args(argv)
+    if args.command == "run":
+        run_training_attempt(
+            manifest_path=Path(args.manifest),
+            source_config_path=Path(args.config),
+            artifact_output_dir=Path(args.output_dir),
+        )
+    else:
+        recover_publish(
+            manifest_path=Path(args.manifest),
+            artifact_output_dir=Path(args.output_dir),
+            attempt_id=args.attempt_id,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

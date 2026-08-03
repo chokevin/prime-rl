@@ -295,11 +295,7 @@ eval)
         : "${PRIME_RL_BASELINE_REWARDS_PATH:?PRIME_RL_BASELINE_REWARDS_PATH must be set for the post-training comparison}"
         : "${PRIME_RL_LORA_ADAPTER_PATH:?PRIME_RL_LORA_ADAPTER_PATH must be set for post eval}"
         : "${PRIME_RL_TRAINING_RESULT_PATH:?PRIME_RL_TRAINING_RESULT_PATH must be set for post eval}"
-        : "${PRIME_RL_TRAINING_PREFLIGHT_PATH:?PRIME_RL_TRAINING_PREFLIGHT_PATH must be set for post eval}"
-        : "${PRIME_RL_TRAINING_COMPLETION_PATH:?PRIME_RL_TRAINING_COMPLETION_PATH must be set for post eval}"
-        : "${PRIME_RL_TRAINING_CONFIG_PATH:?PRIME_RL_TRAINING_CONFIG_PATH must be set for post eval}"
-        : "${PRIME_RL_FINAL_STEP:?PRIME_RL_FINAL_STEP must match the exact bounded final training step}"
-        [[ "$PRIME_RL_FINAL_STEP" =~ ^[1-9][0-9]*$ ]] || die "PRIME_RL_FINAL_STEP must be a positive integer"
+        : "${PRIME_RL_TRAINING_OUTPUT_DIR:?PRIME_RL_TRAINING_OUTPUT_DIR must be set for post eval}"
         manifest_args+=(--require-finalized)
     fi
     uv run --no-sync python -m tau.eval_tools.cli validate-manifest "${manifest_args[@]}" >/dev/null
@@ -317,13 +313,9 @@ eval)
         uv run --no-sync python -m tau.eval_tools.cli validate-adapter-handoff \
             --manifest "$PRIME_RL_MANIFEST_PATH" \
             --training-result "$PRIME_RL_TRAINING_RESULT_PATH" \
-            --preflight "$PRIME_RL_TRAINING_PREFLIGHT_PATH" \
-            --completion-attestation "$PRIME_RL_TRAINING_COMPLETION_PATH" \
-            --resolved-config "$PRIME_RL_TRAINING_CONFIG_PATH" \
+            --training-output-dir "$PRIME_RL_TRAINING_OUTPUT_DIR" \
             --adapter-path "$PRIME_RL_LORA_ADAPTER_PATH" \
-            --private-run-root "$RUN_ROOT" \
-            --final-step "$PRIME_RL_FINAL_STEP" \
-            --lora-rank 16
+            --private-run-root "$RUN_ROOT"
         inference_args+=(--enable-lora --max-lora-rank 16)
         lora_name="post-adapter"
     fi
@@ -385,8 +377,6 @@ train)
     : "${PRIME_RL_MANIFEST_DIR:?PRIME_RL_MANIFEST_DIR must be set}"
     : "${PRIME_RL_MODEL_NAME:?PRIME_RL_MODEL_NAME must be set}"
     : "${PRIME_RL_MODEL_REVISION:?PRIME_RL_MODEL_REVISION must be an exact HF commit SHA}"
-    : "${PRIME_RL_MAX_STEPS:?PRIME_RL_MAX_STEPS must select the exact bounded final training step}"
-    [[ "$PRIME_RL_MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || die "PRIME_RL_MAX_STEPS must be a positive integer"
     config_path="$(primary_config_path)"
     frozen_manifest="${PRIME_RL_MANIFEST_DIR}/frozen-eval-manifest.json"
     if [ ! -f "$frozen_manifest" ]; then
@@ -401,54 +391,11 @@ train)
         --model-revision "$PRIME_RL_MODEL_REVISION" \
         --require-finalized \
         >/dev/null
-    pinned_training_config="${RUN_ROOT}/resolved-train.toml"
-    training_preflight="${TAU_OUTPUT_DIR}/training-preflight.json"
-    training_completion="${TAU_OUTPUT_DIR}/training-completion.json"
-    uv run --no-sync python -m tau.eval_tools.live.validate_training_data_live \
+    log "starting trusted bounded-RL supervisor; it logs the durable attempt ID before materialization"
+    uv run --no-sync python -m tau.eval_tools.live.training_supervisor_live run \
         --manifest "$frozen_manifest" \
         --config "$config_path" \
-        --config-rel "$PRIME_RL_CONFIG_REL" \
-        --output-config "$pinned_training_config" \
-        --output-dir "$TAU_OUTPUT_DIR" \
-        --max-steps "$PRIME_RL_MAX_STEPS" \
-        --preflight "$training_preflight" \
-        --run-root "$RUN_ROOT"
-    [ -f "${RUN_ROOT}/training-inputs-complete.json" ] || die "private training input completion marker is missing"
-    log "frozen manifest and immutable private model/data/config materializations verified — proceeding"
-
-    log "starting bounded RL training: uv run rl @ ${pinned_training_config}"
-    rl_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    uv run --no-sync rl @ "$pinned_training_config" &
-    CHILD_PID=$!
-    rl_pid="$CHILD_PID"
-    if wait "$CHILD_PID"; then
-        rl_status=0
-    else
-        rl_status=$?
-    fi
-    CHILD_PID=""
-    [ "$rl_status" -eq 0 ] || die "rl process ${rl_pid} failed with status ${rl_status}; no completion attestation will be written"
-    rl_ended_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    [ -s "${TAU_OUTPUT_DIR}/metrics.jsonl" ] || die "training completed without the configured metrics.jsonl artifact"
-    uv run --no-sync python -m tau.eval_tools.cli write-training-completion \
-        --output "$training_completion" \
-        --manifest "$frozen_manifest" \
-        --preflight "$training_preflight" \
-        --resolved-config "$pinned_training_config" \
-        --rl-pid "$rl_pid" \
-        --started-at "$rl_started_at" \
-        --ended-at "$rl_ended_at" \
-        --run-root "$RUN_ROOT" \
-        --output-dir "$TAU_OUTPUT_DIR" \
-        --final-step "$PRIME_RL_MAX_STEPS"
-    uv run --no-sync python -m tau.eval_tools.cli publish-training-result \
-        --manifest "$frozen_manifest" \
-        --output-dir "$TAU_OUTPUT_DIR" \
-        --preflight "$training_preflight" \
-        --completion-attestation "$training_completion" \
-        --resolved-config "${TAU_OUTPUT_DIR}/training-resolved.toml" \
-        --final-step "$PRIME_RL_MAX_STEPS" \
-        --lora-rank 16
+        --output-dir "$TAU_OUTPUT_DIR"
     ;;
 
 *)

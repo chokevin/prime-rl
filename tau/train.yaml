@@ -4,17 +4,17 @@
 # supervises the trainer, orchestrator, and inference server as one process group.
 # Refuses to start unless the finalized manifest, complete base snapshot, ordered
 # ID/prompt/answer training identity, and final resolved RL TOML all match. The exact
-# model and dataset are downloaded into a fresh immutable private run root and the exact
-# resolved private config is revalidated immediately before launch. After RL exits zero,
-# a completion attestation is written and publication atomically installs the verified
-# fixed final-adapter/config before writing training-result.json last. The
+# trusted Python supervisor allocates a durable attempt ID plus a fresh immutable private
+# run root, downloads the model and dataset, and revalidates the exact resolved config
+# immediately before launching RL itself. After RL exits zero, the supervisor writes its
+# completion attestation and atomically installs the verified fixed final-adapter before
+# writing training-result.json last. Attempt config/evidence remains under
+# attempts/<attempt-id>/. The
 # in-training startup/periodic/final eval against math500-v1 (configured in the TOML)
 # is a monitoring signal only; the frozen manifest is what tau/eval-baseline.yaml and
 # tau/eval-post.yaml replay for the paired comparison that is the actual hill-climb
 # proof.
 #
-# PRIME_RL_MAX_STEPS is required: it bounds the run and names the exact final checkpoint
-# published after RL. Change it only after real H200 throughput is measured.
 name: prime-rl-math-7b-h200-train
 engine: job
 entrypoint: scripts/run-prime-rl.sh
@@ -32,7 +32,6 @@ runtime:
     PRIME_RL_MODEL_REVISION: a09a35458c702b33eeacc393d103063234e8bc28
     PRIME_RL_CONFIG_REL: configs/tau/math-7b-h200/train.toml
     PRIME_RL_MANIFEST_DIR: /data/pretraining-data/prime-rl-math-7b-h200/manifest
-    PRIME_RL_MAX_STEPS: "50"
 
 compute:
   gpus: 2

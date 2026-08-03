@@ -1,27 +1,17 @@
 from __future__ import annotations
 
-import argparse
 import hashlib
 import os
+import stat
 import tomllib
 from pathlib import Path
 
-from tau.eval_tools.artifacts import write_training_preflight
 from tau.eval_tools.hashing import hash_text
-from tau.eval_tools.json_io import fsync_directory, write_json_exclusive
-from tau.eval_tools.live.private_materialization_live import (
-    materialize_model,
-    materialize_training_dataset,
-    validate_run_root,
-)
 from tau.eval_tools.manifest import (
     EXPECTED_TRAIN_TASKSET_ID,
     FrozenEvalManifest,
     RLConfigIdentity,
     TrainingRecord,
-    validate_manifest_contract,
-    validate_model_materialization,
-    validate_training_prompt_hashes,
 )
 
 CANONICAL_SOURCE_TOML_SHA256 = "53c5d11b03f4981d98ff4c72290edfcb636ca4eb27bbde4785f3ba9fc1d0db6b"
@@ -39,6 +29,37 @@ EXPECTED_LORA_TARGET_MODULES = [
     "fc1_latent_proj",
     "fc2_latent_proj",
 ]
+
+
+def _read_regular_file(path: Path) -> bytes:
+    path = Path(os.path.abspath(path))
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if stat.S_ISLNK(current.lstat().st_mode):
+            raise ValueError(f"resolved RL config contains a symlink component: {current}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("resolved RL config must be a regular file")
+        chunks = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise RuntimeError("resolved RL config changed while it was being read")
+    finally:
+        os.close(descriptor)
+    return b"".join(chunks)
 
 
 def validate_source_toml_contract(
@@ -321,19 +342,81 @@ def _validate_effective_rl_config(
         raise ValueError("resolved math500-v1 evaluation source does not match the fixed 500-row decoding contract")
 
 
-def _replace_private_paths(value, *, model_path: str, dataset_path: str):
+def _replace_runtime_paths(
+    value,
+    *,
+    model_path: str,
+    dataset_path: str,
+    output_dir: str,
+    logical_output_dir: str,
+):
     if isinstance(value, dict):
         return {
-            key: _replace_private_paths(item, model_path=model_path, dataset_path=dataset_path)
+            key: _replace_runtime_paths(
+                item,
+                model_path=model_path,
+                dataset_path=dataset_path,
+                output_dir=output_dir,
+                logical_output_dir=logical_output_dir,
+            )
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_replace_private_paths(item, model_path=model_path, dataset_path=dataset_path) for item in value]
-    if value == model_path:
-        return PRIVATE_MODEL_SENTINEL
-    if value == dataset_path:
-        return PRIVATE_DATASET_SENTINEL
+        return [
+            _replace_runtime_paths(
+                item,
+                model_path=model_path,
+                dataset_path=dataset_path,
+                output_dir=output_dir,
+                logical_output_dir=logical_output_dir,
+            )
+            for item in value
+        ]
+    if isinstance(value, str):
+        for private_root, logical_root in (
+            (model_path, PRIVATE_MODEL_SENTINEL),
+            (dataset_path, PRIVATE_DATASET_SENTINEL),
+            (output_dir, logical_output_dir),
+        ):
+            if value == private_root:
+                return logical_root
+            if value.startswith(private_root + os.sep):
+                return logical_root + value[len(private_root) :]
     return value
+
+
+def _resolved_config_identity(
+    config,
+    *,
+    source_config_rel: str,
+    model_path: Path,
+    dataset_path: Path,
+    output_dir: Path,
+    logical_output_dir: Path,
+    max_steps: int,
+) -> tuple[bytes, RLConfigIdentity]:
+    import tomli_w
+
+    from prime_rl.utils.config import to_toml_dict
+
+    resolved_dict = to_toml_dict(config)
+    resolved_bytes = tomli_w.dumps(resolved_dict).encode("utf-8")
+    canonical_dict = _replace_runtime_paths(
+        resolved_dict,
+        model_path=model_path,
+        dataset_path=dataset_path,
+        output_dir=str(output_dir),
+        logical_output_dir=str(logical_output_dir),
+    )
+    canonical_bytes = tomli_w.dumps(canonical_dict).encode("utf-8")
+    identity = RLConfigIdentity(
+        source_config_rel=source_config_rel,
+        source_toml_sha256=CANONICAL_SOURCE_TOML_SHA256,
+        output_dir=str(logical_output_dir),
+        max_steps=max_steps,
+        canonical_resolved_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
+    )
+    return resolved_bytes, identity
 
 
 def resolve_effective_rl_config(
@@ -344,12 +427,10 @@ def resolve_effective_rl_config(
     model_path: Path = Path(PRIVATE_MODEL_SENTINEL),
     dataset_path: Path = Path(PRIVATE_DATASET_SENTINEL),
     output_dir: Path,
+    logical_output_dir: Path | None = None,
     max_steps: int,
 ) -> tuple[object, bytes, RLConfigIdentity]:
-    import tomli_w
-
-    from prime_rl.utils.config import to_toml_dict
-
+    logical_output_dir = logical_output_dir or output_dir
     config = _resolve_rl_config(
         source_path,
         manifest,
@@ -366,116 +447,52 @@ def resolve_effective_rl_config(
         output_dir=output_dir,
         max_steps=max_steps,
     )
-    resolved_dict = to_toml_dict(config)
-    resolved_bytes = tomli_w.dumps(resolved_dict).encode("utf-8")
-    canonical_dict = _replace_private_paths(
-        resolved_dict,
+    resolved_bytes, identity = _resolved_config_identity(
+        config,
+        source_config_rel=source_config_rel,
         model_path=str(model_path),
         dataset_path=str(dataset_path),
-    )
-    canonical_bytes = tomli_w.dumps(canonical_dict).encode("utf-8")
-    identity = RLConfigIdentity(
-        source_config_rel=source_config_rel,
-        source_toml_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
-        output_dir=str(output_dir),
+        output_dir=output_dir,
+        logical_output_dir=logical_output_dir,
         max_steps=max_steps,
-        canonical_resolved_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
     )
     return config, resolved_bytes, identity
 
 
-def _write_resolved_config(output_path: Path, resolved_bytes: bytes) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("xb") as output:
-        output.write(resolved_bytes)
-        output.flush()
-        os.fsync(output.fileno())
+def validate_resolved_rl_config(
+    resolved_config_path: Path,
+    manifest: FrozenEvalManifest,
+    *,
+    source_config_rel: str,
+    model_path: Path,
+    dataset_path: Path,
+    output_dir: Path,
+    logical_output_dir: Path,
+    max_steps: int,
+) -> tuple[object, bytes, RLConfigIdentity]:
+    from prime_rl.configs.rl import RLConfig
 
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", required=True)
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--config-rel", required=True)
-    parser.add_argument("--output-config", required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--max-steps", required=True, type=int)
-    parser.add_argument("--preflight", required=True)
-    parser.add_argument("--run-root", required=True)
-    args = parser.parse_args(argv)
-
-    run_root = validate_run_root(Path(args.run_root))
-    output_config = Path(args.output_config).resolve()
-    if output_config.parent != run_root or output_config.name != "resolved-train.toml":
-        raise ValueError("resolved RL config must be the fixed file directly beneath the private run root")
-    manifest = FrozenEvalManifest.load(Path(args.manifest))
-    if manifest.state != "finalized":
-        raise ValueError("training-data validation requires a finalized manifest")
-    validate_manifest_contract(
+    resolved_config_path = Path(resolved_config_path)
+    input_bytes = _read_regular_file(resolved_config_path)
+    raw = tomllib.loads(input_bytes.decode("utf-8"))
+    config = RLConfig.model_validate(raw)
+    _validate_effective_rl_config(
+        config,
         manifest,
-        expected_source_revision=manifest.source_revision,
-        expected_verifiers_revision=manifest.verifiers_revision,
-        expected_tasksets_revision=manifest.eval_taskset.taskset_revision,
-        expected_model_name=manifest.model.name,
-        expected_model_revision=manifest.model.revision,
-        require_finalized=True,
-    )
-    model_path = materialize_model(manifest.model, run_root)
-    validate_model_materialization(manifest.model, model_path, run_root)
-    dataset_path = materialize_training_dataset(manifest, run_root)
-    eval_examples = _reload_and_verify_examples(manifest)
-    records = _reload_training_records(manifest, dataset_path)
-    validate_training_prompt_hashes(manifest, records)
-    _, resolved_bytes, config_identity = resolve_effective_rl_config(
-        Path(args.config),
-        manifest,
-        source_config_rel=args.config_rel,
         model_path=model_path,
         dataset_path=dataset_path,
-        output_dir=Path(args.output_dir),
-        max_steps=args.max_steps,
+        output_dir=output_dir,
+        max_steps=max_steps,
     )
-    if manifest.rl_config != config_identity:
-        raise ValueError(
-            "effective RL config identity does not match the finalized manifest "
-            f"(actual={config_identity.canonical_resolved_sha256}, "
-            f"expected={manifest.rl_config.canonical_resolved_sha256 if manifest.rl_config else None})"
-        )
-    _write_resolved_config(output_config, resolved_bytes)
-    written_digest = hashlib.sha256(output_config.read_bytes()).hexdigest()
-    output_config.chmod(0o444)
-    validate_training_prompt_hashes(manifest, _reload_training_records(manifest, dataset_path))
-    write_training_preflight(
-        output_path=Path(args.preflight),
-        manifest=manifest,
-        config_identity=config_identity,
-        run_root=run_root,
+    canonical_resolved_bytes, identity = _resolved_config_identity(
+        config,
+        source_config_rel=source_config_rel,
         model_path=model_path,
         dataset_path=dataset_path,
-        resolved_config_path=output_config,
-        resolved_config_sha256=written_digest,
+        output_dir=output_dir,
+        logical_output_dir=logical_output_dir,
+        max_steps=max_steps,
     )
-    marker = run_root / "training-inputs-complete.json"
-    write_json_exclusive(
-        marker,
-        {
-            "schema_version": 1,
-            "status": "verified",
-            "manifest_identity_hash": manifest.identity_hash(),
-            "resolved_config_sha256": written_digest,
-        },
-    )
-    marker.chmod(0o444)
-    fsync_directory(run_root)
-    run_root.chmod(0o555)
-    fsync_directory(run_root.parent)
-    print(
-        f"ok: revalidated {len(eval_examples)} eval examples and {len(records)} "
-        f"ordered training records (sha256={manifest.training_data.record_digest}); "
-        f"wrote resolved RL config {written_digest} to {args.output_config}"
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    if input_bytes != canonical_resolved_bytes:
+        raise ValueError("resolved RL TOML is not the exact canonical serialization consumed by rl")
+    return config, input_bytes, identity

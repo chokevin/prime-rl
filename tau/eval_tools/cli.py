@@ -23,10 +23,8 @@ from pathlib import Path
 from tau.eval_tools.artifacts import (
     TrainingResult,
     materialize_adapter_for_eval,
-    publish_training_result,
     validate_adapter_handoff,
     write_smoke_result,
-    write_training_completion_attestation,
 )
 from tau.eval_tools.compare import compare_from_paths, write_result
 from tau.eval_tools.live.private_materialization_live import validate_run_root
@@ -95,56 +93,17 @@ def _cmd_write_smoke_result(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_publish_training_result(args: argparse.Namespace) -> int:
-    manifest = FrozenEvalManifest.load(Path(args.manifest))
-    if manifest.state != "finalized":
-        raise ValueError("training result requires a finalized manifest")
-    result = publish_training_result(
-        output_dir=Path(args.output_dir),
-        manifest=manifest,
-        preflight_path=Path(args.preflight),
-        completion_attestation_path=Path(args.completion_attestation),
-        resolved_config_path=Path(args.resolved_config),
-        expected_step=args.final_step,
-        expected_rank=args.lora_rank,
-    )
-    print(
-        f"ok: published stable step {result.source_step} adapter to {result.final_adapter_path} "
-        f"(sha256={result.adapter_sha256})"
-    )
-    return 0
-
-
-def _cmd_write_training_completion(args: argparse.Namespace) -> int:
-    manifest = FrozenEvalManifest.load(Path(args.manifest))
-    result = write_training_completion_attestation(
-        output_path=Path(args.output),
-        manifest=manifest,
-        preflight_path=Path(args.preflight),
-        resolved_config_path=Path(args.resolved_config),
-        rl_pid=args.rl_pid,
-        started_at=args.started_at,
-        ended_at=args.ended_at,
-        run_root=Path(args.run_root),
-        output_dir=Path(args.output_dir),
-        source_step=args.final_step,
-    )
-    print(f"ok: recorded successful rl process {result.rl_pid}")
-    return 0
-
-
 def _cmd_validate_adapter_handoff(args: argparse.Namespace) -> int:
     manifest = FrozenEvalManifest.load(Path(args.manifest))
     result = TrainingResult.load(Path(args.training_result))
+    training_output_dir = Path(args.training_output_dir).resolve(strict=True)
     validate_adapter_handoff(
         result=result,
         manifest=manifest,
-        preflight_path=Path(args.preflight),
-        completion_attestation_path=Path(args.completion_attestation),
-        resolved_config_path=Path(args.resolved_config),
+        training_output_dir=training_output_dir,
         expected_adapter_path=Path(args.adapter_path),
-        expected_step=args.final_step,
-        expected_rank=args.lora_rank,
+        expected_step=manifest.rl_config.max_steps,
+        expected_rank=16,
     )
     private_run_root = validate_run_root(Path(args.private_run_root))
     private_adapter = materialize_adapter_for_eval(
@@ -153,6 +112,18 @@ def _cmd_validate_adapter_handoff(args: argparse.Namespace) -> int:
         run_root=private_run_root,
     )
     print(f"ok: verified and privately materialized adapter at {private_adapter}", file=sys.stderr)
+    return 0
+
+
+def _cmd_recover_publish(args: argparse.Namespace) -> int:
+    from tau.eval_tools.live.training_supervisor_live import recover_publish
+
+    result = recover_publish(
+        manifest_path=Path(args.manifest),
+        artifact_output_dir=Path(args.output_dir),
+        attempt_id=args.attempt_id,
+    )
+    print(f"ok: recovered publication for attempt {result.attempt_id}")
     return 0
 
 
@@ -204,34 +175,14 @@ def build_parser() -> argparse.ArgumentParser:
     smoke_parser.add_argument("--configs-dir", required=True)
     smoke_parser.set_defaults(func=_cmd_write_smoke_result)
 
-    training_parser = subparsers.add_parser(
-        "publish-training-result",
-        help="Select the latest stable adapter, publish it to final-adapter, and write training-result.json.",
+    recovery_parser = subparsers.add_parser(
+        "recover-publish",
+        help="Publish one explicitly named successful training attempt without rerunning RL.",
     )
-    training_parser.add_argument("--manifest", required=True)
-    training_parser.add_argument("--output-dir", required=True)
-    training_parser.add_argument("--preflight", required=True)
-    training_parser.add_argument("--completion-attestation", required=True)
-    training_parser.add_argument("--resolved-config", required=True)
-    training_parser.add_argument("--final-step", type=int, required=True)
-    training_parser.add_argument("--lora-rank", type=int, required=True)
-    training_parser.set_defaults(func=_cmd_publish_training_result)
-
-    completion_parser = subparsers.add_parser(
-        "write-training-completion",
-        help="Exclusively attest a successful rl process before artifact publication.",
-    )
-    completion_parser.add_argument("--output", required=True)
-    completion_parser.add_argument("--manifest", required=True)
-    completion_parser.add_argument("--preflight", required=True)
-    completion_parser.add_argument("--resolved-config", required=True)
-    completion_parser.add_argument("--rl-pid", type=int, required=True)
-    completion_parser.add_argument("--started-at", required=True)
-    completion_parser.add_argument("--ended-at", required=True)
-    completion_parser.add_argument("--run-root", required=True)
-    completion_parser.add_argument("--output-dir", required=True)
-    completion_parser.add_argument("--final-step", type=int, required=True)
-    completion_parser.set_defaults(func=_cmd_write_training_completion)
+    recovery_parser.add_argument("--manifest", required=True)
+    recovery_parser.add_argument("--output-dir", required=True)
+    recovery_parser.add_argument("--attempt-id", required=True)
+    recovery_parser.set_defaults(func=_cmd_recover_publish)
 
     handoff_parser = subparsers.add_parser(
         "validate-adapter-handoff",
@@ -239,13 +190,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     handoff_parser.add_argument("--manifest", required=True)
     handoff_parser.add_argument("--training-result", required=True)
-    handoff_parser.add_argument("--preflight", required=True)
-    handoff_parser.add_argument("--completion-attestation", required=True)
-    handoff_parser.add_argument("--resolved-config", required=True)
+    handoff_parser.add_argument("--training-output-dir", required=True)
     handoff_parser.add_argument("--private-run-root", required=True)
     handoff_parser.add_argument("--adapter-path", required=True)
-    handoff_parser.add_argument("--final-step", type=int, required=True)
-    handoff_parser.add_argument("--lora-rank", type=int, required=True)
     handoff_parser.set_defaults(func=_cmd_validate_adapter_handoff)
 
     return parser
