@@ -20,12 +20,9 @@ from tau.eval_tools.artifacts import (
     AdapterPublicationState,
     TrainingCompletionAttestation,
     TrainingPreflight,
-    TrainingPublicationEvidence,
-    TrainingResult,
     _cancellation_scope,
     _check_cancelled,
-    _quarantine_owned_json_staging,
-    _remove_owned_staging,
+    _quarantine_owned_staging,
     _write_json_staged_noreplace,
     attempt_paths,
     publish_training_result,
@@ -392,42 +389,28 @@ def _cleanup_cancelled_attempt(preflight: TrainingPreflight, adapter_state: Adap
     result_path = Path(preflight.artifact_output_dir) / "training-result.json"
     if not adapter_state.installed_by_invocation and not adapter_state.ownership_transferred:
         if os.path.lexists(result_path):
-            result = TrainingResult.load(result_path)
-            if result.attempt_id != preflight.attempt_id:
-                raise ValueError("refusing to remove another attempt's training result during cancellation")
-            result_path.unlink()
-            fsync_directory(result_path.parent)
-        if os.path.lexists(paths.publication):
-            publication, _ = TrainingPublicationEvidence.load(paths.publication)
-            if publication.attempt_id != preflight.attempt_id:
-                raise ValueError("refusing to remove another attempt's publication during cancellation")
-            paths.publication.unlink()
-            fsync_directory(paths.directory)
-        if os.path.lexists(paths.completion):
-            completion, _ = TrainingCompletionAttestation.load(paths.completion)
-            if completion.attempt_id != preflight.attempt_id:
-                raise ValueError("refusing to remove another attempt's completion during cancellation")
-            paths.completion.unlink()
-            fsync_directory(paths.directory)
-    _quarantine_owned_json_staging(
+            raise RuntimeError("refusing to clean cancellation state after a final training result exists")
+        _quarantine_owned_staging(paths.publication, expected_name="publication.json")
+        _quarantine_owned_staging(paths.completion, expected_name="completion.json")
+    _quarantine_owned_staging(
         paths.completion_staging,
         expected_name=".completion.json.stage",
     )
-    _remove_owned_staging(paths.publication_staging, preflight.attempt_id)
+    _quarantine_owned_staging(paths.publication_staging, expected_name=".publication.stage")
 
 
 def _cleanup_recovery_staging(output_dir: Path, attempt_id: str) -> None:
     paths = attempt_paths(output_dir, attempt_id, require_existing=True)
-    _quarantine_owned_json_staging(
+    _quarantine_owned_staging(
         paths.completion_staging,
         expected_name=".completion.json.stage",
     )
-    _remove_owned_staging(paths.publication_staging, attempt_id)
+    _quarantine_owned_staging(paths.publication_staging, expected_name=".publication.stage")
 
 
 def _cleanup_publication_staging(output_dir: Path, attempt_id: str) -> None:
     paths = attempt_paths(output_dir, attempt_id, require_existing=True)
-    _remove_owned_staging(paths.publication_staging, attempt_id)
+    _quarantine_owned_staging(paths.publication_staging, expected_name=".publication.stage")
 
 
 def supervise_prepared_attempt(
@@ -587,11 +570,11 @@ def run_training_attempt(
                     _cleanup_cancelled_attempt(preflight, cancellation.adapter_publication)
                 else:
                     paths = attempt_paths(artifact_output_dir, attempt_id, require_existing=True)
-                    _quarantine_owned_json_staging(
+                    _quarantine_owned_staging(
                         paths.completion_staging,
                         expected_name=".completion.json.stage",
                     )
-                    _remove_owned_staging(paths.publication_staging, attempt_id)
+                    _quarantine_owned_staging(paths.publication_staging, expected_name=".publication.stage")
             except Exception as cleanup_error:
                 error.add_note(f"cancelled-attempt cleanup failed: {cleanup_error}")
                 raise error from cleanup_error

@@ -6,7 +6,6 @@ import hashlib
 import os
 import re
 import secrets
-import shutil
 import stat
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -615,20 +614,6 @@ def write_training_preflight(
     return result
 
 
-def _remove_owned_staging(path: Path, attempt_id: str) -> None:
-    if not os.path.lexists(path):
-        return
-    if path.is_symlink() or path.name != ".publication.stage" or path.parent.name != attempt_id:
-        raise ValueError(f"refusing to remove unowned publication staging path: {path}")
-    if path.is_dir():
-        shutil.rmtree(path)
-    elif path.is_file():
-        path.unlink()
-    else:
-        raise ValueError(f"refusing to remove non-file publication staging path: {path}")
-    fsync_directory(path.parent)
-
-
 def _rename_entry_noreplace(directory_descriptor: int, source_name: str, destination_name: str) -> None:
     if "/" in source_name or "/" in destination_name:
         raise ValueError("directory-relative rename names must not contain path separators")
@@ -675,19 +660,35 @@ def _before_staging_quarantine(_path: Path) -> None:
     pass
 
 
-def _quarantine_owned_json_staging(path: Path, *, expected_name: str) -> Path | None:
+def _quarantine_owned_staging(path: Path, *, expected_name: str) -> Path | None:
     path = Path(path)
+    allowed_names = {
+        ".completion.json.stage",
+        ".publication.stage",
+        "completion.json",
+        "publication.json",
+    }
+    if expected_name not in allowed_names:
+        raise ValueError(f"unsupported attempt evidence name for quarantine: {expected_name}")
+    if (
+        not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+        or os.open not in os.supports_dir_fd
+        or os.stat not in os.supports_dir_fd
+        or os.stat not in os.supports_follow_symlinks
+    ):
+        raise OSError(errno.ENOTSUP, "safe no-follow attempt staging quarantine is unavailable", path)
     if (
         path.name != expected_name
         or not ATTEMPT_ID_RE.fullmatch(path.parent.name)
         or path.parent.parent.name != "attempts"
     ):
-        raise ValueError(f"refusing to quarantine unsafe JSON staging path: {path}")
-    directory_flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        directory_flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        directory_flags |= os.O_NOFOLLOW
+        raise ValueError(f"refusing to quarantine unsafe staging path: {path}")
+    canonical_parent = path.parent.resolve(strict=True)
+    if canonical_parent != Path(os.path.abspath(path.parent)):
+        raise ValueError(f"attempt staging parent is not canonical: {path.parent}")
+    path = canonical_parent / path.name
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     parent_descriptor = os.open(path.parent, directory_flags)
     source_descriptor = None
     try:
@@ -698,17 +699,18 @@ def _quarantine_owned_json_staging(path: Path, *, expected_name: str) -> Path | 
         except FileNotFoundError:
             return None
         expected_identity = (pathname_metadata.st_dev, pathname_metadata.st_ino)
-        if stat.S_ISREG(pathname_metadata.st_mode):
+        if stat.S_ISREG(pathname_metadata.st_mode) or stat.S_ISDIR(pathname_metadata.st_mode):
             file_flags = os.O_RDONLY
-            if hasattr(os, "O_NOFOLLOW"):
-                file_flags |= os.O_NOFOLLOW
+            if stat.S_ISDIR(pathname_metadata.st_mode):
+                file_flags |= os.O_DIRECTORY
+            file_flags |= os.O_NOFOLLOW
             source_descriptor = os.open(path.name, file_flags, dir_fd=parent_descriptor)
             opened_metadata = os.fstat(source_descriptor)
             if (
-                not stat.S_ISREG(opened_metadata.st_mode)
+                stat.S_IFMT(opened_metadata.st_mode) != stat.S_IFMT(pathname_metadata.st_mode)
                 or (opened_metadata.st_dev, opened_metadata.st_ino) != expected_identity
             ):
-                raise RuntimeError(f"JSON staging path changed while being opened: {path}")
+                raise RuntimeError(f"staging path changed while being opened: {path}")
         _before_staging_quarantine(path)
         for _ in range(8):
             quarantine_name = f"{expected_name}.quarantine-{secrets.token_hex(16)}"
@@ -721,10 +723,11 @@ def _quarantine_owned_json_staging(path: Path, *, expected_name: str) -> Path | 
             raise FileExistsError("could not allocate a unique staging quarantine name")
         os.fsync(parent_descriptor)
         quarantine_metadata = os.stat(quarantine_name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if stat.S_ISREG(quarantine_metadata.st_mode):
+        if stat.S_ISREG(quarantine_metadata.st_mode) or stat.S_ISDIR(quarantine_metadata.st_mode):
             file_flags = os.O_RDONLY
-            if hasattr(os, "O_NOFOLLOW"):
-                file_flags |= os.O_NOFOLLOW
+            if stat.S_ISDIR(quarantine_metadata.st_mode):
+                file_flags |= os.O_DIRECTORY
+            file_flags |= os.O_NOFOLLOW
             descriptor = os.open(quarantine_name, file_flags, dir_fd=parent_descriptor)
             try:
                 reopened_metadata = os.fstat(descriptor)
@@ -736,6 +739,8 @@ def _quarantine_owned_json_staging(path: Path, *, expected_name: str) -> Path | 
         quarantine_path = path.parent / quarantine_name
         if quarantine_identity != expected_identity:
             raise RuntimeError(f"quarantined staging inode does not match the captured entry: {quarantine_path}")
+        if expected_name == ".publication.stage" and not stat.S_ISDIR(quarantine_metadata.st_mode):
+            raise ValueError(f"quarantined attempt evidence has the wrong file type: {quarantine_path}")
         return quarantine_path
     finally:
         if source_descriptor is not None:
@@ -764,12 +769,8 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
             renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
             renamex_np.restype = ctypes.c_int
             result = renamex_np(os.fsencode(source), os.fsencode(destination), DARWIN_RENAME_EXCL)
-        elif source.is_file():
-            os.link(source, destination, follow_symlinks=False)
-            source.unlink()
-            return
         else:
-            raise OSError(errno.ENOTSUP, "atomic no-replace directory rename is unavailable", destination)
+            raise OSError(errno.ENOTSUP, "atomic no-replace rename is unavailable", destination)
     if result == 0:
         return
     error = ctypes.get_errno()
@@ -796,7 +797,7 @@ def _write_json_staged_noreplace(
     if os.path.lexists(staging_path):
         if staging_path.name != ".completion.json.stage":
             raise FileExistsError(f"refusing to replace existing JSON staging evidence: {staging_path}")
-        _quarantine_owned_json_staging(
+        _quarantine_owned_staging(
             staging_path,
             expected_name=".completion.json.stage",
         )
@@ -1040,7 +1041,7 @@ def _load_or_recover_attempt_evidence(
                     )
             except Exception as error:
                 try:
-                    _quarantine_owned_json_staging(
+                    _quarantine_owned_staging(
                         paths.completion_staging,
                         expected_name=".completion.json.stage",
                     )
@@ -1055,7 +1056,7 @@ def _load_or_recover_attempt_evidence(
             if staged_evidence[3] != final_evidence[3] or staged_evidence[4] != final_evidence[4]:
                 raise ValueError("staged completion attestation does not match finalized completion evidence")
             _check_cancelled()
-            _quarantine_owned_json_staging(
+            _quarantine_owned_staging(
                 paths.completion_staging,
                 expected_name=".completion.json.stage",
             )
@@ -1110,7 +1111,7 @@ def _load_or_recover_attempt_evidence(
                 raise RuntimeError("promoted completion validation changed after atomic installation")
     except Exception as error:
         if not promoted:
-            _quarantine_owned_json_staging(
+            _quarantine_owned_staging(
                 paths.completion_staging,
                 expected_name=".completion.json.stage",
             )
@@ -1166,7 +1167,7 @@ def publish_training_result(
             expected_rank=expected_rank,
         )
         _check_cancelled()
-        _remove_owned_staging(staging, attempt_id)
+        _quarantine_owned_staging(staging, expected_name=".publication.stage")
         _check_cancelled()
         return result
     existing_publication = None
@@ -1174,7 +1175,7 @@ def publish_training_result(
     if os.path.lexists(paths.publication):
         existing_publication, publication_sha256 = TrainingPublicationEvidence.load(paths.publication)
     _check_cancelled()
-    _remove_owned_staging(staging, attempt_id)
+    _quarantine_owned_staging(staging, expected_name=".publication.stage")
     _check_cancelled()
     step, source_adapter, source_digest = select_final_adapter(
         paths.run_output / "weights",
@@ -1284,7 +1285,7 @@ def publish_training_result(
         staging_path=staged_result,
         payload=result.model_dump(),
     )
-    staging.rmdir()
+    _quarantine_owned_staging(staging, expected_name=".publication.stage")
     fsync_directory(output_dir)
     return result
 

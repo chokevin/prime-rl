@@ -287,7 +287,7 @@ uv run --no-sync python -m tau.eval_tools.cli recover-publish \
 Run that command only in the same pinned image/overlay with `blob-training` mounted.
 It derives exact paths from the supplied ID, strict-verifies the existing preflight,
 canonical resolved TOML, real-process attestation, STABLE marker, and adapter hashes,
-then removes only that attempt's stale staging and completes atomic publication without
+then quarantines only that attempt's stale staging and completes atomic publication without
 launching RL. This includes the adapter-installed/publication-not-yet-installed
 interruption point. It also accepts an fsynced `.completion.json.stage` only when
 `completion.json` is absent and the staged attestation passes the same full validation,
@@ -298,6 +298,12 @@ publication. Malformed, stale, or suspicious stages are atomically renamed relat
 the opened attempt directory into unique `.completion.json.stage.quarantine-*` evidence.
 The quarantine is no-follow inode-verified and preserved for diagnosis, never unlinked;
 recovery ignores quarantine names, so a strict-valid final succeeds on the next call.
+The same opened-attempt-directory, no-follow inode protocol moves an interrupted
+`.publication.stage` directory to unique `.publication.stage.quarantine-*` evidence,
+reopens it as a directory, verifies the captured token, fsyncs the parent, and preserves
+it. A swapped directory or adapter alias is quarantined but never traversed or deleted;
+an inode mismatch fails the current call while a later strict recovery ignores the
+quarantine.
 When both names exist, the final wins only if the valid stage matches exactly.
 A malformed final publication fails rather than being replaced. A
 different attempt can reuse an exactly matching installed adapter only through this
@@ -447,7 +453,7 @@ output):
   field-by-field against `packages/prime-rl-configs/src/prime_rl/configs/{rl,orchestrator,trainer}.py`.
 - `PYTHONPATH=.:src uv run --no-project` with editable `prime-rl-configs`,
   `verifiers`, `math-env-v1`, and `math500-v1`, then
-  `pytest -q tau/eval_tools/tests` — 117 tests covering content manifests,
+  `pytest -q tau/eval_tools/tests` — 118 tests covering content manifests,
   path/symlink rejection, ordered train identity, immutable attempt/process evidence,
   a non-mocked real-`RLConfig` TOML round trip, fixed bootstrap, cancellation, and
   retry/recovery-safe atomic publication.

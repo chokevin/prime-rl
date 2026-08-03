@@ -227,10 +227,10 @@ def materialize_regular_snapshot(source: Path, cache_root: Path, destination: Pa
     if destination.exists():
         validate_file_manifest(destination, source_manifest)
         return source_manifest
-    if staging.exists():
+    if os.path.lexists(staging):
         if staging.is_symlink() or staging.parent != destination_parent:
-            raise ValueError(f"refusing to remove unsafe snapshot staging path: {staging}")
-        shutil.rmtree(staging)
+            raise ValueError(f"unsafe snapshot staging path exists: {staging}")
+        raise FileExistsError(f"snapshot staging path already exists: {staging}")
     staging.mkdir()
     for record in source_manifest.files:
         source_item = (source / record.path).resolve(strict=True)

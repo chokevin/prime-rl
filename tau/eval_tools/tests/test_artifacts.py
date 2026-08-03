@@ -262,6 +262,14 @@ def _completion_quarantines(paths):
     return sorted(paths.directory.glob(".completion.json.stage.quarantine-*"))
 
 
+def _completion_final_quarantines(paths):
+    return sorted(paths.directory.glob("completion.json.quarantine-*"))
+
+
+def _publication_quarantines(paths):
+    return sorted(paths.directory.glob(".publication.stage.quarantine-*"))
+
+
 def test_select_final_adapter_uses_exact_expected_stable_rank_16_checkpoint(tmp_path):
     _adapter(tmp_path, 10)
     expected = _adapter(tmp_path, 20)
@@ -315,12 +323,17 @@ def test_publish_training_result_is_idempotent_after_completion(tmp_path, exact_
     _evidence(tmp_path, manifest, exact_config_validator(manifest))
     kwargs = _publication_kwargs(tmp_path, manifest)
     publish_training_result(**kwargs)
-    staging = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True).publication_staging
+    paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
+    existing_quarantines = set(_publication_quarantines(paths))
+    staging = paths.publication_staging
     staging.mkdir()
     (staging / "stale").write_text("interrupted after completion")
     retried = publish_training_result(**kwargs)
     assert retried == TrainingResult.load(tmp_path / "training-result.json")
     assert not staging.exists()
+    new_quarantines = set(_publication_quarantines(paths)) - existing_quarantines
+    assert len(new_quarantines) == 1
+    assert (new_quarantines.pop() / "stale").read_text() == "interrupted after completion"
 
 
 def test_publish_training_result_recovers_adapter_install_and_partial_json_stage(tmp_path, exact_config_validator):
@@ -330,6 +343,7 @@ def test_publish_training_result_recovers_adapter_install_and_partial_json_stage
     publish_training_result(**kwargs)
     (tmp_path / "training-result.json").unlink()
     paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
+    existing_quarantines = set(_publication_quarantines(paths))
     paths.publication.unlink()
     staging = paths.publication_staging
     staging.mkdir()
@@ -340,6 +354,13 @@ def test_publish_training_result_recovers_adapter_install_and_partial_json_stage
 
     assert recovered == TrainingResult.load(tmp_path / "training-result.json")
     assert not staging.exists()
+    new_quarantines = set(_publication_quarantines(paths)) - existing_quarantines
+    assert len(new_quarantines) == 2
+    assert any(
+        (quarantine / "publication.json").read_text() == '{"status":"pub'
+        for quarantine in new_quarantines
+        if (quarantine / "publication.json").is_file()
+    )
     assert not paths.completion_staging.exists()
     assert len(_completion_quarantines(paths)) == 1
 
@@ -503,6 +524,7 @@ def test_quarantine_detects_stage_swap_and_preserves_replacement(
     assert len(quarantines) == 1
     assert quarantines[0].read_bytes() == replacement_stage
     assert not paths.publication.exists()
+    monkeypatch.setattr(artifacts_module, "_before_staging_quarantine", lambda _path: None)
     recovered = publish_training_result(**_publication_kwargs(tmp_path, manifest), recovery=True)
     assert recovered.attempt_id == ATTEMPT_1
 
@@ -843,6 +865,12 @@ def test_later_cancelled_attempt_preserves_identical_adapter_owned_by_earlier_at
     assert first_paths.completion.read_bytes() == first_completion
     assert first_paths.publication.read_bytes() == first_publication
     assert not second_paths.completion.exists()
+    completion_quarantines = _completion_final_quarantines(second_paths)
+    assert len(completion_quarantines) == 1
+    assert (
+        TrainingCompletionAttestation.model_validate_json(completion_quarantines[0].read_bytes()).attempt_id
+        == ATTEMPT_2
+    )
     assert not second_paths.publication.exists()
 
 
@@ -919,14 +947,61 @@ def test_cancellation_after_publication_transfers_adapter_ownership_to_durable_e
     assert recovered.attempt_id == ATTEMPT_1
 
 
-def test_supervisor_never_recursively_deletes_global_final_adapter():
-    eval_tools = Path(__file__).parents[1]
-    sources = [
-        (eval_tools / "artifacts.py").read_text(),
-        (eval_tools / "live/training_supervisor_live.py").read_text(),
-    ]
-    assert all("rmtree(final_adapter)" not in source for source in sources)
-    assert all("final_adapter.unlink" not in source for source in sources)
+@pytest.mark.parametrize("replacement_kind", ["directory", "final-adapter-alias"])
+def test_publication_staging_swap_is_quarantined_without_deleting_evidence(
+    tmp_path,
+    exact_config_validator,
+    monkeypatch,
+    replacement_kind,
+):
+    manifest = _manifest()
+    _evidence(tmp_path, manifest, exact_config_validator(manifest))
+    kwargs = _publication_kwargs(tmp_path, manifest)
+    original_result = publish_training_result(**kwargs)
+    paths = attempt_paths(tmp_path, ATTEMPT_1, require_existing=True)
+    existing_quarantines = set(_publication_quarantines(paths))
+    staging = paths.publication_staging
+    staging.mkdir()
+    (staging / "original").write_text("original staging")
+    displaced = paths.directory / "displaced-publication-stage"
+    final_adapter = tmp_path / "final-adapter"
+    adapter_identity = (final_adapter.stat().st_dev, final_adapter.stat().st_ino)
+    replacement_identity = None
+
+    def swap_publication_stage(path):
+        nonlocal replacement_identity
+        assert path == staging
+        staging.rename(displaced)
+        if replacement_kind == "directory":
+            staging.mkdir()
+            (staging / "replacement").write_text("replacement staging")
+        else:
+            staging.symlink_to(final_adapter, target_is_directory=True)
+        metadata = staging.lstat()
+        replacement_identity = (metadata.st_dev, metadata.st_ino)
+
+    monkeypatch.setattr(artifacts_module, "_before_staging_quarantine", swap_publication_stage)
+
+    with pytest.raises(RuntimeError, match="inode does not match"):
+        publish_training_result(**kwargs)
+
+    assert displaced.is_dir()
+    assert (displaced / "original").read_text() == "original staging"
+    assert (final_adapter.stat().st_dev, final_adapter.stat().st_ino) == adapter_identity
+    new_quarantines = set(_publication_quarantines(paths)) - existing_quarantines
+    assert len(new_quarantines) == 1
+    quarantine = new_quarantines.pop()
+    assert (quarantine.lstat().st_dev, quarantine.lstat().st_ino) == replacement_identity
+    if replacement_kind == "directory":
+        assert (quarantine / "replacement").read_text() == "replacement staging"
+    else:
+        assert quarantine.is_symlink()
+        assert quarantine.resolve() == final_adapter.resolve()
+    assert TrainingResult.load(tmp_path / "training-result.json") == original_result
+
+    monkeypatch.setattr(artifacts_module, "_before_staging_quarantine", lambda _path: None)
+    recovered = publish_training_result(**kwargs, recovery=True)
+    assert recovered == original_result
 
 
 @pytest.mark.parametrize(("signum", "expected_exit"), [(signal.SIGINT, 130), (signal.SIGTERM, 143)])
