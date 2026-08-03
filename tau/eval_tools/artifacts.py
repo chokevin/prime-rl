@@ -114,6 +114,7 @@ class AttemptPaths:
     completion_staging: Path
     publication: Path
     publication_staging: Path
+    private_cleanup_diagnostic: Path
     run_output: Path
 
 
@@ -137,6 +138,7 @@ def attempt_paths(output_dir: Path, attempt_id: str, *, require_existing: bool) 
         completion_staging=attempt_dir / ".completion.json.stage",
         publication=attempt_dir / "publication.json",
         publication_staging=attempt_dir / ".publication.stage",
+        private_cleanup_diagnostic=attempt_dir / "private-cleanup-diagnostic.json",
         run_output=attempt_dir / "run-output",
     )
 

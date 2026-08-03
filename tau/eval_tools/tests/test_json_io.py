@@ -130,3 +130,75 @@ def test_exclusive_json_rejects_stage_swap_without_installing_replacement(tmp_pa
     stages = list(tmp_path.glob(".evidence.json.stage-*"))
     assert len(stages) == 1
     assert stages[0].read_bytes() == replacement
+
+
+def test_exclusive_json_quarantines_stage_swap_after_validation_and_retry_succeeds(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "evidence.json"
+    displaced = tmp_path / "displaced-validated-stage"
+    replacement = b'{"replacement":true}\n'
+    payload = {"owned": True}
+    original_hook = json_io_module._after_json_stage_validation
+
+    def swap_after_validation(stage):
+        stage.rename(displaced)
+        stage.write_bytes(replacement)
+
+    monkeypatch.setattr(json_io_module, "_after_json_stage_validation", swap_after_validation)
+    with pytest.raises(RuntimeError, match="changed during installation"):
+        write_json_exclusive(path, payload)
+
+    assert not path.exists()
+    assert displaced.read_bytes() != replacement
+    quarantines = list(tmp_path.glob(".evidence.json.quarantine-*"))
+    assert len(quarantines) == 1
+    assert quarantines[0].read_bytes() == replacement
+
+    monkeypatch.setattr(json_io_module, "_after_json_stage_validation", original_hook)
+    write_json_exclusive(path, payload)
+    assert load_json_with_sha256(path)[0] == payload
+    assert quarantines[0].read_bytes() == replacement
+
+
+def test_exclusive_json_quarantines_final_swap_before_reload_and_retry_succeeds(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "evidence.json"
+    displaced = tmp_path / "displaced-installed-final"
+    replacement = b'{"replacement":true}\n'
+    payload = {"owned": True}
+    original_hook = json_io_module._after_json_install
+
+    def swap_before_reload(final):
+        final.rename(displaced)
+        final.write_bytes(replacement)
+
+    monkeypatch.setattr(json_io_module, "_after_json_install", swap_before_reload)
+    with pytest.raises(RuntimeError, match="changed during installation"):
+        write_json_exclusive(path, payload)
+
+    assert not path.exists()
+    assert load_json_with_sha256(displaced)[0] == payload
+    quarantines = list(tmp_path.glob(".evidence.json.quarantine-*"))
+    assert len(quarantines) == 1
+    assert quarantines[0].read_bytes() == replacement
+
+    monkeypatch.setattr(json_io_module, "_after_json_install", original_hook)
+    write_json_exclusive(path, payload)
+    assert load_json_with_sha256(path)[0] == payload
+    assert quarantines[0].read_bytes() == replacement
+
+
+def test_exclusive_json_existing_final_is_never_quarantined(tmp_path):
+    path = tmp_path / "evidence.json"
+    write_json_exclusive(path, {"immutable": True})
+    original = path.read_bytes()
+
+    with pytest.raises(FileExistsError):
+        write_json_exclusive(path, {"replacement": True})
+
+    assert path.read_bytes() == original
+    assert not list(tmp_path.glob(".evidence.json.quarantine-*"))

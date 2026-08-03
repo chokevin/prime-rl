@@ -928,9 +928,219 @@ def test_cleanup_diagnostic_does_not_invalidate_durable_success(
         )
         assert result is sentinel
         assert "cleanup failed after durable success" in capsys.readouterr().err
+        diagnostic = attempt_paths(output_dir, ATTEMPT_1, require_existing=True).private_cleanup_diagnostic
+        payload, _ = load_json_with_sha256(diagnostic)
+        assert payload["status"] == "private-cleanup-failed-after-durable-success"
+        assert payload["attempt_id"] == ATTEMPT_1
+        assert payload["error_type"] == "RuntimeError"
+        assert (output_dir / "training-result.json").read_text() == "{}"
     finally:
         captured["run_root"].unlink(missing_ok=True)
         captured["displaced"].rmdir()
+
+
+@pytest.mark.parametrize("stream_failure", ["broken-pipe", "closed"])
+def test_cleanup_diagnostic_stderr_failure_cannot_invalidate_durable_success(
+    tmp_path,
+    monkeypatch,
+    stream_failure,
+):
+    manifest_path = tmp_path / "manifest.json"
+    _manifest().save(manifest_path)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    sentinel = object()
+    captured = {}
+    monkeypatch.setattr(supervisor_module, "generate_attempt_id", lambda: ATTEMPT_1)
+    monkeypatch.setattr(supervisor_module, "validate_manifest_contract", lambda *_args, **_kwargs: None)
+
+    def prepare(**kwargs):
+        captured["run_root"] = kwargs["run_root"]
+        return object()
+
+    def complete(**_kwargs):
+        (output_dir / "training-result.json").write_text("{}")
+        return sentinel
+
+    def fail_cleanup(_token):
+        raise RuntimeError("private cleanup failed")
+
+    class BrokenStream:
+        def write(self, _value):
+            raise BrokenPipeError("closed pipe")
+
+        def flush(self):
+            raise BrokenPipeError("closed pipe")
+
+    monkeypatch.setattr(supervisor_module, "prepare_training_attempt", prepare)
+    monkeypatch.setattr(supervisor_module, "_supervise_prepared_attempt", complete)
+    monkeypatch.setattr(supervisor_module, "remove_private_run_root", fail_cleanup)
+    monkeypatch.setattr(TrainingResult, "load", classmethod(lambda _cls, _path: sentinel))
+    if stream_failure == "broken-pipe":
+        monkeypatch.setattr(supervisor_module.sys, "stderr", BrokenStream())
+    else:
+        stream = open(os.devnull, "w")
+        stream.close()
+        monkeypatch.setattr(supervisor_module.sys, "stderr", stream)
+    try:
+        assert (
+            run_training_attempt(
+                manifest_path=manifest_path,
+                source_config_path=tmp_path / "unused.toml",
+                artifact_output_dir=output_dir,
+            )
+            is sentinel
+        )
+        diagnostic = attempt_paths(output_dir, ATTEMPT_1, require_existing=True).private_cleanup_diagnostic
+        assert load_json_with_sha256(diagnostic)[0]["error_message"] == "private cleanup failed"
+        assert (output_dir / "training-result.json").read_text() == "{}"
+    finally:
+        captured["run_root"].rmdir()
+
+
+def test_cleanup_diagnostic_write_failure_cannot_invalidate_durable_success(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    manifest_path = tmp_path / "manifest.json"
+    _manifest().save(manifest_path)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    sentinel = object()
+    captured = {}
+    monkeypatch.setattr(supervisor_module, "generate_attempt_id", lambda: ATTEMPT_1)
+    monkeypatch.setattr(supervisor_module, "validate_manifest_contract", lambda *_args, **_kwargs: None)
+
+    def prepare(**kwargs):
+        captured["run_root"] = kwargs["run_root"]
+        return object()
+
+    def complete(**_kwargs):
+        (output_dir / "training-result.json").write_text("{}")
+        return sentinel
+
+    monkeypatch.setattr(supervisor_module, "prepare_training_attempt", prepare)
+    monkeypatch.setattr(supervisor_module, "_supervise_prepared_attempt", complete)
+    monkeypatch.setattr(
+        supervisor_module,
+        "remove_private_run_root",
+        lambda _token: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
+    )
+    monkeypatch.setattr(
+        supervisor_module, "write_json_exclusive", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full"))
+    )
+    monkeypatch.setattr(TrainingResult, "load", classmethod(lambda _cls, _path: sentinel))
+    try:
+        assert (
+            run_training_attempt(
+                manifest_path=manifest_path,
+                source_config_path=tmp_path / "unused.toml",
+                artifact_output_dir=output_dir,
+            )
+            is sentinel
+        )
+        assert "diagnostic persistence failed: disk full" in capsys.readouterr().err
+        paths = attempt_paths(output_dir, ATTEMPT_1, require_existing=True)
+        assert not paths.private_cleanup_diagnostic.exists()
+        assert (output_dir / "training-result.json").read_text() == "{}"
+    finally:
+        captured["run_root"].rmdir()
+
+
+def test_primary_training_failure_survives_cleanup_failure(tmp_path, monkeypatch):
+    primary = RuntimeError("primary training failure")
+    monkeypatch.setattr(
+        supervisor_module,
+        "_supervise_prepared_attempt",
+        lambda **_kwargs: (_ for _ in ()).throw(primary),
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "_cleanup_publication_staging",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("cleanup failed")),
+    )
+    preflight = type("Preflight", (), {"artifact_output_dir": tmp_path, "attempt_id": ATTEMPT_1})()
+
+    with pytest.raises(RuntimeError, match="primary training failure") as caught:
+        supervise_prepared_attempt(manifest=_manifest(), preflight=preflight)
+
+    assert caught.value is primary
+    assert caught.value.__notes__ == ["publication staging cleanup failed: cleanup failed"]
+
+
+def test_primary_cancellation_survives_cleanup_failure(tmp_path, monkeypatch):
+    primary = SupervisorCancelled(signal.SIGTERM)
+    monkeypatch.setattr(
+        supervisor_module,
+        "_supervise_prepared_attempt",
+        lambda **_kwargs: (_ for _ in ()).throw(primary),
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "_cleanup_cancelled_attempt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("cleanup failed")),
+    )
+
+    with pytest.raises(SupervisorCancelled, match="cancelled by signal") as caught:
+        supervise_prepared_attempt(manifest=_manifest(), preflight=object())
+
+    assert caught.value is primary
+    assert caught.value.exit_code == 143
+    assert caught.value.__notes__ == ["cancelled-attempt cleanup failed: cleanup failed"]
+
+
+@pytest.mark.parametrize(
+    ("primary", "cleanup_name", "expected_note"),
+    [
+        (
+            RuntimeError("primary training failure"),
+            "_cleanup_publication_staging",
+            "publication staging cleanup failed: cleanup failed",
+        ),
+        (
+            SupervisorCancelled(signal.SIGTERM),
+            "_cleanup_cancelled_attempt",
+            "cancelled-attempt cleanup failed: cleanup failed",
+        ),
+    ],
+)
+def test_run_training_attempt_preserves_primary_error_when_cleanup_fails(
+    tmp_path,
+    monkeypatch,
+    primary,
+    cleanup_name,
+    expected_note,
+):
+    manifest_path = tmp_path / "manifest.json"
+    _manifest().save(manifest_path)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    monkeypatch.setattr(supervisor_module, "generate_attempt_id", lambda: ATTEMPT_1)
+    monkeypatch.setattr(supervisor_module, "validate_manifest_contract", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(supervisor_module, "prepare_training_attempt", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        supervisor_module,
+        "_supervise_prepared_attempt",
+        lambda **_kwargs: (_ for _ in ()).throw(primary),
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        cleanup_name,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("cleanup failed")),
+    )
+
+    with pytest.raises(type(primary), match=str(primary)) as caught:
+        run_training_attempt(
+            manifest_path=manifest_path,
+            source_config_path=tmp_path / "unused.toml",
+            artifact_output_dir=output_dir,
+        )
+
+    assert caught.value is primary
+    assert caught.value.__notes__ == [expected_note]
+    if isinstance(primary, SupervisorCancelled):
+        assert caught.value.exit_code == 143
 
 
 @pytest.mark.parametrize(
@@ -1169,9 +1379,16 @@ def test_publication_staging_swap_is_quarantined_without_deleting_evidence(
 
 
 @pytest.mark.parametrize(("signum", "expected_exit"), [(signal.SIGINT, 130), (signal.SIGTERM, 143)])
-def test_supervisor_cli_maps_cancellation_to_conventional_exit(monkeypatch, signum, expected_exit):
+def test_supervisor_cli_maps_cancellation_to_conventional_exit(
+    monkeypatch,
+    capsys,
+    signum,
+    expected_exit,
+):
     def cancel_run(**_kwargs):
-        raise SupervisorCancelled(signum)
+        error = SupervisorCancelled(signum)
+        error.add_note("cancelled-attempt cleanup failed: preserved diagnostic")
+        raise error
 
     monkeypatch.setattr(supervisor_module, "run_training_attempt", cancel_run)
     status = supervisor_main(
@@ -1186,6 +1403,9 @@ def test_supervisor_cli_maps_cancellation_to_conventional_exit(monkeypatch, sign
         ]
     )
     assert status == expected_exit
+    stderr = capsys.readouterr().err
+    assert f"training transaction cancelled by signal {signum}" in stderr
+    assert "note: cancelled-attempt cleanup failed: preserved diagnostic" in stderr
 
 
 def test_recovery_cancellation_during_completion_promotion_stops_publication(

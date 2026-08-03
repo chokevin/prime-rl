@@ -8,11 +8,18 @@ import stat
 from pathlib import Path
 from typing import Any
 
-from tau.eval_tools.fs_safety import open_directory_nofollow, rename_entry_noreplace
+from tau.eval_tools.fs_safety import (
+    open_directory_nofollow,
+    quarantine_entry,
+    rename_entry_noreplace,
+)
 
 
 class DuplicateKeyError(ValueError):
     """Raised when a JSON object repeats a key."""
+
+
+_NO_EXPECTED_OBJECT = object()
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -89,16 +96,73 @@ def _before_json_install(_path: Path) -> None:
     pass
 
 
+def _after_json_stage_validation(_path: Path) -> None:
+    pass
+
+
 def _after_json_install(_path: Path) -> None:
     pass
 
 
-def write_bytes_exclusive(path: Path, payload: bytes) -> None:
+def _read_exact_file(
+    descriptor: int,
+    *,
+    expected_metadata: os.stat_result,
+    expected_bytes: bytes,
+    expected_digest: bytes,
+    expected_object: Any,
+    path: Path,
+) -> None:
+    chunks: list[bytes] = []
+    while chunk := os.read(descriptor, 1024 * 1024):
+        chunks.append(chunk)
+    reloaded_metadata = os.fstat(descriptor)
+    if (
+        reloaded_metadata.st_dev,
+        reloaded_metadata.st_ino,
+        reloaded_metadata.st_size,
+        reloaded_metadata.st_mtime_ns,
+    ) != (
+        expected_metadata.st_dev,
+        expected_metadata.st_ino,
+        expected_metadata.st_size,
+        expected_metadata.st_mtime_ns,
+    ):
+        raise RuntimeError(f"durable evidence changed while being verified: {path}")
+    reloaded = b"".join(chunks)
+    if hashlib.sha256(reloaded).digest() != expected_digest or reloaded != expected_bytes:
+        raise RuntimeError(f"durable evidence bytes do not match staged bytes: {path}")
+    if expected_object is not _NO_EXPECTED_OBJECT and parse_json_bytes(reloaded) != expected_object:
+        raise RuntimeError(f"durable JSON evidence object does not match staged object: {path}")
+
+
+def _quarantine_failed_install(parent_descriptor: int, path: Path, error: Exception) -> None:
+    try:
+        os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    try:
+        quarantine_entry(
+            parent_descriptor,
+            path.name,
+            quarantine_prefix=f".{path.name}.quarantine",
+        )
+    except Exception as quarantine_error:
+        error.add_note(f"failed to quarantine invalid durable evidence: {quarantine_error}")
+
+
+def write_bytes_exclusive(
+    path: Path,
+    payload: bytes,
+    *,
+    expected_object: Any = _NO_EXPECTED_OBJECT,
+) -> None:
     path = Path(os.path.abspath(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     parent_descriptor = open_directory_nofollow(path.parent)
     stage_name = None
     stage_descriptor = None
+    expected_digest = hashlib.sha256(payload).digest()
     try:
         try:
             os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
@@ -136,47 +200,57 @@ def write_bytes_exclusive(path: Path, payload: bytes) -> None:
             staged_metadata.st_ino,
         ):
             raise RuntimeError(f"durable evidence staging changed before installation: {path}")
+        _after_json_stage_validation(path.parent / stage_name)
         rename_entry_noreplace(parent_descriptor, stage_name, path.name)
         os.fsync(parent_descriptor)
         _after_json_install(path)
-        final_metadata = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if not stat.S_ISREG(final_metadata.st_mode):
-            raise ValueError(f"durable evidence path must be a regular file: {path}")
-        if (final_metadata.st_dev, final_metadata.st_ino, final_metadata.st_size) != (
-            staged_metadata.st_dev,
-            staged_metadata.st_ino,
-            staged_metadata.st_size,
-        ):
-            raise RuntimeError(f"durable evidence changed during installation: {path}")
-        final_descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_descriptor)
         try:
-            opened_metadata = os.fstat(final_descriptor)
-            if (opened_metadata.st_dev, opened_metadata.st_ino) != (
+            final_metadata = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if not stat.S_ISREG(final_metadata.st_mode):
+                raise ValueError(f"durable evidence path must be a regular file: {path}")
+            if (final_metadata.st_dev, final_metadata.st_ino, final_metadata.st_size) != (
                 staged_metadata.st_dev,
                 staged_metadata.st_ino,
+                staged_metadata.st_size,
             ):
-                raise RuntimeError(f"durable evidence changed while being reopened: {path}")
-            chunks: list[bytes] = []
-            while chunk := os.read(final_descriptor, 1024 * 1024):
-                chunks.append(chunk)
-            reloaded_metadata = os.fstat(final_descriptor)
-            if (
-                reloaded_metadata.st_dev,
-                reloaded_metadata.st_ino,
-                reloaded_metadata.st_size,
-                reloaded_metadata.st_mtime_ns,
-            ) != (
-                opened_metadata.st_dev,
-                opened_metadata.st_ino,
-                opened_metadata.st_size,
-                opened_metadata.st_mtime_ns,
-            ):
-                raise RuntimeError(f"durable evidence changed while being verified: {path}")
-        finally:
-            os.close(final_descriptor)
-        reloaded = b"".join(chunks)
-        if hashlib.sha256(reloaded).digest() != hashlib.sha256(payload).digest() or reloaded != payload:
-            raise RuntimeError(f"durable evidence bytes do not match staged bytes: {path}")
+                raise RuntimeError(f"durable evidence changed during installation: {path}")
+            final_descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_descriptor)
+            try:
+                opened_metadata = os.fstat(final_descriptor)
+                if (
+                    stat.S_IFMT(opened_metadata.st_mode),
+                    opened_metadata.st_dev,
+                    opened_metadata.st_ino,
+                ) != (
+                    stat.S_IFMT(staged_metadata.st_mode),
+                    staged_metadata.st_dev,
+                    staged_metadata.st_ino,
+                ):
+                    raise RuntimeError(f"durable evidence changed while being reopened: {path}")
+                _read_exact_file(
+                    final_descriptor,
+                    expected_metadata=opened_metadata,
+                    expected_bytes=payload,
+                    expected_digest=expected_digest,
+                    expected_object=expected_object,
+                    path=path,
+                )
+                current_final = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+                if (
+                    stat.S_IFMT(current_final.st_mode),
+                    current_final.st_dev,
+                    current_final.st_ino,
+                ) != (
+                    stat.S_IFMT(opened_metadata.st_mode),
+                    opened_metadata.st_dev,
+                    opened_metadata.st_ino,
+                ):
+                    raise RuntimeError(f"durable evidence path changed after verification: {path}")
+            finally:
+                os.close(final_descriptor)
+        except Exception as verification_error:
+            _quarantine_failed_install(parent_descriptor, path, verification_error)
+            raise
     finally:
         if stage_descriptor is not None:
             os.close(stage_descriptor)
@@ -186,7 +260,4 @@ def write_bytes_exclusive(path: Path, payload: bytes) -> None:
 def write_json_exclusive(path: Path, payload: Any) -> None:
     canonical = (json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
     expected = parse_json_bytes(canonical)
-    write_bytes_exclusive(path, canonical)
-    reloaded, digest = load_json_with_sha256(path)
-    if digest != hashlib.sha256(canonical).hexdigest() or reloaded != expected:
-        raise RuntimeError(f"durable JSON evidence failed strict verification: {path}")
+    write_bytes_exclusive(path, canonical, expected_object=expected)

@@ -9,7 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -419,6 +419,71 @@ def _cleanup_publication_staging(output_dir: Path, attempt_id: str) -> None:
     _quarantine_owned_staging(paths.publication_staging, expected_name=".publication.stage")
 
 
+def _cleanup_preserving_error(error: Exception, cleanup: Callable[[], None], note_prefix: str) -> None:
+    try:
+        cleanup()
+    except Exception as cleanup_error:
+        error.add_note(f"{note_prefix}: {cleanup_error}")
+
+
+def _best_effort_log(message: str) -> None:
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _emit_cancellation(error: SupervisorCancelled) -> None:
+    _best_effort_log(f"[training-supervisor] {error}")
+    for note in getattr(error, "__notes__", ()):
+        _best_effort_log(f"[training-supervisor] note: {note}")
+
+
+def _record_private_cleanup_diagnostic(
+    *,
+    artifact_output_dir: Path,
+    attempt_id: str,
+    cleanup_error: Exception,
+) -> Path:
+    paths = attempt_paths(artifact_output_dir, attempt_id, require_existing=True)
+    write_json_exclusive(
+        paths.private_cleanup_diagnostic,
+        {
+            "schema_version": 1,
+            "status": "private-cleanup-failed-after-durable-success",
+            "attempt_id": attempt_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "error_type": type(cleanup_error).__name__,
+            "error_message": str(cleanup_error),
+        },
+    )
+    return paths.private_cleanup_diagnostic
+
+
+def _diagnose_private_cleanup_after_success(
+    *,
+    artifact_output_dir: Path,
+    attempt_id: str,
+    cleanup_error: Exception,
+) -> None:
+    try:
+        diagnostic = _record_private_cleanup_diagnostic(
+            artifact_output_dir=artifact_output_dir,
+            attempt_id=attempt_id,
+            cleanup_error=cleanup_error,
+        )
+    except Exception as diagnostic_error:
+        _best_effort_log(
+            "[training-supervisor] private cleanup failed after durable success; "
+            f"cleanup={cleanup_error}; diagnostic persistence failed: {diagnostic_error}"
+        )
+        return
+    _best_effort_log(
+        "[training-supervisor] private cleanup failed after durable success; "
+        f"success evidence remains valid; diagnostic={diagnostic}: {cleanup_error}"
+    )
+
+
 def supervise_prepared_attempt(
     *,
     manifest: FrozenEvalManifest,
@@ -434,14 +499,18 @@ def supervise_prepared_attempt(
                 expected_rank=expected_rank,
             )
         except SupervisorCancelled as error:
-            try:
-                _cleanup_cancelled_attempt(preflight, cancellation.adapter_publication)
-            except Exception as cleanup_error:
-                error.add_note(f"cancelled-attempt cleanup failed: {cleanup_error}")
-                raise error from cleanup_error
+            _cleanup_preserving_error(
+                error,
+                lambda: _cleanup_cancelled_attempt(preflight, cancellation.adapter_publication),
+                "cancelled-attempt cleanup failed",
+            )
             raise
-        except Exception:
-            _cleanup_publication_staging(preflight.artifact_output_dir, preflight.attempt_id)
+        except Exception as error:
+            _cleanup_preserving_error(
+                error,
+                lambda: _cleanup_publication_staging(preflight.artifact_output_dir, preflight.attempt_id),
+                "publication staging cleanup failed",
+            )
             raise
 
 
@@ -576,7 +645,8 @@ def run_training_attempt(
             return result
         except SupervisorCancelled as error:
             failure = error
-            try:
+
+            def cleanup_cancelled() -> None:
                 if preflight is not None:
                     _cleanup_cancelled_attempt(preflight, cancellation.adapter_publication)
                 else:
@@ -586,14 +656,17 @@ def run_training_attempt(
                         expected_name=".completion.json.stage",
                     )
                     _quarantine_owned_staging(paths.publication_staging, expected_name=".publication.stage")
-            except Exception as cleanup_error:
-                error.add_note(f"cancelled-attempt cleanup failed: {cleanup_error}")
-                raise error from cleanup_error
+
+            _cleanup_preserving_error(error, cleanup_cancelled, "cancelled-attempt cleanup failed")
             raise
         except Exception as error:
             failure = error
             if preflight is not None:
-                _cleanup_publication_staging(artifact_output_dir, attempt_id)
+                _cleanup_preserving_error(
+                    error,
+                    lambda: _cleanup_publication_staging(artifact_output_dir, attempt_id),
+                    "publication staging cleanup failed",
+                )
             raise
         finally:
             try:
@@ -605,11 +678,10 @@ def run_training_attempt(
                         raise RuntimeError(
                             "private cleanup failed and durable success evidence does not match the returned result"
                         ) from cleanup_error
-                    print(
-                        "[training-supervisor] private cleanup failed after durable success; "
-                        f"success evidence remains valid: {cleanup_error}",
-                        file=sys.stderr,
-                        flush=True,
+                    _diagnose_private_cleanup_after_success(
+                        artifact_output_dir=artifact_output_dir,
+                        attempt_id=attempt_id,
+                        cleanup_error=cleanup_error,
                     )
                 elif failure is not None:
                     failure.add_note(f"private run-root cleanup failed: {cleanup_error}")
@@ -639,14 +711,18 @@ def recover_publish(
                 recovery=True,
             )
         except SupervisorCancelled as error:
-            try:
-                _cleanup_recovery_staging(artifact_output_dir, attempt_id)
-            except Exception as cleanup_error:
-                error.add_note(f"recovery staging cleanup failed: {cleanup_error}")
-                raise error from cleanup_error
+            _cleanup_preserving_error(
+                error,
+                lambda: _cleanup_recovery_staging(artifact_output_dir, attempt_id),
+                "recovery staging cleanup failed",
+            )
             raise
-        except Exception:
-            _cleanup_publication_staging(artifact_output_dir, attempt_id)
+        except Exception as error:
+            _cleanup_preserving_error(
+                error,
+                lambda: _cleanup_publication_staging(artifact_output_dir, attempt_id),
+                "publication staging cleanup failed",
+            )
             raise
 
 
@@ -676,7 +752,7 @@ def main(argv: list[str] | None = None) -> int:
                 attempt_id=args.attempt_id,
             )
     except SupervisorCancelled as error:
-        print(f"[training-supervisor] {error}", flush=True)
+        _emit_cancellation(error)
         return error.exit_code
     return 0
 
