@@ -586,3 +586,39 @@ def test_tier_curve_wrapper_closes_writer_before_log_promotion():
     promote = script.index("inference_launcher_live promote", stop)
 
     assert launch < evaluate < stop < promote
+
+
+@pytest.mark.parametrize(
+    ("inference_body", "expected_status"),
+    [
+        ("import time; print('ready', flush=True); time.sleep(60)", 143),
+        (
+            "import signal, threading; "
+            "done = threading.Event(); "
+            "signal.signal(signal.SIGTERM, lambda *_: done.set()); "
+            "print('ready', flush=True); "
+            "done.wait()",
+            0,
+        ),
+    ],
+)
+def test_uv_run_inference_sigterm_status_matches_wrapper_contract(tmp_path, inference_body, expected_status):
+    executable = tmp_path / "inference"
+    executable.write_text(f"#!/usr/bin/env python3\n{inference_body}\n")
+    executable.chmod(0o755)
+    environment = os.environ | {"PATH": f"{tmp_path}:{os.environ['PATH']}"}
+    child = subprocess.Popen(
+        ["uv", "run", "--no-project", "inference"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "ready"
+        child.send_signal(signal.SIGTERM)
+        assert child.wait(timeout=5) == expected_status
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
