@@ -45,6 +45,41 @@ die() {
 [[ "$PRIME_RL_VERIFIERS_SHA" =~ ^[0-9a-f]{40}$ ]] || die "PRIME_RL_VERIFIERS_SHA must be a full lowercase 40-character commit SHA"
 [[ "$PRIME_RL_TASKSETS_SHA" =~ ^[0-9a-f]{40}$ ]] || die "PRIME_RL_TASKSETS_SHA must be a full lowercase 40-character commit SHA"
 
+# The immutable F12 recovery identity contract: the exact PRIME_RL_RECOVERY_* names
+# required, with no silent default, whenever this script runs a recovery mode
+# (eval-post-recovery or eval-post-recovery-preflight). This single array is the one
+# place these names are listed in this script; it is used both for the fail-fast check
+# below and to build output_paths.py's --recovery-* arguments further down, so the two
+# can never drift apart from each other. It must exactly mirror the keys of
+# tau.eval_tools.f12_recovery.F12_RECOVERY_ENVIRONMENT -- enforced by
+# test_run_prime_rl_recovery_env_names_match_f12_recovery_environment.
+PRIME_RL_RECOVERY_ENV_NAMES=(
+    EXPERIMENT_SOURCE_REVISION
+    MANIFEST_SHA256
+    BASELINE_REWARDS_SHA256
+    TRAINING_RESULT_SHA256
+    MANIFEST_IDENTITY
+    ADAPTER_AGGREGATE
+    ADAPTER_CONFIG_SHA256
+    ADAPTER_MODEL_SHA256
+    MODEL_AGGREGATE
+    TRAINING_DATA_DIGEST
+    SOURCE_CONFIG_DIGEST
+    TRAINING_ATTEMPT_ID
+    SOURCE_STEP
+    MAX_STEPS
+    EVAL_INTERVAL
+)
+case "$PRIME_RL_RUN_MODE" in
+eval-post-recovery | eval-post-recovery-preflight)
+    for _recovery_name in "${PRIME_RL_RECOVERY_ENV_NAMES[@]}"; do
+        _recovery_var="PRIME_RL_RECOVERY_${_recovery_name}"
+        : "${!_recovery_var:?${_recovery_var} must be set for ${PRIME_RL_RUN_MODE} mode (F12 recovery identity contract)}"
+    done
+    unset _recovery_name _recovery_var
+    ;;
+esac
+
 CHILD_PID=""
 CHILD_PROCESS_GROUP_ID=""
 TMP_ROOT="$(realpath -e /tmp)"
@@ -231,6 +266,20 @@ cd /app
 export PYTHONPATH="$OVERLAY_DIR"
 export HF_HOME="${RUN_ROOT}/hf-home"
 
+# Build the --recovery-* flags from the same PRIME_RL_RECOVERY_ENV_NAMES array checked
+# above, rather than hand-listing each flag a second time -- one centralized name list,
+# reused for both the fail-fast check and this invocation. Values are safe to default to
+# empty here: the fail-fast case above already refused to reach this point for a
+# recovery mode with any of these unset, and non-recovery modes legitimately never set
+# them (output_paths.py rejects non-empty recovery values outside recovery modes).
+RECOVERY_ENV_ARGS=()
+for _recovery_name in "${PRIME_RL_RECOVERY_ENV_NAMES[@]}"; do
+    _recovery_var="PRIME_RL_RECOVERY_${_recovery_name}"
+    _recovery_flag="--recovery-$(printf '%s' "$_recovery_name" | tr 'A-Z_' 'a-z-')"
+    RECOVERY_ENV_ARGS+=("$_recovery_flag" "${!_recovery_var:-}")
+done
+unset _recovery_name _recovery_var _recovery_flag
+
 GENERATION_ROOT="$(uv run --no-sync python -m tau.eval_tools.output_paths \
     --mode "$PRIME_RL_RUN_MODE" \
     --output-dir "$TAU_OUTPUT_DIR" \
@@ -247,21 +296,7 @@ GENERATION_ROOT="$(uv run --no-sync python -m tau.eval_tools.output_paths \
     --recovery-preflight-output-path "${PRIME_RL_RECOVERY_PREFLIGHT_OUTPUT_PATH:-}" \
     --tier-curve-model-source-revision "${PRIME_RL_TIER_CURVE_MODEL_SOURCE_REVISION:-}" \
     --tier-curve-model-manifest-path "${PRIME_RL_TIER_CURVE_MODEL_MANIFEST_PATH:-}" \
-    --recovery-experiment-source-revision "${PRIME_RL_RECOVERY_EXPERIMENT_SOURCE_REVISION:-}" \
-    --recovery-manifest-sha256 "${PRIME_RL_RECOVERY_MANIFEST_SHA256:-}" \
-    --recovery-baseline-rewards-sha256 "${PRIME_RL_RECOVERY_BASELINE_REWARDS_SHA256:-}" \
-    --recovery-training-result-sha256 "${PRIME_RL_RECOVERY_TRAINING_RESULT_SHA256:-}" \
-    --recovery-manifest-identity "${PRIME_RL_RECOVERY_MANIFEST_IDENTITY:-}" \
-    --recovery-adapter-aggregate "${PRIME_RL_RECOVERY_ADAPTER_AGGREGATE:-}" \
-    --recovery-adapter-config-sha256 "${PRIME_RL_RECOVERY_ADAPTER_CONFIG_SHA256:-}" \
-    --recovery-adapter-model-sha256 "${PRIME_RL_RECOVERY_ADAPTER_MODEL_SHA256:-}" \
-    --recovery-model-aggregate "${PRIME_RL_RECOVERY_MODEL_AGGREGATE:-}" \
-    --recovery-training-data-digest "${PRIME_RL_RECOVERY_TRAINING_DATA_DIGEST:-}" \
-    --recovery-source-config-digest "${PRIME_RL_RECOVERY_SOURCE_CONFIG_DIGEST:-}" \
-    --recovery-training-attempt-id "${PRIME_RL_RECOVERY_TRAINING_ATTEMPT_ID:-}" \
-    --recovery-source-step "${PRIME_RL_RECOVERY_SOURCE_STEP:-}" \
-    --recovery-max-steps "${PRIME_RL_RECOVERY_MAX_STEPS:-}" \
-    --recovery-eval-interval "${PRIME_RL_RECOVERY_EVAL_INTERVAL:-}")"
+    "${RECOVERY_ENV_ARGS[@]}")"
 log "prepared source generation ${GENERATION_ROOT} and mode output ${TAU_OUTPUT_DIR}"
 
 # --- Step 2: child-process lifecycle helpers -----------------------------------------

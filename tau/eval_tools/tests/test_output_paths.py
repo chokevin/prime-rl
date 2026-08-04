@@ -1,4 +1,5 @@
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import tau.eval_tools.live.inference_launcher_live as inference_launcher
 from tau.eval_tools.f12_recovery import (
     F12_EXPERIMENT_SOURCE_REVISION,
     F12_RECOVERY_ENVIRONMENT,
+    f12_recovery_environment_variable_names,
     f12_recovery_paths,
 )
 from tau.eval_tools.live.inference_launcher_live import (
@@ -256,6 +258,72 @@ def test_f12_recovery_preflight_rejects_mismatched_contract_before_output_creati
             "eval-post-recovery-preflight",
             expected,
             SOURCE_B,
+            data_root=data_root,
+            **references,
+        )
+
+    assert not expected.exists()
+
+
+@pytest.mark.parametrize("mode", ["eval-post-recovery", "eval-post-recovery-preflight"])
+def test_recovery_input_mode_rejects_absent_recovery_environment_before_output_creation(tmp_path, mode):
+    # Mirrors calling prepare_output_directory for a recovery mode with no
+    # recovery_environment kwarg at all (the None default), rather than a caller
+    # supplying an already-populated mapping.
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    generation = evidence_generation(SOURCE_B, data_root=data_root)
+    expected = (
+        generation.eval_post_recovery if mode == "eval-post-recovery" else generation.eval_post_recovery_preflight
+    )
+    eval_label = "post" if mode == "eval-post-recovery" else None
+    references = (
+        _f12_recovery_references(data_root)
+        if mode == "eval-post-recovery"
+        else _f12_recovery_preflight_references(data_root)
+    ) | {"recovery_environment": None}
+
+    with pytest.raises(ValueError, match="experiment_source_revision is None, expected"):
+        prepare_output_directory(
+            mode,
+            expected,
+            SOURCE_B,
+            eval_label=eval_label,
+            data_root=data_root,
+            **references,
+        )
+
+    assert not expected.exists()
+
+
+@pytest.mark.parametrize("mode", ["eval-post-recovery", "eval-post-recovery-preflight"])
+def test_recovery_input_mode_rejects_all_empty_string_recovery_environment_before_output_creation(tmp_path, mode):
+    # Reproduces the exact live blocker: a Tau target that omits the PRIME_RL_RECOVERY_*
+    # identity env vars, combined with run-prime-rl.sh's `${VAR:-}` argument wiring,
+    # previously reached output_paths.py with every recovery identity as an empty
+    # string (never None) -- distinct from, and more realistic than, the omitted-kwarg
+    # case above.
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    generation = evidence_generation(SOURCE_B, data_root=data_root)
+    expected = (
+        generation.eval_post_recovery if mode == "eval-post-recovery" else generation.eval_post_recovery_preflight
+    )
+    eval_label = "post" if mode == "eval-post-recovery" else None
+    base_references = (
+        _f12_recovery_references(data_root)
+        if mode == "eval-post-recovery"
+        else _f12_recovery_preflight_references(data_root)
+    )
+    all_empty = {name: "" for name in F12_RECOVERY_ENVIRONMENT}
+    references = base_references | {"recovery_environment": all_empty}
+
+    with pytest.raises(ValueError, match=re.escape("experiment_source_revision is '', expected 'a603e791")):
+        prepare_output_directory(
+            mode,
+            expected,
+            SOURCE_B,
+            eval_label=eval_label,
             data_root=data_root,
             **references,
         )
@@ -901,6 +969,43 @@ def test_tier_curve_wrapper_closes_writer_before_log_promotion():
     promote = script.index("inference_launcher_live promote", stop)
 
     assert launch < evaluate < stop < promote
+
+
+def _run_prime_rl_script_text() -> str:
+    return (Path(__file__).parents[2] / "scripts/run-prime-rl.sh").read_text()
+
+
+def test_run_prime_rl_recovery_env_names_match_f12_recovery_environment():
+    script = _run_prime_rl_script_text()
+    array_match = re.search(r"PRIME_RL_RECOVERY_ENV_NAMES=\((.*?)\)", script, re.DOTALL)
+    assert array_match is not None, "PRIME_RL_RECOVERY_ENV_NAMES array not found in run-prime-rl.sh"
+    parsed_names = array_match.group(1).split()
+    assert len(parsed_names) == len(set(parsed_names)), "PRIME_RL_RECOVERY_ENV_NAMES must not repeat a name"
+    shell_env_var_names = {f"PRIME_RL_RECOVERY_{name}" for name in parsed_names}
+
+    assert shell_env_var_names == set(f12_recovery_environment_variable_names())
+    assert shell_env_var_names == {f"PRIME_RL_RECOVERY_{name.upper()}" for name in F12_RECOVERY_ENVIRONMENT}
+
+
+def test_run_prime_rl_recovery_env_names_used_for_both_fail_fast_check_and_cli_args():
+    script = _run_prime_rl_script_text()
+    array_definition = script.index("PRIME_RL_RECOVERY_ENV_NAMES=(")
+    fail_fast_case = script.index('case "$PRIME_RL_RUN_MODE" in', array_definition)
+    fail_fast_check = script.index(
+        "${!_recovery_var:?${_recovery_var} must be set for ${PRIME_RL_RUN_MODE} mode", fail_fast_case
+    )
+    args_build_loop = script.index("RECOVERY_ENV_ARGS=()", fail_fast_check)
+    prepare = script.index("tau.eval_tools.output_paths", args_build_loop)
+
+    # Both the fail-fast check and the --recovery-* CLI argument construction must
+    # iterate the one PRIME_RL_RECOVERY_ENV_NAMES array, and the fail-fast check must
+    # run strictly before output_paths.py is ever invoked (before output-directory
+    # setup), for every recovery mode.
+    assert array_definition < fail_fast_case < fail_fast_check < args_build_loop < prepare
+    assert script.count("PRIME_RL_RECOVERY_ENV_NAMES[@]") == 2
+    # No silent `:-` default remains for any of the 15 recovery identity env vars.
+    for name in F12_RECOVERY_ENVIRONMENT:
+        assert f"PRIME_RL_RECOVERY_{name.upper()}:-" not in script
 
 
 @pytest.mark.parametrize(

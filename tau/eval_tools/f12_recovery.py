@@ -101,6 +101,17 @@ def validate_f12_recovery_environment(**actual: str | None) -> None:
             raise ValueError(f"F12 recovery {name} is {actual[name]!r}, expected {expected!r}")
 
 
+def f12_recovery_environment_variable_names() -> tuple[str, ...]:
+    """The exact `PRIME_RL_RECOVERY_*` environment variable names the shell entrypoint
+    must require (fail fast, no silent default) whenever it runs a recovery mode
+    (`eval-post-recovery` or `eval-post-recovery-preflight`). This is the single source
+    of truth `tau/scripts/run-prime-rl.sh`'s own required-name list is checked against
+    (see `test_run_prime_rl_recovery_env_names_match_f12_recovery_environment`), so the
+    shell and Python contracts cannot silently drift apart.
+    """
+    return tuple(f"PRIME_RL_RECOVERY_{name.upper()}" for name in F12_RECOVERY_ENVIRONMENT)
+
+
 def validate_recovery_runtime_source(runtime_source_revision: str) -> None:
     if (
         len(runtime_source_revision) != 40
