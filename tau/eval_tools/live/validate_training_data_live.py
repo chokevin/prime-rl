@@ -4,6 +4,7 @@ import hashlib
 import os
 import stat
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 from tau.eval_tools.hashing import hash_text
@@ -14,7 +15,29 @@ from tau.eval_tools.manifest import (
     TrainingRecord,
 )
 
-CANONICAL_SOURCE_TOML_SHA256 = "7617f4d2e574ac4eb834b488b8b43d4d9f5034e89e92ea7af761f3c3198a6c2c"
+
+@dataclass(frozen=True)
+class SourceConfigContract:
+    source_config_rel: str
+    source_toml_sha256: str
+    max_steps: int
+    eval_interval: int
+
+
+SOURCE_CONFIG_CONTRACTS = {
+    "configs/tau/math-7b-h200/train.toml": SourceConfigContract(
+        source_config_rel="configs/tau/math-7b-h200/train.toml",
+        source_toml_sha256="7617f4d2e574ac4eb834b488b8b43d4d9f5034e89e92ea7af761f3c3198a6c2c",
+        max_steps=50,
+        eval_interval=25,
+    ),
+    "configs/tau/math-7b-h200/train-f12.toml": SourceConfigContract(
+        source_config_rel="configs/tau/math-7b-h200/train-f12.toml",
+        source_toml_sha256="5450d2ff141172a4ababc5dfe3df572f2764cba5c6e998d982bb21d270e9e2ff",
+        max_steps=200,
+        eval_interval=100,
+    ),
+}
 PRIVATE_MODEL_SENTINEL = "/__prime_rl_private__/model"
 PRIVATE_DATASET_SENTINEL = "/__prime_rl_private__/training-dataset"
 EXPECTED_LORA_TARGET_MODULES = [
@@ -29,6 +52,29 @@ EXPECTED_LORA_TARGET_MODULES = [
     "fc1_latent_proj",
     "fc2_latent_proj",
 ]
+
+
+def source_config_contract(source_config_rel: str) -> SourceConfigContract:
+    try:
+        return SOURCE_CONFIG_CONTRACTS[source_config_rel]
+    except KeyError:
+        raise ValueError(f"unsupported immutable RL source config: {source_config_rel}") from None
+
+
+def _source_config_contract_for_bytes(
+    source_bytes: bytes,
+    source_config_rel: str | None = None,
+) -> SourceConfigContract:
+    digest = hashlib.sha256(source_bytes).hexdigest()
+    if source_config_rel is not None:
+        contract = source_config_contract(source_config_rel)
+        if digest != contract.source_toml_sha256:
+            raise ValueError(f"RL TOML does not match canonical experiment contract {contract.source_toml_sha256}")
+        return contract
+    for contract in SOURCE_CONFIG_CONTRACTS.values():
+        if digest == contract.source_toml_sha256:
+            return contract
+    raise ValueError(f"RL TOML does not match any canonical experiment contract: {digest}")
 
 
 def _read_regular_file(path: Path) -> bytes:
@@ -66,10 +112,10 @@ def validate_source_toml_contract(
     source_bytes: bytes,
     raw: dict,
     manifest: FrozenEvalManifest,
-) -> None:
-    digest = hashlib.sha256(source_bytes).hexdigest()
-    if digest != CANONICAL_SOURCE_TOML_SHA256:
-        raise ValueError(f"primary RL TOML does not match canonical experiment contract {CANONICAL_SOURCE_TOML_SHA256}")
+    *,
+    source_config_rel: str | None = None,
+) -> SourceConfigContract:
+    contract = _source_config_contract_for_bytes(source_bytes, source_config_rel)
     try:
         deployment = raw["deployment"]
         trainer = raw["trainer"]
@@ -84,6 +130,8 @@ def validate_source_toml_contract(
         raise ValueError(f"primary RL TOML is missing required contract field {exc}") from exc
     if raw.get("model", {}).get("name") != manifest.model.name:
         raise ValueError("source TOML model name does not match the frozen model name")
+    if raw.get("max_steps") != contract.max_steps:
+        raise ValueError(f"source TOML max_steps must be exactly {contract.max_steps}")
     if deployment.get("num_train_gpus") != 1 or deployment.get("num_infer_gpus") != 1:
         raise ValueError("source TOML must request exactly one trainer and one inference GPU")
     if trainer_model.get("impl") != "hf" or trainer_model.get("attn") != "flash_attention_2":
@@ -121,7 +169,7 @@ def validate_source_toml_contract(
     ):
         raise ValueError("source TOML math-env-v1 task config does not match the deterministic contract")
     if (
-        evaluation.get("interval") != 25
+        evaluation.get("interval") != contract.eval_interval
         or evaluation.get("num_examples") != 500
         or evaluation.get("group_size") != 1
         or len(eval_sources) != 1
@@ -130,6 +178,7 @@ def validate_source_toml_contract(
         or eval_sources[0].get("env", {}).get("agent", {}).get("runtime", {}).get("type") != "subprocess"
     ):
         raise ValueError("source TOML must configure all 500 math500-v1 rows with fixed eval settings")
+    return contract
 
 
 def _reload_training_records(manifest: FrozenEvalManifest, dataset_path: Path) -> list[TrainingRecord]:
@@ -155,6 +204,7 @@ def _resolve_rl_config(
     source_path: Path,
     manifest: FrozenEvalManifest,
     *,
+    source_config_rel: str,
     model_path: Path,
     dataset_path: Path,
     output_dir: Path,
@@ -164,7 +214,16 @@ def _resolve_rl_config(
 
     source_bytes = Path(source_path).read_bytes()
     raw = tomllib.loads(source_bytes.decode("utf-8"))
-    validate_source_toml_contract(source_bytes, raw, manifest)
+    contract = validate_source_toml_contract(
+        source_bytes,
+        raw,
+        manifest,
+        source_config_rel=source_config_rel,
+    )
+    if max_steps != contract.max_steps:
+        raise ValueError(
+            f"requested max_steps {max_steps} does not match {source_config_rel} contract {contract.max_steps}"
+        )
     _bind_run_specific_config(
         raw,
         model_path=model_path,
@@ -196,11 +255,17 @@ def _validate_effective_rl_config(
     config,
     manifest: FrozenEvalManifest,
     *,
+    source_config_rel: str,
     model_path: Path,
     dataset_path: Path,
     output_dir: Path,
     max_steps: int,
 ) -> None:
+    contract = source_config_contract(source_config_rel)
+    if max_steps != contract.max_steps:
+        raise ValueError(
+            f"resolved max_steps {max_steps} does not match {source_config_rel} contract {contract.max_steps}"
+        )
     model_path_str = str(model_path)
     if config.model is None or config.model.name != model_path_str:
         raise ValueError("resolved RL config does not use the verified local model snapshot")
@@ -320,7 +385,7 @@ def _validate_effective_rl_config(
         evaluation is None
         or evaluation.num_examples != 500
         or evaluation.group_size != 1
-        or evaluation.interval != 25
+        or evaluation.interval != contract.eval_interval
         or evaluation.skip_first_step
         or len(evaluation.source) != 1
     ):
@@ -330,7 +395,7 @@ def _validate_effective_rl_config(
         eval_source.env.taskset.id != "math500-v1"
         or eval_source.num_examples != 500
         or eval_source.group_size != 1
-        or eval_source.interval != 25
+        or eval_source.interval != contract.eval_interval
         or eval_source.env.agent.harness.id != "null"
         or eval_source.env.agent.runtime.type != "subprocess"
         or eval_source.sampling.model_dump()
@@ -424,7 +489,7 @@ def _resolved_config_identity(
     canonical_bytes = tomli_w.dumps(canonical_dict).encode("utf-8")
     identity = RLConfigIdentity(
         source_config_rel=source_config_rel,
-        source_toml_sha256=CANONICAL_SOURCE_TOML_SHA256,
+        source_toml_sha256=source_config_contract(source_config_rel).source_toml_sha256,
         output_dir=logical_output_dir,
         max_steps=max_steps,
         canonical_resolved_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
@@ -447,6 +512,7 @@ def resolve_effective_rl_config(
     config = _resolve_rl_config(
         source_path,
         manifest,
+        source_config_rel=source_config_rel,
         model_path=model_path,
         dataset_path=dataset_path,
         output_dir=output_dir,
@@ -455,6 +521,7 @@ def resolve_effective_rl_config(
     _validate_effective_rl_config(
         config,
         manifest,
+        source_config_rel=source_config_rel,
         model_path=model_path,
         dataset_path=dataset_path,
         output_dir=output_dir,
@@ -492,6 +559,7 @@ def validate_resolved_rl_config(
     _validate_effective_rl_config(
         config,
         manifest,
+        source_config_rel=source_config_rel,
         model_path=model_path,
         dataset_path=dataset_path,
         output_dir=output_dir,

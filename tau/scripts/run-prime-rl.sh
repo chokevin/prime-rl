@@ -178,9 +178,19 @@ canonical_overlay_path() {
 }
 
 primary_config_path() {
-    [ "${PRIME_RL_CONFIG_REL:-}" = "configs/tau/math-7b-h200/train.toml" ] ||
-        die "PRIME_RL_CONFIG_REL must be exactly configs/tau/math-7b-h200/train.toml"
+    case "${PRIME_RL_CONFIG_REL:-}" in
+    configs/tau/math-7b-h200/train.toml | configs/tau/math-7b-h200/train-f12.toml) ;;
+    *) die "PRIME_RL_CONFIG_REL must select an immutable Tau train config" ;;
+    esac
     canonical_overlay_path "$PRIME_RL_CONFIG_REL" file
+}
+
+primary_config_max_steps() {
+    case "${PRIME_RL_CONFIG_REL:-}" in
+    configs/tau/math-7b-h200/train.toml) printf '50\n' ;;
+    configs/tau/math-7b-h200/train-f12.toml) printf '200\n' ;;
+    *) die "PRIME_RL_CONFIG_REL must select an immutable Tau train config" ;;
+    esac
 }
 
 # Optional narrow install of one repo-local environment package — forward-compatible
@@ -288,6 +298,8 @@ freeze-finalize)
     : "${PRIME_RL_MAX_STEPS:?PRIME_RL_MAX_STEPS must select the exact bounded final training step}"
     [[ "$PRIME_RL_MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || die "PRIME_RL_MAX_STEPS must be a positive integer"
     config_path="$(primary_config_path)"
+    [ "$PRIME_RL_MAX_STEPS" = "$(primary_config_max_steps)" ] ||
+        die "PRIME_RL_MAX_STEPS does not match the selected immutable train config"
     uv run --no-sync python -m tau.eval_tools.cli validate-manifest \
         --manifest "${PRIME_RL_MANIFEST_DIR}/draft-manifest.json" \
         --source-revision "$resolved_sha" \

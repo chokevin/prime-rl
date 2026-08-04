@@ -44,6 +44,7 @@ from tau.eval_tools.live.validate_training_data_live import (
     _read_regular_file,
     _replace_runtime_paths,
     resolve_effective_rl_config,
+    source_config_contract,
     validate_resolved_rl_config,
     validate_source_toml_contract,
 )
@@ -63,6 +64,8 @@ from tau.eval_tools.manifest import (
 from tau.eval_tools.output_paths import evidence_generation
 
 SOURCE_REVISION = "a" * 40
+F10_CONFIG_REL = "configs/tau/math-7b-h200/train.toml"
+F12_CONFIG_REL = "configs/tau/math-7b-h200/train-f12.toml"
 VERIFIERS_REVISION = "b" * 40
 TASKSETS_REVISION = "c" * 40
 MODEL_REVISION = "d" * 40
@@ -253,12 +256,12 @@ def _evidence(
     return preflight, paths
 
 
-def _publication_kwargs(output_dir: Path, manifest, attempt_id: str = ATTEMPT_1):
+def _publication_kwargs(output_dir: Path, manifest, attempt_id: str = ATTEMPT_1, expected_step: int = 50):
     return {
         "output_dir": output_dir,
         "manifest": manifest,
         "attempt_id": attempt_id,
-        "expected_step": 50,
+        "expected_step": expected_step,
         "expected_rank": 16,
     }
 
@@ -1700,6 +1703,87 @@ def test_source_equivalent_config_contract_accepts_full_current_toml():
     validate_source_toml_contract(source_bytes, raw, manifest)
 
 
+def test_f12_source_config_is_exact_duration_only_contract():
+    manifest = _manifest()
+    root = Path(__file__).parents[3]
+    f10_path = root / F10_CONFIG_REL
+    f12_path = root / F12_CONFIG_REL
+    f10 = source_config_contract(F10_CONFIG_REL)
+    f12 = source_config_contract(F12_CONFIG_REL)
+
+    assert (f10.max_steps, f10.eval_interval) == (50, 25)
+    assert (f12.max_steps, f12.eval_interval) == (200, 100)
+    validate_source_toml_contract(
+        f10_path.read_bytes(),
+        tomllib.loads(f10_path.read_text()),
+        manifest,
+        source_config_rel=F10_CONFIG_REL,
+    )
+    validate_source_toml_contract(
+        f12_path.read_bytes(),
+        tomllib.loads(f12_path.read_text()),
+        manifest,
+        source_config_rel=F12_CONFIG_REL,
+    )
+    with pytest.raises(ValueError, match="canonical experiment contract"):
+        validate_source_toml_contract(
+            f10_path.read_bytes(),
+            tomllib.loads(f10_path.read_text()),
+            manifest,
+            source_config_rel=F12_CONFIG_REL,
+        )
+
+
+def _config_differences(left, right, prefix=()):
+    if isinstance(left, dict) and isinstance(right, dict):
+        assert left.keys() == right.keys()
+        differences = set()
+        for key in left:
+            differences.update(_config_differences(left[key], right[key], (*prefix, key)))
+        return differences
+    if isinstance(left, list) and isinstance(right, list):
+        assert len(left) == len(right)
+        differences = set()
+        for index, (left_item, right_item) in enumerate(zip(left, right, strict=True)):
+            differences.update(_config_differences(left_item, right_item, (*prefix, index)))
+        return differences
+    return {prefix} if left != right else set()
+
+
+def test_resolved_f10_f12_configs_differ_only_in_duration_and_monitoring_interval(tmp_path):
+    from prime_rl.utils.config import to_toml_dict
+
+    root = Path(__file__).parents[3]
+    common = {
+        "manifest": _manifest(),
+        "model_path": tmp_path / "model",
+        "dataset_path": tmp_path / "training-dataset",
+        "output_dir": TEST_GENERATION.train,
+    }
+    f10, _, _ = resolve_effective_rl_config(
+        root / F10_CONFIG_REL,
+        source_config_rel=F10_CONFIG_REL,
+        max_steps=50,
+        **common,
+    )
+    f12, _, f12_identity = resolve_effective_rl_config(
+        root / F12_CONFIG_REL,
+        source_config_rel=F12_CONFIG_REL,
+        max_steps=200,
+        **common,
+    )
+
+    assert f12_identity.source_config_rel == F12_CONFIG_REL
+    assert f12_identity.source_toml_sha256 == source_config_contract(F12_CONFIG_REL).source_toml_sha256
+    assert _config_differences(to_toml_dict(f10), to_toml_dict(f12)) == {
+        ("max_steps",),
+        ("orchestrator", "eval", "interval"),
+        ("orchestrator", "eval", "source", 0, "interval"),
+        ("orchestrator", "max_steps"),
+        ("trainer", "max_steps"),
+    }
+
+
 def test_run_specific_config_binds_only_private_materializations():
     source = Path(__file__).parents[3] / "configs/tau/math-7b-h200/train.toml"
     raw = tomllib.loads(source.read_text())
@@ -1751,8 +1835,19 @@ def test_runtime_config_identity_normalizes_all_attempt_private_paths_and_reject
         _read_regular_file(link)
 
 
-def test_real_resolved_config_round_trip_preflight_publication_and_post_handoff(tmp_path):
-    source_config = Path(__file__).parents[3] / "configs/tau/math-7b-h200/train.toml"
+@pytest.mark.parametrize(
+    ("source_config_rel", "max_steps"),
+    [
+        (F10_CONFIG_REL, 50),
+        (F12_CONFIG_REL, 200),
+    ],
+)
+def test_real_resolved_config_round_trip_preflight_publication_and_post_handoff(
+    tmp_path,
+    source_config_rel,
+    max_steps,
+):
+    source_config = Path(__file__).parents[3] / source_config_rel
     output_dir = tmp_path / "train"
     output_dir.mkdir()
     create_attempt_directory(output_dir, ATTEMPT_1)
@@ -1768,12 +1863,12 @@ def test_real_resolved_config_round_trip_preflight_publication_and_post_handoff(
     _, resolved_bytes, identity = resolve_effective_rl_config(
         source_config,
         _manifest(),
-        source_config_rel="configs/tau/math-7b-h200/train.toml",
+        source_config_rel=source_config_rel,
         model_path=model_path,
         dataset_path=dataset_path,
         output_dir=paths.run_output,
         logical_output_dir=Path(RL_CONFIG.output_dir),
-        max_steps=50,
+        max_steps=max_steps,
     )
     manifest = _manifest().model_copy(update={"rl_config": identity})
     private_config_path.write_bytes(resolved_bytes)
@@ -1782,12 +1877,12 @@ def test_real_resolved_config_round_trip_preflight_publication_and_post_handoff(
     _, parsed_bytes, parsed_identity = validate_resolved_rl_config(
         paths.resolved_config,
         manifest,
-        source_config_rel="configs/tau/math-7b-h200/train.toml",
+        source_config_rel=source_config_rel,
         model_path=model_path,
         dataset_path=dataset_path,
         output_dir=paths.run_output,
         logical_output_dir=Path(RL_CONFIG.output_dir),
-        max_steps=50,
+        max_steps=max_steps,
     )
     assert parsed_bytes == resolved_bytes
     assert parsed_identity == identity
@@ -1804,7 +1899,7 @@ def test_real_resolved_config_round_trip_preflight_publication_and_post_handoff(
         private_config_path=private_config_path,
         resolved_config_path=paths.resolved_config,
     )
-    source_adapter = _adapter(paths.run_output, 50)
+    source_adapter = _adapter(paths.run_output, max_steps)
     _, preflight_sha256 = load_json_with_sha256(paths.preflight)
     stable = source_adapter.parent / "STABLE"
     completion = TrainingCompletionAttestation(
@@ -1823,7 +1918,7 @@ def test_real_resolved_config_round_trip_preflight_publication_and_post_handoff(
         resolved_config_path=str(paths.resolved_config),
         artifact_output_dir=str(output_dir),
         attempt_output_dir=str(paths.run_output),
-        source_step=50,
+        source_step=max_steps,
         stable_marker_path=str(stable),
         stable_marker_sha256=hashlib.sha256(stable.read_bytes()).hexdigest(),
         source_adapter_path=str(source_adapter),
@@ -1834,14 +1929,14 @@ def test_real_resolved_config_round_trip_preflight_publication_and_post_handoff(
         staging_path=paths.completion_staging,
         payload=completion.model_dump(),
     )
-    result = publish_training_result(**_publication_kwargs(output_dir, manifest))
+    result = publish_training_result(**_publication_kwargs(output_dir, manifest, expected_step=max_steps))
     assert preflight.rl_config == parsed_identity
     validate_adapter_handoff(
         result=result,
         manifest=manifest,
         training_output_dir=output_dir,
         expected_adapter_path=output_dir / "final-adapter",
-        expected_step=50,
+        expected_step=max_steps,
         expected_rank=16,
     )
 

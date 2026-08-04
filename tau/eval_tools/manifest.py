@@ -453,7 +453,10 @@ class RLConfigIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     contract_version: Literal[1] = 1
-    source_config_rel: Literal["configs/tau/math-7b-h200/train.toml"]
+    source_config_rel: Literal[
+        "configs/tau/math-7b-h200/train.toml",
+        "configs/tau/math-7b-h200/train-f12.toml",
+    ]
     source_toml_sha256: str
     output_dir: str
     max_steps: int

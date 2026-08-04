@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Iterator
 
 from tau.eval_tools.artifacts import (
-    SOURCE_CONFIG_REL,
     AdapterPublicationState,
     TrainingCompletionAttestation,
     TrainingPreflight,
@@ -236,7 +235,7 @@ def prepare_training_attempt(
     _, resolved_bytes, config_identity = resolve_effective_rl_config(
         source_config_path,
         manifest,
-        source_config_rel=SOURCE_CONFIG_REL,
+        source_config_rel=manifest.rl_config.source_config_rel,
         model_path=model_path,
         dataset_path=dataset_path,
         output_dir=paths.run_output,
@@ -316,7 +315,7 @@ def _write_completion_from_process(
     _, resolved_bytes, config_identity = validate_resolved_rl_config(
         paths.resolved_config,
         manifest,
-        source_config_rel=SOURCE_CONFIG_REL,
+        source_config_rel=manifest.rl_config.source_config_rel,
         model_path=Path(preflight.model_path),
         dataset_path=Path(preflight.dataset_path),
         output_dir=paths.run_output,
@@ -326,7 +325,7 @@ def _write_completion_from_process(
     _, private_bytes, private_identity = validate_resolved_rl_config(
         Path(preflight.private_config_path),
         manifest,
-        source_config_rel=SOURCE_CONFIG_REL,
+        source_config_rel=manifest.rl_config.source_config_rel,
         model_path=Path(preflight.model_path),
         dataset_path=Path(preflight.dataset_path),
         output_dir=paths.run_output,
@@ -534,7 +533,7 @@ def _supervise_prepared_attempt(
     _, private_bytes, private_identity = validate_resolved_rl_config(
         private_config,
         manifest,
-        source_config_rel=SOURCE_CONFIG_REL,
+        source_config_rel=manifest.rl_config.source_config_rel,
         model_path=Path(preflight.model_path),
         dataset_path=Path(preflight.dataset_path),
         output_dir=paths.run_output,
@@ -545,7 +544,7 @@ def _supervise_prepared_attempt(
     _, durable_bytes, durable_identity = validate_resolved_rl_config(
         paths.resolved_config,
         manifest,
-        source_config_rel=SOURCE_CONFIG_REL,
+        source_config_rel=manifest.rl_config.source_config_rel,
         model_path=Path(preflight.model_path),
         dataset_path=Path(preflight.dataset_path),
         output_dir=paths.run_output,

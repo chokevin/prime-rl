@@ -38,7 +38,6 @@ from tau.eval_tools.manifest import (
 ADAPTER_CONFIG = "adapter_config.json"
 ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors",)
 ATTEMPT_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{16}$")
-SOURCE_CONFIG_REL = "configs/tau/math-7b-h200/train.toml"
 _CANCELLATION_CHECK: ContextVar[Callable[[], None] | None] = ContextVar(
     "training_cancellation_check",
     default=None,
@@ -585,7 +584,7 @@ def write_training_preflight(
     _, resolved_bytes, config_identity = validate_resolved_rl_config(
         resolved_config_path,
         manifest,
-        source_config_rel=SOURCE_CONFIG_REL,
+        source_config_rel=manifest.rl_config.source_config_rel,
         model_path=model_path,
         dataset_path=dataset_path,
         output_dir=attempt_output_dir,
@@ -816,7 +815,7 @@ def _load_attempt_evidence(
     _, resolved_bytes, config_identity = validate_resolved_rl_config(
         paths.resolved_config,
         manifest,
-        source_config_rel=SOURCE_CONFIG_REL,
+        source_config_rel=manifest.rl_config.source_config_rel,
         model_path=Path(preflight.model_path),
         dataset_path=Path(preflight.dataset_path),
         output_dir=paths.run_output,
