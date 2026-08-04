@@ -29,6 +29,7 @@ tau/
   f12-eval-baseline.yaml  # 1 H200: source-matched F12 baseline
   f12-train.yaml          # 2 H200: 200-step duration-only training
   f12-eval-post.yaml      # 1 H200: F12 frozen post eval + unchanged gate
+  f12-eval-post-recovery.yaml # 1 H200: re-run the F12 post eval in a fresh generation (read-only F12 inputs)
   scripts/
     run-prime-rl.sh      # the one self-contained entrypoint all targets share (mode via $PRIME_RL_RUN_MODE)
   eval_tools/            # pure, macOS-testable: hashing, frozen-manifest schema, paired comparison + gate
@@ -249,6 +250,34 @@ contracts, not measured F12 results.
 Run the F12 ladder in the same order as F10 using the five
 `tau/.rendered/f12-*.yaml` targets: smoke, freeze draft, baseline, freeze finalize,
 train, and post. Fetch artifacts by exact filenames as described below.
+
+### F12 post-only recovery
+
+The F12 post evaluation published complete, immutable `rewards.json` and
+`comparison.json`, but its final `inference.log` promotion was interrupted. Per the
+terminal-state rule the comparison is already the experiment result and the interrupted
+`eval-post/inference.attempt-<hostname>.log` is the diagnostic artifact — that outcome is
+never resubmitted to obtain a fixed log.
+
+`f12-eval-post-recovery.yaml` (`PRIME_RL_RUN_MODE: eval-post-recovery`) re-runs that post
+eval once in a **fresh runtime-source generation** keyed by its own
+`PRIME_RL_REPO_SHA`, writing only into that generation's `eval-post-recovery` leaf. It
+reads the F12 inputs — frozen manifest, baseline rewards, training result, train output
+dir, and final adapter — **read-only** from the F12 generation
+`a603e791776a4579440edc5df5b70309c61cf46a`; nothing in the F12 generation (including its
+preserved partial log) is ever written, deleted, or quarantined.
+
+`tau/eval_tools/recovery.py` pins the exact immutable F12 input contract (canonical
+paths, source revision, full file digests, internal manifest/training-result identities,
+source step 200, adapter aggregate and per-file digests, and the 500 baseline example
+ids/mean) and rejects any supplied input that does not match — there is no
+arbitrary-source escape hatch. The model, decoding, grader, seed, all-500 ordering,
+baseline, adapter, comparison algorithm, bootstrap seed/count, and the unchanged gate
+(delta `>= +0.03` and paired-bootstrap 95% CI lower bound `> 0`) are byte-for-byte
+identical to the F12 post eval; there are no alternate checkpoint or reroll knobs. After
+the comparison is durable and before final log promotion, the run writes
+`recovery-provenance.json` binding both the recovery runtime source and the frozen F12
+source to that comparison result.
 
 ## Frozen eval manifest and the paired comparison gate
 
@@ -523,6 +552,7 @@ storage proof) — fetch each by its exact name with `--artifact <file>`.
 | `eval-post` | `<generation-root>/eval-post` | successful `rewards.json`, `comparison.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | post-training rewards + the `ComparisonResult` (delta, bootstrap CI, pass/fail); fixed log publishes last |
 | `train` | `<generation-root>/train` | fixed `training-result.json` and `final-adapter/`; exact logged `attempts/<attempt-id>/{preflight.json,resolved-train.toml,completion.json,publication.json,run-output/metrics.jsonl}`; optional `attempts/<attempt-id>/private-cleanup-diagnostic.json` | the trusted supervisor owns launch and attestation; attempt evidence binds the exact config/process/STABLE adapter, publication fsyncs and atomically installs without replacement, and writes the fixed result last; a post-success private-cleanup failure writes the optional diagnostic without changing success |
 | `harder-tier-curve` | F11 `<generation-root>/tier-curve` | successful `raw-base.json`, `raw-core.json`, `raw-hard.json`, `tier-curve.v1.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | full trusted harder-math catalog, exact F10 base-model/decoding contract, fixed `0.15` hardness gate; fixed log publishes last |
+| `eval-post-recovery` | recovery-runtime `<generation-root>/eval-post-recovery` | successful `rewards.json`, `comparison.json`, `recovery-provenance.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | fresh post rewards + the unchanged `ComparisonResult` over read-only frozen F12 inputs, plus `recovery-provenance.json` binding both the recovery runtime source and the frozen F12 source; fixed log publishes last |
 
 Explicit-file fetch while the run's Workload/Job still exists (the proven, reliable path):
 
@@ -588,7 +618,8 @@ target (see the proof ladder above), so no command in this doc lists a directory
 its output.
 
 `<job-name>` equals each YAML's `name:` field
-(`prime-rl-math-7b-h200-{smoke,freeze-manifest,eval-baseline,eval-post,train}` or
+(`prime-rl-math-7b-h200-{smoke,freeze-manifest,eval-baseline,eval-post,train}`,
+`prime-rl-math-7b-h200-f12-eval-post-recovery`, or
 `prime-rl-harder-math-7b-h200-tier-curve`).
 Never submit the bare `tau/<target>.yaml` template directly; use the validated rendered
 copy so image-pin validation cannot be skipped.
