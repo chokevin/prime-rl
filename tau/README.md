@@ -259,8 +259,8 @@ Its source-generation `eval-post/inference.log` remains preserved partial eviden
 there is no F12 post `rewards.json` or `comparison.json`, and that immutable tuple must
 not be rerun or cleaned up. The only approved continuation is the additive
 `f12-eval-post-recovery.yaml` target. It runs source
-`2594a4c0bdd1ba8ccc754e12205f4b0201bfef86`, writes only beneath
-`/data/pretraining-data/prime-rl-math-7b-h200/generations/2594a4c0bdd1ba8ccc754e12205f4b0201bfef86/eval-post-recovery/`,
+`09ac5e35304a5d0ae9dc43f3a39fed0a8c338af3`, writes only beneath
+`/data/pretraining-data/prime-rl-math-7b-h200/generations/09ac5e35304a5d0ae9dc43f3a39fed0a8c338af3/eval-post-recovery/`,
 and treats the complete F12 source generation as read-only.
 
 The recovery validates the exact F12 frozen manifest, 500-row baseline, successful
@@ -318,6 +318,27 @@ was repinned in a code-only session with no cluster access, and the real product
 adapter weight bytes are not available outside the cluster. The H200 target's fail-closed
 digest check means it cannot proceed until `f12-eval-post-recovery-preflight.yaml` is
 run for real and this placeholder is replaced with its actual output digest.
+
+**A first live CPU-preflight run at source `2594a4c0bdd1ba8ccc754e12205f4b0201bfef86`
+was admitted with 0 GPUs on a system node and fetched the exact runtime source, but
+failed before input validation.** Root cause:
+`f12-eval-post-recovery-preflight.yaml` never set the 15 immutable
+`PRIME_RL_RECOVERY_*` identity env vars, and `run-prime-rl.sh` built
+`output_paths.py`'s `--recovery-*` arguments with a silent `${VAR:-}` empty-string
+default for every mode, so the omission became empty strings rather than an
+immediate, clear failure. `run-prime-rl.sh` now fails fast with a per-variable error
+the moment `PRIME_RL_RUN_MODE` is `eval-post-recovery`/`eval-post-recovery-preflight`
+and any of these 15 vars is unset, using one `PRIME_RL_RECOVERY_ENV_NAMES` array
+checked by test against `tau.eval_tools.f12_recovery.f12_recovery_environment_variable_names()`
+so the two contracts cannot silently drift apart again.
+`f12-eval-post-recovery-preflight.yaml` now carries the complete identity block,
+kept byte-identical to `f12-eval-post-recovery.yaml`'s by
+`tau/eval_tools/tests/test_tau_targets.py`. Both targets are repinned to fresh
+runtime source `09ac5e35304a5d0ae9dc43f3a39fed0a8c338af3` and a correspondingly fresh
+output generation; source `2594a4c0bdd1ba8ccc754e12205f4b0201bfef86` and any output it
+produced are superseded evidence, never reused or cleaned up. The
+`PRIME_RL_RECOVERY_PREFLIGHT_SHA256` placeholder above is unchanged by this repin and
+remains fail-closed.
 
 Static recovery validation is:
 
