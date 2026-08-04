@@ -42,7 +42,7 @@ die() {
 [[ "$PRIME_RL_TASKSETS_SHA" =~ ^[0-9a-f]{40}$ ]] || die "PRIME_RL_TASKSETS_SHA must be a full lowercase 40-character commit SHA"
 
 CHILD_PID=""
-CHILD_PROCESS_GROUP=false
+CHILD_PROCESS_GROUP_ID=""
 TMP_ROOT="$(realpath -e /tmp)"
 [ -d "$TMP_ROOT" ] || die "canonical /tmp root is unavailable"
 overlay_raw="$(mktemp -d "${TMP_ROOT}/prime-rl-overlay.XXXXXX")"
@@ -78,8 +78,9 @@ fi
 cleanup() {
     if [ -n "$CHILD_PID" ]; then
         log "stopping child process (pid ${CHILD_PID})"
-        if [ "$CHILD_PROCESS_GROUP" = true ]; then
-            kill -TERM -- "-${CHILD_PID}" 2>/dev/null || kill -TERM "$CHILD_PID" 2>/dev/null || true
+        if [ -n "$CHILD_PROCESS_GROUP_ID" ]; then
+            kill -TERM -- "-${CHILD_PROCESS_GROUP_ID}" 2>/dev/null ||
+                kill -TERM "$CHILD_PID" 2>/dev/null || true
         else
             kill -TERM "$CHILD_PID" 2>/dev/null || true
         fi
@@ -121,8 +122,8 @@ forward_signal_and_exit() {
     trap - INT TERM
     if [ -n "$CHILD_PID" ]; then
         log "forwarding ${signal_name} to child process (pid ${CHILD_PID})"
-        if [ "$CHILD_PROCESS_GROUP" = true ]; then
-            kill "-${signal_name}" -- "-${CHILD_PID}" 2>/dev/null ||
+        if [ -n "$CHILD_PROCESS_GROUP_ID" ]; then
+            kill "-${signal_name}" -- "-${CHILD_PROCESS_GROUP_ID}" 2>/dev/null ||
                 kill "-${signal_name}" "$CHILD_PID" 2>/dev/null || true
         else
             kill "-${signal_name}" "$CHILD_PID" 2>/dev/null || true
@@ -130,7 +131,7 @@ forward_signal_and_exit() {
         wait "$CHILD_PID" 2>/dev/null || true
     fi
     CHILD_PID=""
-    CHILD_PROCESS_GROUP=false
+    CHILD_PROCESS_GROUP_ID=""
     exit "$exit_status"
 }
 
@@ -270,7 +271,7 @@ wait_for_health() {
                 child_status=$?
             fi
             CHILD_PID=""
-            CHILD_PROCESS_GROUP=false
+            CHILD_PROCESS_GROUP_ID=""
             die "inference server exited before readiness (status ${child_status}; ${url})"
         fi
         if [ "$waited" -ge "$timeout_s" ]; then
@@ -282,17 +283,54 @@ wait_for_health() {
     log "inference server healthy after ${waited}s (${url})"
 }
 
-stop_inference() {
-    local child_status inference_pid waited
-    [ -n "$CHILD_PID" ] || die "cannot stop inference without a tracked child"
-    [ "$CHILD_PROCESS_GROUP" = true ] || die "inference child is not isolated in its own process group"
-    inference_pid="$CHILD_PID"
-    log "stopping inference server before log promotion (pid ${CHILD_PID})"
-    if kill -0 -- "-${inference_pid}" 2>/dev/null; then
-        if ! kill -TERM -- "-${inference_pid}" 2>/dev/null &&
-            kill -0 -- "-${inference_pid}" 2>/dev/null; then
-            die "failed to terminate inference process group ${inference_pid}"
+wait_for_inference_process_group() {
+    local group_file="$1" waited=0 process_group_id child_status
+    [ -n "$CHILD_PID" ] || die "cannot discover inference process group without a tracked child"
+    while [ ! -s "$group_file" ]; do
+        if ! kill -0 "$CHILD_PID" 2>/dev/null; then
+            if wait "$CHILD_PID"; then
+                child_status=0
+            else
+                child_status=$?
+            fi
+            CHILD_PID=""
+            die "inference launcher exited before publishing its process group (status ${child_status})"
         fi
+        [ "$waited" -lt 200 ] || die "inference launcher did not publish its process group within 10s"
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+    [ -f "$group_file" ] && [ ! -L "$group_file" ] ||
+        die "inference process-group evidence is not a regular no-follow file"
+    IFS= read -r process_group_id <"$group_file"
+    [[ "$process_group_id" =~ ^[1-9][0-9]*$ ]] ||
+        die "inference launcher published an invalid process group: ${process_group_id}"
+    [ "$process_group_id" != "$$" ] || die "refusing to target the wrapper's own process group"
+    kill -0 -- "-${process_group_id}" 2>/dev/null ||
+        die "published inference process group ${process_group_id} is not running"
+    CHILD_PROCESS_GROUP_ID="$process_group_id"
+    log "tracking inference process group ${CHILD_PROCESS_GROUP_ID} via outer child ${CHILD_PID}"
+}
+
+stop_inference() {
+    local child_status inference_pid inference_pgid waited
+    [ -n "$CHILD_PID" ] || die "cannot stop inference without a tracked child"
+    [ -n "$CHILD_PROCESS_GROUP_ID" ] || die "inference process group was not verified"
+    inference_pid="$CHILD_PID"
+    inference_pgid="$CHILD_PROCESS_GROUP_ID"
+    log "stopping inference server before log promotion (pid ${inference_pid}, pgid ${inference_pgid})"
+    if kill -0 -- "-${inference_pgid}" 2>/dev/null; then
+        if ! kill -TERM -- "-${inference_pgid}" 2>/dev/null &&
+            kill -0 -- "-${inference_pgid}" 2>/dev/null; then
+            kill -TERM "$inference_pid" 2>/dev/null || true
+            die "failed to terminate inference process group ${inference_pgid}"
+        fi
+    elif kill -0 "$inference_pid" 2>/dev/null; then
+        kill -TERM "$inference_pid" 2>/dev/null || true
+        wait "$inference_pid" 2>/dev/null || true
+        CHILD_PID=""
+        CHILD_PROCESS_GROUP_ID=""
+        die "verified inference process group ${inference_pgid} disappeared while outer child remained"
     fi
     if wait "$inference_pid"; then
         child_status=0
@@ -300,18 +338,19 @@ stop_inference() {
         child_status=$?
     fi
     CHILD_PID=""
-    CHILD_PROCESS_GROUP=false
+    CHILD_PROCESS_GROUP_ID=""
     case "$child_status" in
     0 | 143) ;;
     *) die "inference server exited unexpectedly while stopping (status ${child_status})" ;;
     esac
     waited=0
-    while kill -0 -- "-${inference_pid}" 2>/dev/null && [ "$waited" -lt 100 ]; do
+    while kill -0 -- "-${inference_pgid}" 2>/dev/null && [ "$waited" -lt 100 ]; do
         sleep 0.1
         waited=$((waited + 1))
     done
-    if kill -0 -- "-${inference_pid}" 2>/dev/null; then
-        die "inference process group ${inference_pid} still owns descendants after TERM"
+    if kill -0 -- "-${inference_pgid}" 2>/dev/null; then
+        kill -KILL -- "-${inference_pgid}" 2>/dev/null || true
+        die "inference process group ${inference_pgid} still owns descendants after TERM"
     fi
 }
 
@@ -446,12 +485,14 @@ eval | eval-post-recovery)
         [ ! -e "$rewards_path" ] || die "${rewards_path} already exists; reward evidence is immutable"
         log "inference attempt id ${inference_attempt_id}"
         log "starting inference server: uv run inference ${inference_args[*]}"
+        inference_pgid_file="${RUN_ROOT}/inference-process-group"
         uv run --no-sync python -m tau.eval_tools.live.inference_launcher_live launch \
             --output-dir "$TAU_OUTPUT_DIR" \
-            --attempt-id "$inference_attempt_id" -- \
+            --attempt-id "$inference_attempt_id" \
+            --process-group-file "$inference_pgid_file" -- \
             uv run --no-sync inference "${inference_args[@]}" &
         CHILD_PID=$!
-        CHILD_PROCESS_GROUP=true
+        wait_for_inference_process_group "$inference_pgid_file"
 
         wait_for_health "http://localhost:8000/health" "${PRIME_RL_HEALTH_TIMEOUT_S:-1800}"
 
@@ -543,15 +584,17 @@ tier-curve)
     inference_attempt_id="${HOSTNAME:?HOSTNAME must identify this pod}"
     log "inference attempt id ${inference_attempt_id}"
     log "starting inference server for the full harder-math tier curve"
+    inference_pgid_file="${RUN_ROOT}/inference-process-group"
     uv run --no-sync python -m tau.eval_tools.live.inference_launcher_live launch \
         --output-dir "$TAU_OUTPUT_DIR" \
-        --attempt-id "$inference_attempt_id" -- \
+        --attempt-id "$inference_attempt_id" \
+        --process-group-file "$inference_pgid_file" -- \
         uv run --no-sync inference \
             --model.name "$model_snapshot_path" \
             --server.port 8000 \
             --router None &
     CHILD_PID=$!
-    CHILD_PROCESS_GROUP=true
+    wait_for_inference_process_group "$inference_pgid_file"
     wait_for_health "http://localhost:8000/health" "${PRIME_RL_HEALTH_TIMEOUT_S:-1800}"
 
     uv run --no-sync python -m tau.eval_tools.live.run_harder_tier_curve_live \
@@ -600,7 +643,7 @@ train)
         supervisor_status=$?
     fi
     CHILD_PID=""
-    CHILD_PROCESS_GROUP=false
+    CHILD_PROCESS_GROUP_ID=""
     if [ "$supervisor_status" -ne 0 ]; then
         log "training supervisor failed with status ${supervisor_status}"
         exit "$supervisor_status"

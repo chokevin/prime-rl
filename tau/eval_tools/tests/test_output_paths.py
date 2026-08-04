@@ -429,6 +429,7 @@ def test_interrupted_inference_attempt_preserves_partial_log_and_retry_can_start
     output_dir.mkdir()
     first_attempt = "pod-first"
     first_path = output_dir / attempt_log_name(first_attempt)
+    process_group_file = tmp_path / "first-process-group"
     environment = os.environ | {"PYTHONPATH": str(Path(__file__).parents[3])}
     child = subprocess.Popen(
         [
@@ -440,6 +441,8 @@ def test_interrupted_inference_attempt_preserves_partial_log_and_retry_can_start
             str(output_dir),
             "--attempt-id",
             first_attempt,
+            "--process-group-file",
+            str(process_group_file),
             "--",
             sys.executable,
             "-c",
@@ -454,7 +457,8 @@ def test_interrupted_inference_attempt_preserves_partial_log_and_retry_can_start
             time.sleep(0.01)
         else:
             raise AssertionError("inference launcher did not write its partial log")
-        child.send_signal(signal.SIGTERM)
+        process_group_id = int(process_group_file.read_text())
+        os.killpg(process_group_id, signal.SIGTERM)
         child.wait(timeout=5)
     finally:
         if child.poll() is None:
@@ -683,13 +687,14 @@ def test_recovery_wrapper_validates_fixed_inputs_before_model_or_inference_use()
 
     assert prepare < dispatch < recovery_validation < resolved_source < model_materialization
     assert model_materialization < launch < evaluate < comparison < stop < promote
-    assert "CHILD_PROCESS_GROUP=true" in script
-    assert 'kill -TERM -- "-${inference_pid}"' in script
+    assert 'wait_for_inference_process_group "$inference_pgid_file"' in script
+    assert 'kill -TERM -- "-${inference_pgid}"' in script
 
 
 def test_inference_launcher_terminates_complete_process_group_before_promotion(tmp_path):
     output_dir = tmp_path.resolve()
     attempt_id = "pod-process-group"
+    process_group_file = tmp_path / "process-group"
     leader_body = (
         "import os, signal, subprocess, sys, time; "
         "grandchild=subprocess.Popen([sys.executable, '-c', "
@@ -699,7 +704,10 @@ def test_inference_launcher_terminates_complete_process_group_before_promotion(t
     )
     child = subprocess.Popen(
         [
-            sys.executable,
+            "uv",
+            "run",
+            "--no-project",
+            "python",
             "-m",
             "tau.eval_tools.live.inference_launcher_live",
             "launch",
@@ -707,6 +715,8 @@ def test_inference_launcher_terminates_complete_process_group_before_promotion(t
             str(output_dir),
             "--attempt-id",
             attempt_id,
+            "--process-group-file",
+            str(process_group_file),
             "--",
             sys.executable,
             "-c",
@@ -722,19 +732,26 @@ def test_inference_launcher_terminates_complete_process_group_before_promotion(t
             time.sleep(0.05)
         else:
             pytest.fail("inference process group did not become ready")
-        assert os.getpgid(child.pid) == child.pid
+        process_group_id = int(process_group_file.read_text())
+        assert process_group_id != child.pid
+        assert os.getpgid(process_group_id) == process_group_id
 
-        os.killpg(child.pid, signal.SIGTERM)
+        os.killpg(process_group_id, signal.SIGTERM)
         assert child.wait(timeout=10) == 0
         with pytest.raises(ProcessLookupError):
-            os.killpg(child.pid, 0)
+            os.killpg(process_group_id, 0)
 
         promoted = promote_inference_log(output_dir, attempt_id)
         assert promoted.digest
-        assert (output_dir / "inference.log").read_text().startswith("leader-ready:")
+        final_log = (output_dir / "inference.log").read_text()
+        assert "leader-ready:" in final_log
+        assert "grandchild-ready" in final_log
     finally:
         if child.poll() is None:
-            os.killpg(child.pid, signal.SIGKILL)
+            if process_group_file.exists():
+                os.killpg(int(process_group_file.read_text()), signal.SIGKILL)
+            else:
+                child.kill()
             child.wait(timeout=5)
 
 

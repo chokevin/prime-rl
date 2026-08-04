@@ -63,7 +63,40 @@ def promote_inference_log(output_dir: str | Path, attempt_id: str) -> FileEviden
     )
 
 
-def launch_with_inference_log(output_dir: str | Path, attempt_id: str, command: Sequence[str]) -> NoReturn:
+def _publish_process_group_id(path: str | Path) -> None:
+    raw_path = os.fspath(path)
+    group_path = Path(raw_path)
+    if not group_path.is_absolute() or raw_path != str(group_path) or ".." in group_path.parts:
+        raise ValueError(f"process-group file must be an absolute canonical path: {raw_path}")
+    directory_descriptor = open_directory_nofollow(group_path.parent)
+    descriptor = None
+    try:
+        descriptor = os.open(
+            group_path.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        raw = f"{os.getpgrp()}\n".encode()
+        offset = 0
+        while offset < len(raw):
+            offset += os.write(descriptor, raw[offset:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.fsync(directory_descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_descriptor)
+
+
+def launch_with_inference_log(
+    output_dir: str | Path,
+    attempt_id: str,
+    process_group_file: str | Path,
+    command: Sequence[str],
+) -> NoReturn:
     if not command:
         raise ValueError("inference command must not be empty")
     descriptor = open_inference_log(output_dir, attempt_id)
@@ -74,6 +107,9 @@ def launch_with_inference_log(output_dir: str | Path, attempt_id: str, command: 
         if descriptor > 2:
             os.close(descriptor)
     os.setsid()
+    if os.getpgrp() != os.getpid():
+        raise RuntimeError("inference launcher failed to become its process-group leader")
+    _publish_process_group_id(process_group_file)
     os.execvp(command[0], command)
 
 
@@ -83,6 +119,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     launch_parser = subparsers.add_parser("launch")
     launch_parser.add_argument("--output-dir", required=True)
     launch_parser.add_argument("--attempt-id", required=True)
+    launch_parser.add_argument("--process-group-file", required=True)
     launch_parser.add_argument("command", nargs=argparse.REMAINDER)
     promote_parser = subparsers.add_parser("promote")
     promote_parser.add_argument("--output-dir", required=True)
@@ -92,7 +129,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         promote_inference_log(args.output_dir, args.attempt_id)
         return
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    launch_with_inference_log(args.output_dir, args.attempt_id, command)
+    launch_with_inference_log(args.output_dir, args.attempt_id, args.process_group_file, command)
 
 
 if __name__ == "__main__":
