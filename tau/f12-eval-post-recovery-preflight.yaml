@@ -1,0 +1,41 @@
+# Zero-GPU/CPU-only preflight: strictly re-validates the exact F12 recovery inputs and
+# private adapter materialization the H200 f12-eval-post-recovery target performs before
+# any GPU/inference work, and publishes the deterministic recovery-preflight.json that
+# target must then require by exact path and pin-supplied SHA-256.
+name: prime-rl-math-7b-h200-f12-eval-post-recovery-preflight
+engine: job
+entrypoint: scripts/run-prime-rl.sh
+
+runtime:
+  image: ghcr.io/primeintellect-ai/prime-rl@sha256:d701d000174052a70ad060197e71915e83e0f2b1fedef956c60b3038cf2b992f
+  env:
+    WANDB_MODE: offline
+    PRIME_RL_RUN_MODE: eval-post-recovery-preflight
+    PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
+    PRIME_RL_REPO_SHA: 2594a4c0bdd1ba8ccc754e12205f4b0201bfef86
+    PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
+    PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
+    PRIME_RL_MANIFEST_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/manifest/frozen-eval-manifest.json
+    PRIME_RL_BASELINE_REWARDS_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/eval-baseline/rewards.json
+    PRIME_RL_TRAINING_RESULT_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/train/training-result.json
+    PRIME_RL_TRAINING_OUTPUT_DIR: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/train
+    PRIME_RL_LORA_ADAPTER_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/train/final-adapter
+    PRIME_RL_RECOVERY_PREFLIGHT_OUTPUT_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/2594a4c0bdd1ba8ccc754e12205f4b0201bfef86/eval-post-recovery-preflight/recovery-preflight.json
+
+compute:
+  gpus: 0
+  cpu_request: "2"
+  cpu_limit: "4"
+  memory_request: 4Gi
+  memory_limit: 8Gi
+
+policy:
+  workspace: pretraining-data
+  queue: jobqueue
+  topology: independent
+  node_selector:
+    kubernetes.azure.com/mode: system
+
+storage:
+  data_pvc: blob-training
+  output: /data/pretraining-data/prime-rl-math-7b-h200/generations/2594a4c0bdd1ba8ccc754e12205f4b0201bfef86/eval-post-recovery-preflight

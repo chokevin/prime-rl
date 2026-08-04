@@ -30,6 +30,7 @@ tau/
   f12-train.yaml          # 2 H200: 200-step duration-only training
   f12-eval-post.yaml      # 1 H200: F12 frozen post eval + unchanged gate
   f12-eval-post-recovery.yaml # 1 H200: fixed-input recovery of interrupted F12 post eval
+  f12-eval-post-recovery-preflight.yaml # system-CPU, zero GPU: exact-path adapter handoff gate the H200 recovery requires
   scripts/
     run-prime-rl.sh      # the one self-contained entrypoint all targets share (mode via $PRIME_RL_RUN_MODE)
   eval_tools/            # pure, macOS-testable: hashing, frozen-manifest schema, paired comparison + gate
@@ -258,8 +259,8 @@ Its source-generation `eval-post/inference.log` remains preserved partial eviden
 there is no F12 post `rewards.json` or `comparison.json`, and that immutable tuple must
 not be rerun or cleaned up. The only approved continuation is the additive
 `f12-eval-post-recovery.yaml` target. It runs source
-`0da0f06fe3a214faa7d30fbbe007e2548f8cb232`, writes only beneath
-`/data/pretraining-data/prime-rl-math-7b-h200/generations/0da0f06fe3a214faa7d30fbbe007e2548f8cb232/eval-post-recovery/`,
+`2594a4c0bdd1ba8ccc754e12205f4b0201bfef86`, writes only beneath
+`/data/pretraining-data/prime-rl-math-7b-h200/generations/2594a4c0bdd1ba8ccc754e12205f4b0201bfef86/eval-post-recovery/`,
 and treats the complete F12 source generation as read-only.
 
 The recovery validates the exact F12 frozen manifest, 500-row baseline, successful
@@ -271,10 +272,60 @@ source and frozen F12 experiment source while applying the unchanged determinist
 10,000-sample paired-bootstrap gate. It does not expose an alternate checkpoint,
 decoding, grader, seed, baseline, or reroll knob.
 
+**The first recovery attempt at source `0da0f06fe3a214faa7d30fbbe007e2548f8cb232` failed
+pre-CUDA at 0/500.** Root cause: the durable BlobFuse adapter handoff validated the
+signed `TrainingResult.adapter_files` manifest by first calling `os.scandir()` on the
+mounted `final-adapter/` directory to discover file records, and BlobFuse's enumeration
+API returned zero entries even though every expected child path opened successfully by
+exact name. The generic, enumeration-based `build_file_manifest` /
+`validate_file_manifest` used for local/private trees is unchanged and still rejects
+missing, changed, symlink, nonregular, and extra entries by directory listing — that
+code path is correct for trees it controls. The durable BlobFuse handoff boundary is
+different: it is the one place a directory listing crossing an external mount cannot be
+trusted as either present or authoritative. `tau/eval_tools/manifest.py` and
+`tau/eval_tools/artifacts.py` (`validate_file_manifest_by_exact_paths`,
+`validate_adapter_directory_exact`, `copy_adapter_exclusive_by_manifest`) now validate
+that boundary by the exact, already-signed child paths only — no-follow descriptor-safe
+opens, inode-bound reads, size/SHA-256 streamed and compared per file and in aggregate,
+never inferring a trusted file list from what the directory happens to enumerate. The
+private destination this materializes is then re-validated by the original
+enumeration-based exact-set check, so arbitrary extra files still fail there. Recovery
+now runs at fresh runtime source `2594a4c0bdd1ba8ccc754e12205f4b0201bfef86`; source
+`0da0f06fe3a214faa7d30fbbe007e2548f8cb232` and its failed
+`eval-post-recovery/inference.log` are superseded evidence, never reused or cleaned up.
+
+Because the BlobFuse enumeration failure is provider/mount-state-dependent and cannot be
+fully reproduced offline, the H200 recovery target now requires a separate, additive
+zero-GPU preflight: `f12-eval-post-recovery-preflight.yaml` runs on system CPU (no GPU,
+no H200 selector/toleration, independent topology) against the same read-only F12
+inputs, and performs the identical exact-path adapter validation and private
+materialization the H200 job performs before inference — cheaply, on general compute,
+before any GPU is scheduled. It publishes a deterministic, timestamp-free
+`recovery-preflight.json` (`tau/eval_tools/f12_recovery.py`:
+`write_f12_recovery_preflight`) recording both source identities, the exact
+manifest/baseline/training-result/adapter digests, rank/step, the private materialized
+adapter's own manifest, and a success status. The H200 recovery target requires the
+exact `PRIME_RL_RECOVERY_PREFLIGHT_PATH` and pins its SHA-256 in
+`PRIME_RL_RECOVERY_PREFLIGHT_SHA256`; `validate_f12_recovery_preflight` strictly checks
+the artifact's schema, object identity, source identity, input digests, and private
+manifest before inference is permitted to start, and fails closed if the artifact is
+absent, unreadable, or any field mismatches.
+
+`PRIME_RL_RECOVERY_PREFLIGHT_SHA256` in `f12-eval-post-recovery.yaml` is currently a
+placeholder (64 zero-hex digits, commented `PENDING`) because computing the real digest
+requires actually running the CPU preflight target once — this repo's runtime source
+was repinned in a code-only session with no cluster access, and the real production
+adapter weight bytes are not available outside the cluster. The H200 target's fail-closed
+digest check means it cannot proceed until `f12-eval-post-recovery-preflight.yaml` is
+run for real and this placeholder is replaced with its actual output digest.
+
 Static recovery validation is:
 
 ```bash
 uv run --no-sync python tau/render_image.py
+tau run validate --config tau/.rendered/f12-eval-post-recovery-preflight.yaml
+tau run --config tau/.rendered/f12-eval-post-recovery-preflight.yaml \
+  --context aks-ai-runtime-eastus2-admin --dry-run=client
 tau run validate --config tau/.rendered/f12-eval-post-recovery.yaml
 tau run --config tau/.rendered/f12-eval-post-recovery.yaml \
   --context aks-ai-runtime-eastus2-admin --dry-run=client
@@ -554,7 +605,8 @@ storage proof) — fetch each by its exact name with `--artifact <file>`.
 | `freeze-manifest` | `<generation-root>/manifest` | `draft-manifest.json`, `frozen-eval-manifest.json` | unfrozen draft (pass 1) and the immutable frozen manifest (pass 2) `tau/eval_tools/manifest.py` reads/writes |
 | `eval-baseline` | `<generation-root>/eval-baseline` | successful `rewards.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | baseline per-example rewards (`RewardRecord`) `tau/eval_tools/compare.py` consumes; fixed log publishes last |
 | `eval-post` | `<generation-root>/eval-post` | successful `rewards.json`, `comparison.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | post-training rewards + the `ComparisonResult` (delta, bootstrap CI, pass/fail); fixed log publishes last |
-| `f12-eval-post-recovery` | recovery `<generation-root>/eval-post-recovery` | successful `rewards.json`, `comparison.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | one fixed-input post-only recovery; comparison records recovery runtime source plus frozen F12 source; F12 source generation remains read-only |
+| `f12-eval-post-recovery` | recovery `<generation-root>/eval-post-recovery` | successful `rewards.json`, `comparison.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | one fixed-input post-only recovery; comparison records recovery runtime source plus frozen F12 source; F12 source generation remains read-only; requires a matching `recovery-preflight.json` sibling before inference |
+| `f12-eval-post-recovery-preflight` | recovery `<generation-root>/eval-post-recovery-preflight` | `recovery-preflight.json` | system-CPU, zero-GPU: the same exact-path adapter validation + private materialization the H200 recovery job performs, run first on general compute; deterministic, timestamp-free, digest-pinned by the H200 target |
 | `train` | `<generation-root>/train` | fixed `training-result.json` and `final-adapter/`; exact logged `attempts/<attempt-id>/{preflight.json,resolved-train.toml,completion.json,publication.json,run-output/metrics.jsonl}`; optional `attempts/<attempt-id>/private-cleanup-diagnostic.json` | the trusted supervisor owns launch and attestation; attempt evidence binds the exact config/process/STABLE adapter, publication fsyncs and atomically installs without replacement, and writes the fixed result last; a post-success private-cleanup failure writes the optional diagnostic without changing success |
 | `harder-tier-curve` | F11 `<generation-root>/tier-curve` | successful `raw-base.json`, `raw-core.json`, `raw-hard.json`, `tier-curve.v1.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | full trusted harder-math catalog, exact F10 base-model/decoding contract, fixed `0.15` hardness gate; fixed log publishes last |
 
@@ -624,7 +676,8 @@ its output.
 `<job-name>` equals each YAML's `name:` field
 (`prime-rl-math-7b-h200-{smoke,freeze-manifest,eval-baseline,eval-post,train}` or
 `prime-rl-harder-math-7b-h200-tier-curve`, or
-`prime-rl-math-7b-h200-f12-eval-post-recovery`).
+`prime-rl-math-7b-h200-f12-eval-post-recovery`, or
+`prime-rl-math-7b-h200-f12-eval-post-recovery-preflight`).
 Never submit the bare `tau/<target>.yaml` template directly; use the validated rendered
 copy so image-pin validation cannot be skipped.
 

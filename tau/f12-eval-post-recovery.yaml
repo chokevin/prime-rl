@@ -1,4 +1,6 @@
 # One approved 1-H200 recovery of the interrupted F12 post eval against immutable F12 inputs.
+# Repinned to a fresh runtime source generation after the BlobFuse os.scandir() root-cause fix
+# (the original 0da0f06f... generation is superseded and never reused).
 name: prime-rl-math-7b-h200-f12-eval-post-recovery
 engine: job
 entrypoint: scripts/run-prime-rl.sh
@@ -9,7 +11,7 @@ runtime:
     WANDB_MODE: offline
     PRIME_RL_RUN_MODE: eval-post-recovery
     PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
-    PRIME_RL_REPO_SHA: 0da0f06fe3a214faa7d30fbbe007e2548f8cb232
+    PRIME_RL_REPO_SHA: 2594a4c0bdd1ba8ccc754e12205f4b0201bfef86
     PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
     PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
     PRIME_RL_MODEL_NAME: Qwen/Qwen2.5-7B-Instruct
@@ -20,7 +22,16 @@ runtime:
     PRIME_RL_TRAINING_RESULT_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/train/training-result.json
     PRIME_RL_TRAINING_OUTPUT_DIR: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/train
     PRIME_RL_LORA_ADAPTER_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/train/final-adapter
-    PRIME_RL_COMPARISON_OUTPUT_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/0da0f06fe3a214faa7d30fbbe007e2548f8cb232/eval-post-recovery/comparison.json
+    PRIME_RL_COMPARISON_OUTPUT_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/2594a4c0bdd1ba8ccc754e12205f4b0201bfef86/eval-post-recovery/comparison.json
+    # Deterministic path to the sibling zero-GPU preflight artifact under the same fresh
+    # output generation; the H200 run fails closed if this exact path/digest don't match.
+    PRIME_RL_RECOVERY_PREFLIGHT_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/2594a4c0bdd1ba8ccc754e12205f4b0201bfef86/eval-post-recovery-preflight/recovery-preflight.json
+    # PENDING: placeholder pending the CPU-live preflight gate (out of scope for this
+    # code-only session -- see tau/f12-eval-post-recovery-preflight.yaml). Replace with
+    # the real SHA-256 of recovery-preflight.json after running that target once on the
+    # cluster; until then this placeholder cannot match a real preflight artifact, so
+    # the H200 target's fail-closed digest check correctly refuses to proceed.
+    PRIME_RL_RECOVERY_PREFLIGHT_SHA256: "0000000000000000000000000000000000000000000000000000000000000000"
     PRIME_RL_RECOVERY_EXPERIMENT_SOURCE_REVISION: a603e791776a4579440edc5df5b70309c61cf46a
     PRIME_RL_RECOVERY_MANIFEST_SHA256: 759bb7ba018f75d3c3dee219e0746e00d2ff0c7531ddc986becac4f909291845
     PRIME_RL_RECOVERY_BASELINE_REWARDS_SHA256: 8fc09bce4b4ecaf5256712d2b0eb1b72979e8f5a250f86e1e8e310ec3b2ec000
@@ -55,4 +66,4 @@ policy:
 
 storage:
   data_pvc: blob-training
-  output: /data/pretraining-data/prime-rl-math-7b-h200/generations/0da0f06fe3a214faa7d30fbbe007e2548f8cb232/eval-post-recovery
+  output: /data/pretraining-data/prime-rl-math-7b-h200/generations/2594a4c0bdd1ba8ccc754e12205f4b0201bfef86/eval-post-recovery
