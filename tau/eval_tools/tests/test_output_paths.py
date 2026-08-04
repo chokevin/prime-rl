@@ -32,6 +32,11 @@ def _references(mode, eval_label, source_revision, data_root):
             "training_output_dir": generation.train,
             "lora_adapter_path": generation.final_adapter,
         }
+    elif mode == "tier-curve":
+        references = {
+            "tier_curve_model_source_revision": source_revision,
+            "tier_curve_model_manifest_path": generation.frozen_manifest,
+        }
     else:
         references = {}
     if mode == "freeze-finalize":
@@ -47,6 +52,7 @@ def _references(mode, eval_label, source_revision, data_root):
         ("freeze-finalize", None, "manifest"),
         ("eval", "baseline", "eval-baseline"),
         ("eval", "post", "eval-post"),
+        ("tier-curve", None, "tier-curve"),
         ("train", None, "train"),
     ],
 )
@@ -185,6 +191,7 @@ def test_prepare_output_directory_rejects_noncanonical_path_before_creation(tmp_
         ("eval", "post", "training_result_path"),
         ("eval", "post", "training_output_dir"),
         ("eval", "post", "lora_adapter_path"),
+        ("tier-curve", None, "tier_curve_model_manifest_path"),
     ],
 )
 def test_cross_mode_references_cannot_mix_source_generations(tmp_path, mode, eval_label, field):
@@ -204,6 +211,32 @@ def test_cross_mode_references_cannot_mix_source_generations(tmp_path, mode, eva
         )
 
     assert not list(data_root.iterdir())
+
+
+def test_tier_curve_requires_explicit_model_generation_before_creation(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    output = evidence_generation(SOURCE_A, data_root=data_root).tier_curve
+
+    with pytest.raises(ValueError, match="MODEL_SOURCE_REVISION"):
+        prepare_output_directory("tier-curve", output, SOURCE_A, data_root=data_root)
+
+    assert not list(data_root.iterdir())
+
+
+def test_tier_curve_model_references_are_rejected_for_other_modes(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    model_generation = evidence_generation(SOURCE_B, data_root=data_root)
+
+    with pytest.raises(ValueError, match="only for tier-curve"):
+        validate_generation_references(
+            "smoke",
+            SOURCE_A,
+            tier_curve_model_source_revision=SOURCE_B,
+            tier_curve_model_manifest_path=model_generation.frozen_manifest,
+            data_root=data_root,
+        )
 
 
 def test_comparison_output_must_be_directly_under_matching_post_generation(tmp_path):

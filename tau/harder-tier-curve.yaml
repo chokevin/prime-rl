@@ -1,0 +1,43 @@
+# 1 H200: evaluate the exact F10 base model over all 5,030 trusted harder-math-v1
+# eval records, retain raw base/core/hard results, and enforce base-hard >= 0.15.
+#
+# This target is additive and independent: the five primary F10 smoke/freeze/eval/train
+# targets remain pinned to F10 and their evidence is never copied into this generation.
+name: prime-rl-harder-math-7b-h200-tier-curve
+engine: job
+entrypoint: scripts/run-prime-rl.sh
+
+runtime:
+  image: ghcr.io/primeintellect-ai/prime-rl@sha256:d701d000174052a70ad060197e71915e83e0f2b1fedef956c60b3038cf2b992f
+  env:
+    WANDB_MODE: offline
+    PRIME_RL_RUN_MODE: tier-curve
+    PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
+    PRIME_RL_REPO_SHA: ce9d0919b6eb266a7c8100b333dc9ea91e95b96f
+    PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
+    PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
+    PRIME_RL_EXTRA_ENV_PACKAGE_DIR: environments/harder_math_v1
+    PRIME_RL_TIER_CURVE_MODEL_SOURCE_REVISION: ce9d0919b6eb266a7c8100b333dc9ea91e95b96f
+    PRIME_RL_TIER_CURVE_MODEL_MANIFEST_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/ce9d0919b6eb266a7c8100b333dc9ea91e95b96f/manifest/frozen-eval-manifest.json
+    PRIME_RL_TIER_CURVE_MODEL_MANIFEST_SHA256: 115369d8b3248548b1680de0b8c695e161d1336b64a4b0de10493908c3021abe
+    PRIME_RL_TIER_CURVE_MAX_CONCURRENCY: "128"
+    PRIME_RL_HEALTH_TIMEOUT_S: "1800"
+
+compute:
+  gpus: 1
+  cpu_request: "8"
+  cpu_limit: "16"
+  memory_request: 64Gi
+  memory_limit: 128Gi
+
+policy:
+  workspace: pretraining-data
+  queue: jobqueue
+  topology: single-node-nvlink
+  node_selector:
+    agentpool: h200pool
+    kueue.azure.com/gpu-series: nd-h200-v5
+
+storage:
+  data_pvc: blob-training
+  output: /data/pretraining-data/prime-rl-math-7b-h200/generations/ce9d0919b6eb266a7c8100b333dc9ea91e95b96f/tier-curve

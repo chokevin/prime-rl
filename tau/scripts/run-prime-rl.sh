@@ -18,6 +18,7 @@
 #                    frozen-eval manifest (CPU-only, no GPU).
 #   freeze-finalize- validate fixed baseline rewards and freeze the immutable manifest.
 #   eval           - 1 GPU: standalone frozen-eval replay (baseline or post-training).
+#   tier-curve     - 1 GPU: full harder-math-v1 base/core/hard evaluation curve.
 #   train          - 2 GPU: bounded RL training; refuses to start without a frozen
 #                    manifest already on durable storage.
 set -euo pipefail
@@ -28,7 +29,7 @@ die() {
     exit 1
 }
 
-: "${PRIME_RL_RUN_MODE:?PRIME_RL_RUN_MODE must be set (smoke|freeze-draft|freeze-finalize|eval|train)}"
+: "${PRIME_RL_RUN_MODE:?PRIME_RL_RUN_MODE must be set (smoke|freeze-draft|freeze-finalize|eval|tier-curve|train)}"
 : "${TAU_OUTPUT_DIR:?TAU_OUTPUT_DIR not set by Tau}"
 : "${PRIME_RL_REPO_URL:?PRIME_RL_REPO_URL must be set (e.g. https://github.com/chokevin/prime-rl.git)}"
 : "${PRIME_RL_REPO_SHA:?PRIME_RL_REPO_SHA must be set to the exact commit to overlay}"
@@ -211,7 +212,9 @@ GENERATION_ROOT="$(uv run --no-sync python -m tau.eval_tools.output_paths \
     --training-result-path "${PRIME_RL_TRAINING_RESULT_PATH:-}" \
     --training-output-dir "${PRIME_RL_TRAINING_OUTPUT_DIR:-}" \
     --lora-adapter-path "${PRIME_RL_LORA_ADAPTER_PATH:-}" \
-    --comparison-output-path "${PRIME_RL_COMPARISON_OUTPUT_PATH:-}")"
+    --comparison-output-path "${PRIME_RL_COMPARISON_OUTPUT_PATH:-}" \
+    --tier-curve-model-source-revision "${PRIME_RL_TIER_CURVE_MODEL_SOURCE_REVISION:-}" \
+    --tier-curve-model-manifest-path "${PRIME_RL_TIER_CURVE_MODEL_MANIFEST_PATH:-}")"
 log "prepared source generation ${GENERATION_ROOT} and mode output ${TAU_OUTPUT_DIR}"
 
 # --- Step 2: child-process lifecycle helpers -----------------------------------------
@@ -400,6 +403,39 @@ eval)
         # `compare` exits nonzero on a failed gate; with `set -e` that fails this job,
         # which is the intended, honest signal — never overridden or ignored here.
     fi
+    ;;
+
+tier-curve)
+    : "${PRIME_RL_TIER_CURVE_MODEL_MANIFEST_PATH:?PRIME_RL_TIER_CURVE_MODEL_MANIFEST_PATH must bind the exact model and decoding contract}"
+    : "${PRIME_RL_TIER_CURVE_MODEL_MANIFEST_SHA256:?PRIME_RL_TIER_CURVE_MODEL_MANIFEST_SHA256 must bind the exact manifest bytes}"
+    : "${PRIME_RL_TIER_CURVE_MODEL_SOURCE_REVISION:?PRIME_RL_TIER_CURVE_MODEL_SOURCE_REVISION must bind the model contract generation}"
+    uv run --no-sync python -m tau.eval_tools.live.private_materialization_live \
+        --manifest "$PRIME_RL_TIER_CURVE_MODEL_MANIFEST_PATH" \
+        --run-root "$RUN_ROOT" \
+        --require-finalized \
+        >/dev/null
+    model_snapshot_path="${RUN_ROOT}/model"
+    chmod 0555 "$RUN_ROOT"
+
+    log "starting inference server for the full harder-math tier curve"
+    uv run --no-sync python -m tau.eval_tools.live.inference_launcher_live \
+        --output-dir "$TAU_OUTPUT_DIR" -- \
+        uv run --no-sync inference \
+            --model.name "$model_snapshot_path" \
+            --server.port 8000 \
+            --router None &
+    CHILD_PID=$!
+    wait_for_health "http://localhost:8000/health" "${PRIME_RL_HEALTH_TIMEOUT_S:-1800}"
+
+    uv run --no-sync python -m tau.eval_tools.live.run_harder_tier_curve_live \
+        --model-manifest "$PRIME_RL_TIER_CURVE_MODEL_MANIFEST_PATH" \
+        --model-manifest-sha256 "$PRIME_RL_TIER_CURVE_MODEL_MANIFEST_SHA256" \
+        --model-source-revision "$PRIME_RL_TIER_CURVE_MODEL_SOURCE_REVISION" \
+        --base-url "http://localhost:8000/v1" \
+        --served-model-name "$model_snapshot_path" \
+        --source-revision "$resolved_sha" \
+        --output-dir "$TAU_OUTPUT_DIR" \
+        --max-concurrency "${PRIME_RL_TIER_CURVE_MAX_CONCURRENCY:-128}"
     ;;
 
 train)

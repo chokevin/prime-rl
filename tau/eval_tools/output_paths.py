@@ -16,6 +16,7 @@ _MODE_OUTPUTS = {
     "smoke": "smoke",
     "freeze-draft": "manifest",
     "freeze-finalize": "manifest",
+    "tier-curve": "tier-curve",
     "train": "train",
 }
 _EVAL_OUTPUTS = {
@@ -32,6 +33,7 @@ class EvidenceGeneration:
     eval_baseline: Path
     train: Path
     eval_post: Path
+    tier_curve: Path
 
     @property
     def draft_manifest(self) -> Path:
@@ -69,6 +71,7 @@ def evidence_generation(
         eval_baseline=root / "eval-baseline",
         train=root / "train",
         eval_post=root / "eval-post",
+        tier_curve=root / "tier-curve",
     )
 
 
@@ -120,6 +123,8 @@ def validate_generation_references(
     training_output_dir: str | Path | None = None,
     lora_adapter_path: str | Path | None = None,
     comparison_output_path: str | Path | None = None,
+    tier_curve_model_source_revision: str | None = None,
+    tier_curve_model_manifest_path: str | Path | None = None,
     data_root: Path = Path("/data"),
 ) -> EvidenceGeneration:
     generation = evidence_generation(source_revision, data_root=data_root)
@@ -176,6 +181,18 @@ def validate_generation_references(
             raise ValueError(
                 f"PRIME_RL_COMPARISON_OUTPUT_PATH must be a canonical named file directly under {generation.eval_post}"
             )
+    if mode == "tier-curve":
+        if not tier_curve_model_source_revision:
+            raise ValueError("PRIME_RL_TIER_CURVE_MODEL_SOURCE_REVISION must be set for tier-curve mode")
+        model_generation = evidence_generation(tier_curve_model_source_revision, data_root=data_root)
+        _validate_exact_path(
+            "PRIME_RL_TIER_CURVE_MODEL_MANIFEST_PATH",
+            tier_curve_model_manifest_path,
+            model_generation.frozen_manifest,
+            required=True,
+        )
+    elif tier_curve_model_source_revision or tier_curve_model_manifest_path:
+        raise ValueError("tier-curve model references are valid only for tier-curve mode")
     return generation
 
 
@@ -192,6 +209,8 @@ def prepare_output_directory(
     training_output_dir: str | Path | None = None,
     lora_adapter_path: str | Path | None = None,
     comparison_output_path: str | Path | None = None,
+    tier_curve_model_source_revision: str | None = None,
+    tier_curve_model_manifest_path: str | Path | None = None,
     data_root: Path = Path("/data"),
 ) -> Path:
     validate_generation_references(
@@ -205,6 +224,8 @@ def prepare_output_directory(
         training_output_dir=training_output_dir,
         lora_adapter_path=lora_adapter_path,
         comparison_output_path=comparison_output_path,
+        tier_curve_model_source_revision=tier_curve_model_source_revision,
+        tier_curve_model_manifest_path=tier_curve_model_manifest_path,
         data_root=data_root,
     )
     expected = expected_output_path(mode, source_revision, eval_label=eval_label, data_root=data_root)
@@ -256,6 +277,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--training-output-dir", default="")
     parser.add_argument("--lora-adapter-path", default="")
     parser.add_argument("--comparison-output-path", default="")
+    parser.add_argument("--tier-curve-model-source-revision", default="")
+    parser.add_argument("--tier-curve-model-manifest-path", default="")
     args = parser.parse_args(argv)
     prepared = prepare_output_directory(
         args.mode,
@@ -269,6 +292,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         training_output_dir=args.training_output_dir,
         lora_adapter_path=args.lora_adapter_path,
         comparison_output_path=args.comparison_output_path,
+        tier_curve_model_source_revision=args.tier_curve_model_source_revision,
+        tier_curve_model_manifest_path=args.tier_curve_model_manifest_path,
     )
     print(prepared.parent)
 
