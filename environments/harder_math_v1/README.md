@@ -168,4 +168,7 @@ base_mean - hard_mean >= 0.15
 The API rejects thresholds below `0.15`; callers may request a stricter
 threshold up to `1.0`.
 
-The empirical model run is intentionally outside this package.
+The empirical model run is intentionally outside this package. The repository's
+`tau/harder-tier-curve.yaml` target runs the full catalog on one H200, binds the exact
+finalized F10 base-model/decoding manifest, writes immutable raw base/core/hard evidence,
+and fails if any request/grader fails or the fixed `0.15` gap is missed.

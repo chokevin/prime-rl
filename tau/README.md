@@ -1,13 +1,15 @@
-# Tau: prime-rl math-7b-h200 (W4b)
+# Tau: prime-rl math-7b-h200
 
-Runs the primary experiment from the `/goal` harness's math hill-climb — LoRA RL
-fine-tuning of `Qwen/Qwen2.5-7B-Instruct` on `math-env-v1`, measured against a frozen,
-paired `math500-v1` held-out eval — through the `tau` CLI on `aks-ai-runtime-eastus2`.
+Runs LoRA RL fine-tuning of `Qwen/Qwen2.5-7B-Instruct` on `math-env-v1`, measured
+against a frozen, paired `math500-v1` held-out eval, through the `tau` CLI on
+`aks-ai-runtime-eastus2`. The F10 proof ladder completed end to end, including a
+50-step two-H200 run, but the frozen comparison was a retained negative result:
+`0.7480 -> 0.7500`, delta `+0.0020`, paired-bootstrap 95% CI
+`[-0.0160, +0.0200]`.
 
-**GPU execution has not been done in this session.** Everything below through "Static
-validation done in this session" is proven; everything under "What is *not* proven yet"
-requires a live cluster submit that this W4b implementation session did not perform (its
-scope was static config/scripts/tests only — see the parent `/goal` plan's W4b/W5 split).
+The additive F11 target measures the same frozen base model over the full 5,030-row
+`harder-math-v1` eval catalog. It is independent of F10 training evidence and does
+not rerun or reinterpret the failed F10 tuple.
 
 ## Layout
 
@@ -20,8 +22,9 @@ tau/
   eval-baseline.yaml    # 1 H200: frozen-eval replay against the base model (`tau run eval-baseline`)
   eval-post.yaml        # 1 H200: frozen-eval replay against base+LoRA, then compare (`tau run eval-post`)
   train.yaml            # 2 H200 (1 trainer + 1 inference): bounded RL training (`tau run train`)
+  harder-tier-curve.yaml # 1 H200: full harder-math base/core/hard empirical curve
   scripts/
-    run-prime-rl.sh      # the one self-contained entrypoint all five targets share (mode via $PRIME_RL_RUN_MODE)
+    run-prime-rl.sh      # the one self-contained entrypoint all six targets share (mode via $PRIME_RL_RUN_MODE)
   eval_tools/            # pure, macOS-testable: hashing, frozen-manifest schema, paired comparison + gate
     hashing.py
     json_io.py             # duplicate-key rejection + exclusive JSON evidence writes
@@ -33,6 +36,7 @@ tau/
     live/                   # GPU-container-only: real dataset/model/inference-server scripts
       freeze_manifest_live.py
       run_frozen_eval_live.py
+      run_harder_tier_curve_live.py
       validate_training_data_live.py # canonical resolved-config parser/identity
       training_supervisor_live.py    # owns private inputs, RL child, attestation, publication
 configs/tau/math-7b-h200/
@@ -58,7 +62,8 @@ independent` with `kubernetes.azure.com/mode=system`, admitting on system CPU
 nodes without H200 selectors or tolerations. GPU targets use H200 node selectors
 `agentpool=h200pool` + `kueue.azure.com/gpu-series=nd-h200-v5` and
 `policy.topology: single-node-nvlink` (required — the H200 `ResourceFlavor` is
-TAS-only), with 2 GPUs for training / 1 for eval.
+TAS-only), with 2 GPUs for training and 1 GPU for either frozen eval or the
+harder-math tier curve.
 
 ## Image and overlay strategy
 
@@ -78,20 +83,20 @@ curl -sD - -o /dev/null --oauth2-bearer "$TOKEN" \
 The manifest's `org.opencontainers.image.revision` annotation is
 `bbb90a1b4132c351cbe8b0ed1fa808dde99f0318` — exactly this branch's merge-base commit (the
 sync branch's tree is byte-identical to upstream `bbb90a1b4`; see the `/goal` plan's
-Baseline section). The immutable runtime overlay is
-`ce9d0919b6eb266a7c8100b333dc9ea91e95b96f`. That commit contains the complete Tau
-wrapper/eval tooling and the workspace-locked `environments/harder_math_v1` package.
-Its dependency set matches the pinned image: `harder-math-v1` uses only `datasets` and
-`verifiers`, which are already present. The later integration commit changes only
-checked-in Tau pins/docs and the client-side selection fixture; runtime code continues
-to come from the immutable overlay.
+Baseline section). The five F10 targets use immutable runtime overlay
+`ce9d0919b6eb266a7c8100b333dc9ea91e95b96f`. The additive tier-curve target uses
+F11 runtime `bf0e4c478648ec97eb0eea917cba71348af86d1e`, which adds only the
+full-catalog runner, exact F10 model-contract binding, and its isolated output mode.
+Both commits contain the workspace-locked `environments/harder_math_v1` package.
+Its dependency set matches the pinned image: `harder-math-v1` uses only `datasets`
+and `verifiers`, which are already present.
 
 The Qwen2.5 trainer is pinned to prime-rl's Hugging Face implementation with
 `flash_attention_2`. Qwen2.5 has no custom PrimeRL trainer implementation, while Hopper's
 automatic `flash_attention_3` selection is custom-only; leaving both fields on `auto`
 therefore fails before model loading.
 
-Every durable artifact belongs to the complete source generation rooted at
+Every F10 artifact belongs to the complete source generation rooted at
 `/data/pretraining-data/prime-rl-math-7b-h200/generations/ce9d0919b6eb266a7c8100b333dc9ea91e95b96f`.
 The wrapper derives this root from the exact fetched commit and rejects output or
 cross-mode inputs from any other generation before creating a directory. Any runtime
@@ -100,14 +105,23 @@ new smoke/manifest/baseline/train/post generation. The later pin commit may only
 templates and docs to that source SHA. Existing generation directories are immutable and
 preserved; they are never migrated, deleted, or reused by a newer source.
 
-**Why a pin file + render step when the digest is also checked in 5×:** the templates
+F11 tier evidence is isolated under
+`/data/pretraining-data/prime-rl-math-7b-h200/generations/bf0e4c478648ec97eb0eea917cba71348af86d1e/tier-curve`.
+It deliberately consumes the finalized F10 manifest only as the exact base-model and
+decoding contract. Before creating F11 output, the wrapper requires the canonical F10
+manifest path, source revision, and verified file SHA-256
+`115369d8b3248548b1680de0b8c695e161d1336b64a4b0de10493908c3021abe`.
+The runner repeats the digest and semantic-contract checks and records the digest in
+each raw tier artifact.
+
+**Why a pin file + render step when the digest is also checked into every target:** the templates
 must be directly inspectable and runnable-looking, while `tau/image.pin.json` remains
 the source of truth used to detect drift. `tau/render_image.py` validates that every
 template carries exactly that real digest, writes validated copies to gitignored
 `tau/.rendered/`, and mirrors `tau/scripts/` alongside them because `entrypoint:` paths
 resolve relative to the config file's own directory. It refuses to stage anything if
 the pin is missing, malformed, set to `latest`, or disagrees with any target. Re-pinning
-therefore requires an intentional edit to the pin and all five visible targets.
+therefore requires an intentional edit to the pin and all visible targets.
 
 **Why no `uv sync` at job startup:** `tau/scripts/run-prime-rl.sh` creates a private
 `/tmp/prime-rl-overlay.XXXXXX` scratch directory, fetches this exact fork/commit into it
@@ -126,7 +140,7 @@ that *does* change dependencies, but heavier than this branch needs. If a future
 adds a Python dependency, switch to that built-in mechanism (or add an
 explicit `uv sync --inexact` step to this wrapper) instead of silently going stale.
 
-**Narrow package-install escape hatch:** a later harder-math tier-curve target may set
+**Narrow package-install escape hatch:** the harder-math tier-curve target sets
 `runtime.env.PRIME_RL_EXTRA_ENV_PACKAGE_DIR=environments/harder_math_v1`. No other path
 is accepted. The wrapper rejects absolute paths, `..`, symlink components, and canonical
 escapes before running `uv pip install --no-deps -e` on that verified checkout path. It
@@ -136,13 +150,14 @@ not need this escape hatch: `math-env-v1` and `math500-v1` already ship in
 
 The corresponding prime-rl source-selection overlay is
 `configs/tau/math-7b-h200/harder-math-v1-hard.toml`. It is a static fixture for config
-selection and a future tier-curve run; none of the five primary targets use it. Compose
+selection and a future harder-math training experiment; none of the five primary targets
+or the evaluation-only tier target use it. Compose
 it after `train.toml` to replace only `orchestrator.train.source`. The primary
 `math-env-v1` training and all-500 `math500-v1` frozen-evaluation proof ladder remain the
 default.
 
 **Harder-math metadata boundary:** the primary frozen manifest remains a strict,
-ordered 500-row MATH-500 contract. A `harder-math-v1` tier curve is a separate
+ordered 500-row MATH-500 contract. The `harder-math-v1` tier curve is a separate
 `tier-curve.v1` artifact covering its full 5,030-row eval catalog; it must never be
 inserted into `FrozenEvalManifest.examples`. For later disjointness tooling,
 `tier-curve.v1.records[].prompt_sha256` is the field corresponding to Tau's
@@ -150,7 +165,7 @@ inserted into `FrozenEvalManifest.examples`. For later disjointness tooling,
 answer-only `answer_hash`; `record_id` is source-qualified text rather than the
 MATH-500 integer ID. Keeping those artifacts separate lets Tau consume the W4a prompt
 hash set later without weakening or renaming the primary manifest fields and without
-claiming any empirical tier result.
+mixing its empirical result into the F10 comparison.
 
 **If no matching image digest existed:** the fallback is a manual
 `workflow_dispatch` of `.github/workflows/build_image.yaml` — but that workflow only
@@ -195,8 +210,9 @@ Derived from `configs/basic/hendrycks-sanity/rl.toml` per the W2 selection memo:
 | `[orchestrator.train.source.env.taskset.task].judge` | `"None"` | disables `math-env-v1`'s LLM reference-judge fallback so training reward is purely deterministic (`"None"` → Python `None`, per `deps/pydantic-config/src/pydantic_config/cli.py`'s TOML-null convention) |
 | `[orchestrator.eval]` | `math500-v1`, all 500 examples, `group_size=1`, `interval=25` with `max_steps=50` | in-run startup(step 0)/periodic(25)/final(50) eval — a monitoring signal only, **not** the frozen comparison of record |
 
-`max_steps = 50` is a placeholder pending a real throughput measurement (see "What is
-not proven yet"). Finalization binds it in the canonical config identity. Training and
+`max_steps = 50` is the frozen F10 bounded-run budget. It completed successfully but
+was not sufficient to meet the statistical improvement gate. Finalization binds it in
+the canonical config identity. Training and
 post-eval derive the one source-proven final checkpoint path
 `weights/step_<max_steps>/lora_adapters` from that frozen identity; there is no runtime
 step override. The handoff never enumerates a storage directory.
@@ -247,7 +263,7 @@ step override. The handoff never enumerates a storage directory.
 
 ### Proof ladder (in order)
 
-Before any of this, confirm every target pins
+Before any of this, confirm the five primary F10 targets pin
 `ce9d0919b6eb266a7c8100b333dc9ea91e95b96f`, then render the image pin with
 `uv run --no-sync python tau/render_image.py`. The base model and training dataset
 revisions are already immutable pins. Every command below points at
@@ -312,6 +328,35 @@ tau run get prime-rl-math-7b-h200-eval-post -n pretraining-data \
 tau run get prime-rl-math-7b-h200-eval-post -n pretraining-data \
   --context aks-ai-runtime-eastus2-admin --artifact comparison.json
 ```
+
+### Harder-math tier curve
+
+The additive target pins F11 source `bf0e4c478648ec97eb0eea917cba71348af86d1e`
+while binding the exact finalized F10 manifest bytes. It evaluates all 5,030 trusted
+eval records once with concurrency 128: base 1,331, core 2,345, and hard 1,354.
+`verify_boxed_math_answer` remains synchronous so its timeout mechanism is not moved
+across worker threads. Any request/grader failure or
+`base_mean - hard_mean < 0.15` fails the Job after immutable evidence is written.
+Raw artifacts retain completions, IDs, hashes, binary rewards, and failures, but not
+dataset prompts or gold answers.
+
+```bash
+uv run --no-sync python tau/render_image.py
+tau run --config tau/.rendered/harder-tier-curve.yaml \
+  --context aks-ai-runtime-eastus2-admin
+tau run status prime-rl-harder-math-7b-h200-tier-curve -n pretraining-data \
+  --context aks-ai-runtime-eastus2-admin --watch
+tau run logs prime-rl-harder-math-7b-h200-tier-curve -n pretraining-data \
+  --context aks-ai-runtime-eastus2-admin -f
+for artifact in raw-base.json raw-core.json raw-hard.json tier-curve.v1.json inference.log; do
+  tau run get prime-rl-harder-math-7b-h200-tier-curve -n pretraining-data \
+    --context aks-ai-runtime-eastus2-admin --artifact "$artifact"
+done
+```
+
+This one-H200 full-catalog run is the only remaining empirical gate for the custom
+environment. Runtime and token cost are not yet measured; do not infer a cost estimate
+from the client dry-run.
 
 If a job is interrupted **before** `completion.json`, submit the unchanged train target
 again. The supervisor creates a new attempt ID and ignores stale attempt evidence; it
@@ -400,6 +445,7 @@ storage proof) — fetch each by its exact name with `--artifact <file>`.
 | `eval-baseline` | `<generation-root>/eval-baseline` | `rewards.json`, `inference.log` | baseline per-example rewards (`RewardRecord`) `tau/eval_tools/compare.py` consumes |
 | `eval-post` | `<generation-root>/eval-post` | `rewards.json`, `comparison.json`, `inference.log` | post-training rewards + the `ComparisonResult` (delta, bootstrap CI, pass/fail) |
 | `train` | `<generation-root>/train` | fixed `training-result.json` and `final-adapter/`; exact logged `attempts/<attempt-id>/{preflight.json,resolved-train.toml,completion.json,publication.json,run-output/metrics.jsonl}`; optional `attempts/<attempt-id>/private-cleanup-diagnostic.json` | the trusted supervisor owns launch and attestation; attempt evidence binds the exact config/process/STABLE adapter, publication fsyncs and atomically installs without replacement, and writes the fixed result last; a post-success private-cleanup failure writes the optional diagnostic without changing success |
+| `harder-tier-curve` | F11 `<generation-root>/tier-curve` | `raw-base.json`, `raw-core.json`, `raw-hard.json`, `tier-curve.v1.json`, `inference.log` | full trusted harder-math catalog, exact F10 base-model/decoding contract, fixed `0.15` hardness gate |
 
 Explicit-file fetch while the run's Workload/Job still exists (the proven, reliable path):
 
@@ -420,10 +466,11 @@ tau run get <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admi
 
 ## Operator commands
 
-**Before every submit:** confirm all five checked-in templates pin the immutable runtime
-overlay `ce9d0919b6eb266a7c8100b333dc9ea91e95b96f`, then render. Do not replace it with the
-later integration/pin commit: that would be a self-reference and that commit changes no
-runtime code. The pinned `Qwen/Qwen2.5-7B-Instruct` revision is
+**Before every submit:** confirm the five F10 templates pin runtime
+`ce9d0919b6eb266a7c8100b333dc9ea91e95b96f` and `harder-tier-curve.yaml` pins
+F11 runtime `bf0e4c478648ec97eb0eea917cba71348af86d1e`, then render. Do not pin a
+target to its later pin/docs commit: that would be a self-reference. The pinned
+`Qwen/Qwen2.5-7B-Instruct` revision is
 `a09a35458c702b33eeacc393d103063234e8bc28`. Every model-serving phase downloads that
 exact revision directly into a fresh job-private cache, validates the complete frozen
 file manifest, and serves only the non-writable private regular-file tree. Post-eval does
@@ -459,7 +506,9 @@ write/fetch/re-fetch reliable but directory listing (the no-`--artifact` form of
 target (see the proof ladder above), so no command in this doc lists a directory to find
 its output.
 
-`<job-name>` equals each YAML's `name:` field (`prime-rl-math-7b-h200-{smoke,freeze-manifest,eval-baseline,eval-post,train}`).
+`<job-name>` equals each YAML's `name:` field
+(`prime-rl-math-7b-h200-{smoke,freeze-manifest,eval-baseline,eval-post,train}` or
+`prime-rl-harder-math-7b-h200-tier-curve`).
 Never submit the bare `tau/<target>.yaml` template directly; use the validated rendered
 copy so image-pin validation cannot be skipped.
 
@@ -485,51 +534,50 @@ copy so image-pin validation cannot be skipped.
 
 Run all of the following before any submit:
 
-- `tau run validate --config tau/.rendered/<target>.yaml` for all 5 targets.
+- `tau run validate --config tau/.rendered/<target>.yaml` for all 6 targets.
 - `tau run --config tau/.rendered/<target>.yaml --context aks-ai-runtime-eastus2-admin --dry-run=client`
-  for all 5 targets — rendered `batch/v1 Job`s with correct GPU requests/limits, node
+  for all 6 targets — rendered `batch/v1 Job`s with correct GPU requests/limits, node
   selectors, topology annotation, storage mounts, and env vars; the embedded
   `TAU_SCRIPT_B64` was verified byte-identical to `tau/scripts/run-prime-rl.sh` by
   decoding it back and diffing.
 - `uv run --no-sync python tau/render_image.py` (and its
   `--check-only`/malformed-pin/missing-pin/mismatched-template error paths); confirm all
-  five checked-in and rendered targets carry the exact public digest.
+  six checked-in and rendered targets carry the exact public digest.
 - `bash -n` and `shellcheck` (zero warnings) on `tau/scripts/run-prime-rl.sh`.
 - stdlib JSON/TOML parsing of the image pin and training config, cross-referenced
   field-by-field against `packages/prime-rl-configs/src/prime_rl/configs/{rl,orchestrator,trainer}.py`.
 - `PYTHONPATH=.:src uv run --no-project` with editable `prime-rl-configs`,
   `verifiers`, `math-env-v1`, and `math500-v1`, then
-  `pytest -q tau/eval_tools/tests` — 189 tests covering content manifests,
+  `pytest -q tau/eval_tools/tests` — 193 tests covering content manifests,
   path/symlink rejection, ordered train identity, immutable attempt/process evidence,
   a non-mocked real-`RLConfig` TOML round trip, locked-HF snapshot symlink cleanup,
   fixed bootstrap, cancellation, retry/recovery-safe atomic publication, and
-  source-generation isolation across every cross-mode reference.
+  source-generation isolation across every cross-mode reference, including the
+  explicit F10 model contract consumed by F11.
 - `ruff check` / `ruff format --check` clean on every new Python file under `tau/`.
 - `uv run --no-project python -m py_compile` on the `live/` scripts.
 - `uv lock --check`, `git diff --check`, and secret/dependency/submodule/dtype scans.
 
-## What is *not* proven yet (explicitly out of this session's scope)
+## Measured result and remaining proof
 
-- No Tau job has run source generation
-  `ce9d0919b6eb266a7c8100b333dc9ea91e95b96f`; client dry-runs do not prove live
-  execution.
-- Source commit `ce9d0919b6eb266a7c8100b333dc9ea91e95b96f` validates private cleanup
-  against a locked-`huggingface-hub==1.16.1` snapshot with symlinks. Fixed JSON evidence
-  is fully written, fsynced, and inode-bound before its writer is closed and the entry is
-  atomically promoted; closing before promotion is required by the BlobFuse-backed output
-  PVC. Model and training snapshots materialize into direct children of the canonical
-  private run root while source snapshots and destinations remain strictly contained and
-  symlink-free. Before mode dispatch, the wrapper validates mode and eval label against
-  the exact configured output path and creates only that canonical directory beneath the
-  `/data` PVC mount. Interruption, race, quarantine, and retry behavior is covered by
-  tests. It also derives all output and cross-mode evidence paths from the verified source
-  SHA and opens `inference.log` exclusively without following a pre-existing symlink, but
-  this does not prove the end-to-end job.
-- The current source generation's full `tau/eval_tools/live/*.py` sequence has not run
-  against the real experiment dataset, base model, and inference server.
-- `max_steps = 50` and the resource requests are placeholders, not throughput-measured.
-- This source generation has no frozen eval manifest or baseline yet; no training or
-  comparison has run.
-- Whether `Qwen/Qwen2.5-7B-Instruct` + `DefaultRenderer` + rank-16 LoRA actually loads
-  and trains cleanly on this image is unverified — the W2 memo's compatibility read is
-  source-backed, not execution-tested.
+F10 proved the operational path end to end: CPU smoke, frozen 500-example manifest,
+one-H200 baseline, 50 optimizer steps on two H200s, immutable rank-16 adapter
+publication, and one-H200 post-eval. The adapter contained 161,533,566 bytes with
+aggregate SHA-256
+`a2808199450da1506edcb491f20917ff5dbbaa2f54fbeae07f4f3817c4d06d23`.
+The authoritative frozen comparison was `0.7480 -> 0.7500`, delta `+0.0020`,
+paired-bootstrap 95% CI `[-0.0160, +0.0200]`; it failed the fixed `+0.03` and
+positive-lower-bound gate. This negative tuple is retained and must not be rerun,
+slice-shopped, or seed-shopped.
+
+Environment reward here is deterministic boxed-answer exact/math verification and is
+used as a benchmark-accuracy proxy, not a general reasoning-quality measure. Public
+MATH, MATH-500, and AIME material may have appeared in model pretraining, so even a
+future positive result would demonstrate only this pinned setup, not uncontaminated
+generalization.
+
+F11's 5,030-record harder-math tier curve has passed local render, validation, and
+client dry-run only. A live one-H200 submission must still prove zero request/grader
+failures, retain every fixed artifact, and satisfy
+`base_mean - hard_mean >= 0.15`. Any future RL attempt after F10 must be a new,
+separately justified and predeclared source generation.

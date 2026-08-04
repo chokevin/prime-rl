@@ -13,7 +13,7 @@ runtime:
     WANDB_MODE: offline
     PRIME_RL_RUN_MODE: tier-curve
     PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
-    PRIME_RL_REPO_SHA: ce9d0919b6eb266a7c8100b333dc9ea91e95b96f
+    PRIME_RL_REPO_SHA: bf0e4c478648ec97eb0eea917cba71348af86d1e
     PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
     PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
     PRIME_RL_EXTRA_ENV_PACKAGE_DIR: environments/harder_math_v1
@@ -40,4 +40,4 @@ policy:
 
 storage:
   data_pvc: blob-training
-  output: /data/pretraining-data/prime-rl-math-7b-h200/generations/ce9d0919b6eb266a7c8100b333dc9ea91e95b96f/tier-curve
+  output: /data/pretraining-data/prime-rl-math-7b-h200/generations/bf0e4c478648ec97eb0eea917cba71348af86d1e/tier-curve
