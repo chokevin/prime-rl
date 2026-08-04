@@ -45,6 +45,24 @@ def test_cpu_preflight_and_h200_recovery_targets_share_identical_recovery_identi
     assert expected_names <= preflight_env.keys()
 
 
+def test_recovery_target_env_values_match_f12_recovery_environment_constants():
+    # Cross-YAML parity alone would still pass if both targets were edited to the same
+    # *wrong* value, so also compare each target's values directly against the Python
+    # F12_RECOVERY_ENVIRONMENT constants -- the actual values validate_f12_recovery_environment
+    # checks against at runtime.
+    for target in (H200_RECOVERY_TARGET, CPU_PREFLIGHT_TARGET):
+        target_env = _target_env(target)
+        for name, expected_value in F12_RECOVERY_ENVIRONMENT.items():
+            env_name = f"PRIME_RL_RECOVERY_{name.upper()}"
+            actual_value = target_env[env_name]
+            assert isinstance(actual_value, str), (
+                f"{target.name}:{env_name} must be a YAML string, got {actual_value!r}"
+            )
+            assert actual_value == expected_value, (
+                f"{target.name}:{env_name} is {actual_value!r}, expected {expected_value!r}"
+            )
+
+
 def test_both_recovery_targets_pin_the_same_runtime_source_and_fresh_output_generation():
     h200_env = _target_env(H200_RECOVERY_TARGET)
     preflight_env = _target_env(CPU_PREFLIGHT_TARGET)

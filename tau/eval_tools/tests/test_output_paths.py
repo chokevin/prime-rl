@@ -1008,6 +1008,72 @@ def test_run_prime_rl_recovery_env_names_used_for_both_fail_fast_check_and_cli_a
         assert f"PRIME_RL_RECOVERY_{name.upper()}:-" not in script
 
 
+def _extract_recovery_fail_fast_guard() -> str:
+    script = _run_prime_rl_script_text()
+    start = script.index("PRIME_RL_RECOVERY_ENV_NAMES=(")
+    end = script.index("esac", start) + len("esac")
+    return script[start:end]
+
+
+def _all_recovery_env(**overrides: str) -> dict[str, str]:
+    env = {f"PRIME_RL_RECOVERY_{name.upper()}": value for name, value in F12_RECOVERY_ENVIRONMENT.items()}
+    env.update(overrides)
+    return env
+
+
+@pytest.mark.parametrize("mode", ["eval-post-recovery", "eval-post-recovery-preflight"])
+def test_run_prime_rl_fail_fast_guard_rejects_unset_recovery_var(mode):
+    # Executes the real extracted guard text from run-prime-rl.sh (not a reimplementation),
+    # so a future regression that swaps `:?` for a silent `:-` default, breaks the
+    # indirection, or narrows the case pattern is caught here even though the
+    # string-based ordering test above only proves the guard's presence and placement.
+    guard = _extract_recovery_fail_fast_guard()
+    env = {"PRIME_RL_RUN_MODE": mode, **_all_recovery_env()}
+    del env["PRIME_RL_RECOVERY_MANIFEST_SHA256"]
+
+    result = subprocess.run(
+        ["bash", "-c", f"set -euo pipefail\n{guard}\necho guard-passed"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout.strip() != "guard-passed"
+    assert "PRIME_RL_RECOVERY_MANIFEST_SHA256 must be set" in result.stderr
+    assert mode in result.stderr
+
+
+def test_run_prime_rl_fail_fast_guard_passes_when_every_recovery_var_is_set():
+    guard = _extract_recovery_fail_fast_guard()
+    env = {"PRIME_RL_RUN_MODE": "eval-post-recovery-preflight", **_all_recovery_env()}
+
+    result = subprocess.run(
+        ["bash", "-c", f"set -euo pipefail\n{guard}\necho guard-passed"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "guard-passed"
+
+
+def test_run_prime_rl_fail_fast_guard_is_a_noop_outside_recovery_modes():
+    guard = _extract_recovery_fail_fast_guard()
+    env = {"PRIME_RL_RUN_MODE": "smoke"}
+
+    result = subprocess.run(
+        ["bash", "-c", f"set -euo pipefail\n{guard}\necho guard-passed"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "guard-passed"
+
+
 @pytest.mark.parametrize(
     ("inference_body", "expected_status"),
     [
