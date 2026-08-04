@@ -38,6 +38,18 @@ class JsonEvidenceSnapshot:
     ctime_ns: int
 
 
+@dataclass(frozen=True)
+class FileEvidenceSnapshot:
+    raw: bytes
+    digest: str
+    mode: int
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -233,6 +245,136 @@ def _open_json_snapshot(directory_descriptor: int, name: str, path: Path) -> Jso
         return snapshot
     finally:
         os.close(descriptor)
+
+
+def _open_file_snapshot(directory_descriptor: int, name: str, path: Path) -> FileEvidenceSnapshot:
+    pathname_metadata = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+    if not stat.S_ISREG(pathname_metadata.st_mode):
+        raise ValueError(f"evidence path must be a regular file: {path}")
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_descriptor)
+    try:
+        before = os.fstat(descriptor)
+        if _snapshot_metadata(pathname_metadata) != _snapshot_metadata(before):
+            raise RuntimeError(f"evidence path changed while being opened: {path}")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if _snapshot_metadata(before) != _snapshot_metadata(after):
+            raise RuntimeError(f"evidence changed while being read: {path}")
+        raw = b"".join(chunks)
+        snapshot = FileEvidenceSnapshot(
+            raw=raw,
+            digest=hashlib.sha256(raw).hexdigest(),
+            mode=stat.S_IFMT(after.st_mode),
+            device=after.st_dev,
+            inode=after.st_ino,
+            size=after.st_size,
+            mtime_ns=after.st_mtime_ns,
+            ctime_ns=after.st_ctime_ns,
+        )
+        current = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        if _snapshot_metadata(current) != (
+            snapshot.mode,
+            snapshot.device,
+            snapshot.inode,
+            snapshot.size,
+            snapshot.mtime_ns,
+            snapshot.ctime_ns,
+        ):
+            raise RuntimeError(f"evidence path changed after being read: {path}")
+        return snapshot
+    finally:
+        os.close(descriptor)
+
+
+def promote_file_noreplace(
+    staging_path: Path,
+    final_path: Path,
+    *,
+    expected_raw: bytes | None = None,
+    expected_digest: str | None = None,
+    expected_identity: tuple[int, int] | None = None,
+    after_stage_validation: Callable[[Path], None] | None = None,
+    after_install: Callable[[Path], None] | None = None,
+) -> FileEvidenceSnapshot:
+    staging_path = Path(os.path.abspath(staging_path))
+    final_path = Path(os.path.abspath(final_path))
+    if staging_path == final_path:
+        raise ValueError("staging and final evidence paths must differ")
+    source_descriptor = open_directory_nofollow(staging_path.parent)
+    destination_descriptor = None
+    installed = False
+    try:
+        destination_descriptor = open_directory_nofollow(final_path.parent)
+        if os.fstat(source_descriptor).st_dev != os.fstat(destination_descriptor).st_dev:
+            raise RuntimeError("evidence staging and destination must be on the same filesystem")
+        staged = _open_file_snapshot(source_descriptor, staging_path.name, staging_path)
+        if expected_raw is not None and staged.raw != expected_raw:
+            raise RuntimeError(f"staged evidence bytes do not match expected evidence: {staging_path}")
+        if expected_digest is not None and staged.digest != expected_digest:
+            raise RuntimeError(f"staged evidence digest does not match expected evidence: {staging_path}")
+        if expected_identity is not None and (staged.device, staged.inode) != expected_identity:
+            raise RuntimeError(f"staged evidence inode does not match expected evidence: {staging_path}")
+        if after_stage_validation is not None:
+            after_stage_validation(staging_path)
+        current_stage = os.stat(
+            staging_path.name,
+            dir_fd=source_descriptor,
+            follow_symlinks=False,
+        )
+        if _snapshot_metadata(current_stage) != (
+            staged.mode,
+            staged.device,
+            staged.inode,
+            staged.size,
+            staged.mtime_ns,
+            staged.ctime_ns,
+        ):
+            raise RuntimeError(f"evidence staging path changed after validation: {staging_path}")
+        rename_entries_noreplace(
+            source_descriptor,
+            staging_path.name,
+            destination_descriptor,
+            final_path.name,
+        )
+        installed = True
+        os.fsync(source_descriptor)
+        if source_descriptor != destination_descriptor:
+            os.fsync(destination_descriptor)
+        if after_install is not None:
+            after_install(final_path)
+        final = _open_file_snapshot(destination_descriptor, final_path.name, final_path)
+        if (
+            final.mode,
+            final.device,
+            final.inode,
+            final.size,
+            final.raw,
+            final.digest,
+        ) != (
+            staged.mode,
+            staged.device,
+            staged.inode,
+            staged.size,
+            staged.raw,
+            staged.digest,
+        ):
+            raise RuntimeError(f"installed evidence does not match validated staging: {final_path}")
+    except Exception as error:
+        if installed and destination_descriptor is not None:
+            _quarantine_failed_install(
+                destination_descriptor,
+                final_path,
+                error,
+                quarantine_prefix=f"{final_path.name}.quarantine",
+            )
+        raise
+    finally:
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+        os.close(source_descriptor)
+    return final
 
 
 def promote_json_noreplace(

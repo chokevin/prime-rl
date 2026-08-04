@@ -1,9 +1,20 @@
 import os
+import signal
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
-from tau.eval_tools.live.inference_launcher_live import open_inference_log
+import tau.eval_tools.live.inference_launcher_live as inference_launcher
+from tau.eval_tools.live.inference_launcher_live import (
+    attempt_log_name,
+    open_inference_log,
+    promote_inference_log,
+)
 from tau.eval_tools.output_paths import (
     evidence_generation,
     expected_output_path,
@@ -322,40 +333,219 @@ def test_prepare_output_directory_preserves_existing_artifacts(tmp_path):
     assert rewards.read_bytes() == b"immutable"
 
 
-def test_inference_log_is_created_exclusively_and_remains_bound_to_open_descriptor(tmp_path):
+def test_interrupted_inference_attempt_preserves_partial_log_and_retry_can_start(tmp_path):
     output_dir = tmp_path / "eval-baseline"
     output_dir.mkdir()
-    descriptor = open_inference_log(output_dir)
-    os.write(descriptor, b"ready\n")
-    replacement = output_dir / "replacement.log"
-    (output_dir / "inference.log").rename(replacement)
-    (output_dir / "inference.log").write_bytes(b"replacement")
-    os.write(descriptor, b"running\n")
+    first_attempt = "pod-first"
+    first_path = output_dir / attempt_log_name(first_attempt)
+    environment = os.environ | {"PYTHONPATH": str(Path(__file__).parents[3])}
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "tau.eval_tools.live.inference_launcher_live",
+            "launch",
+            "--output-dir",
+            str(output_dir),
+            "--attempt-id",
+            first_attempt,
+            "--",
+            sys.executable,
+            "-c",
+            "import time; print('partial', flush=True); time.sleep(60)",
+        ],
+        env=environment,
+    )
+    try:
+        for _ in range(500):
+            if first_path.exists() and first_path.stat().st_size:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("inference launcher did not write its partial log")
+        child.send_signal(signal.SIGTERM)
+        child.wait(timeout=5)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+    second_attempt = "pod-second"
+    descriptor = open_inference_log(output_dir, second_attempt)
+    os.write(descriptor, b"retry\n")
     os.close(descriptor)
 
-    assert replacement.read_bytes() == b"ready\nrunning\n"
-    assert (output_dir / "inference.log").read_bytes() == b"replacement"
+    assert first_path.read_bytes() == b"partial\n"
+    assert (output_dir / attempt_log_name(second_attempt)).read_bytes() == b"retry\n"
+    assert not (output_dir / "inference.log").exists()
+
+
+def test_inference_attempt_id_collision_preserves_existing_log(tmp_path):
+    output_dir = tmp_path.resolve()
+    descriptor = open_inference_log(output_dir, "pod-same")
+    os.write(descriptor, b"partial\n")
+    os.close(descriptor)
+
     with pytest.raises(FileExistsError):
-        open_inference_log(output_dir)
+        open_inference_log(output_dir, "pod-same")
+
+    assert (output_dir / attempt_log_name("pod-same")).read_bytes() == b"partial\n"
+
+
+def test_inference_log_successfully_promotes_closed_attempt(tmp_path):
+    output_dir = tmp_path.resolve()
+    descriptor = open_inference_log(output_dir, "pod-success")
+    os.write(descriptor, b"complete\n")
+    metadata = os.fstat(descriptor)
+    os.close(descriptor)
+
+    snapshot = promote_inference_log(output_dir, "pod-success")
+
+    final = output_dir / "inference.log"
+    assert final.read_bytes() == b"complete\n"
+    assert (snapshot.device, snapshot.inode, snapshot.size) == (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+    )
+    assert not (output_dir / attempt_log_name("pod-success")).exists()
+
+
+def test_inference_log_final_collision_is_immutable_and_preserves_losing_attempt(tmp_path):
+    output_dir = tmp_path.resolve()
+    first = open_inference_log(output_dir, "pod-winner")
+    os.write(first, b"winner\n")
+    os.close(first)
+    promote_inference_log(output_dir, "pod-winner")
+    second_path = output_dir / attempt_log_name("pod-loser")
+    second = open_inference_log(output_dir, "pod-loser")
+    os.write(second, b"loser\n")
+    os.close(second)
+
+    with pytest.raises(FileExistsError):
+        promote_inference_log(output_dir, "pod-loser")
+
+    assert (output_dir / "inference.log").read_bytes() == b"winner\n"
+    assert second_path.read_bytes() == b"loser\n"
+
+
+def test_concurrent_inference_log_promotions_publish_one_closed_attempt(tmp_path, monkeypatch):
+    output_dir = tmp_path.resolve()
+    attempts = ("pod-old", "pod-new")
+    for attempt in attempts:
+        descriptor = open_inference_log(output_dir, attempt)
+        os.write(descriptor, f"{attempt}\n".encode())
+        os.close(descriptor)
+    barrier = Barrier(2)
+    monkeypatch.setattr(
+        inference_launcher,
+        "_after_inference_log_validation",
+        lambda _path: barrier.wait(timeout=10),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(promote_inference_log, output_dir, attempt) for attempt in attempts]
+    outcomes = []
+    for future in futures:
+        try:
+            future.result()
+        except FileExistsError:
+            outcomes.append("lost")
+        else:
+            outcomes.append("won")
+
+    assert sorted(outcomes) == ["lost", "won"]
+    final = (output_dir / "inference.log").read_text().strip()
+    assert final in attempts
+    losing_attempt = next(attempt for attempt in attempts if attempt != final)
+    assert (output_dir / attempt_log_name(losing_attempt)).read_text() == f"{losing_attempt}\n"
 
 
 @pytest.mark.parametrize("dangling", [False, True])
-def test_inference_log_rejects_symlink_without_touching_target(tmp_path, dangling):
+def test_inference_attempt_log_rejects_symlink_without_touching_target(tmp_path, dangling):
     output_dir = tmp_path / "eval-baseline"
     output_dir.mkdir()
     target = tmp_path / "external.log"
     if not dangling:
         target.write_bytes(b"external")
-    (output_dir / "inference.log").symlink_to(target)
+    attempt_path = output_dir / attempt_log_name("pod-symlink")
+    attempt_path.symlink_to(target)
 
     with pytest.raises(FileExistsError):
-        open_inference_log(output_dir)
+        open_inference_log(output_dir, "pod-symlink")
 
     if dangling:
         assert not target.exists()
     else:
         assert target.read_bytes() == b"external"
+    assert attempt_path.is_symlink()
+
+
+def test_inference_final_symlink_blocks_promotion_without_touching_target(tmp_path):
+    output_dir = tmp_path.resolve()
+    target = tmp_path / "external.log"
+    target.write_bytes(b"external")
+    (output_dir / "inference.log").symlink_to(target)
+    attempt_path = output_dir / attempt_log_name("pod-final-symlink")
+    descriptor = open_inference_log(output_dir, "pod-final-symlink")
+    os.write(descriptor, b"owned\n")
+    os.close(descriptor)
+
+    with pytest.raises(FileExistsError):
+        promote_inference_log(output_dir, "pod-final-symlink")
+
+    assert target.read_bytes() == b"external"
     assert (output_dir / "inference.log").is_symlink()
+    assert attempt_path.read_bytes() == b"owned\n"
+
+
+def test_inference_attempt_swap_after_validation_fails_closed(tmp_path, monkeypatch):
+    output_dir = tmp_path.resolve()
+    attempt_path = output_dir / attempt_log_name("pod-swapped")
+    displaced = output_dir / "displaced-owned.log"
+    descriptor = open_inference_log(output_dir, "pod-swapped")
+    os.write(descriptor, b"owned\n")
+    os.close(descriptor)
+
+    def swap_attempt(path):
+        path.rename(displaced)
+        path.write_bytes(b"replacement\n")
+
+    monkeypatch.setattr(inference_launcher, "_after_inference_log_validation", swap_attempt)
+    with pytest.raises(RuntimeError, match="changed after validation"):
+        promote_inference_log(output_dir, "pod-swapped")
+
+    assert not (output_dir / "inference.log").exists()
+    assert displaced.read_bytes() == b"owned\n"
+    assert attempt_path.read_bytes() == b"replacement\n"
+
+
+def test_inference_final_swap_before_verification_is_quarantined(tmp_path, monkeypatch):
+    output_dir = tmp_path.resolve()
+    displaced = output_dir / "displaced-installed.log"
+    descriptor = open_inference_log(output_dir, "pod-final-swapped")
+    os.write(descriptor, b"owned\n")
+    os.close(descriptor)
+
+    def swap_final(path):
+        path.rename(displaced)
+        path.write_bytes(b"replacement\n")
+
+    monkeypatch.setattr(inference_launcher, "_after_inference_log_install", swap_final)
+    with pytest.raises(RuntimeError, match="does not match validated staging"):
+        promote_inference_log(output_dir, "pod-final-swapped")
+
+    assert not (output_dir / "inference.log").exists()
+    assert displaced.read_bytes() == b"owned\n"
+    quarantines = list(output_dir.glob("inference.log.quarantine-*"))
+    assert len(quarantines) == 1
+    assert quarantines[0].read_bytes() == b"replacement\n"
+
+
+@pytest.mark.parametrize("attempt_id", ["", "UPPER", "../escape", "two.parts", "-start", "end-", "a" * 64])
+def test_inference_attempt_id_must_be_strict_dns_label(tmp_path, attempt_id):
+    with pytest.raises(ValueError, match="DNS label"):
+        open_inference_log(tmp_path.resolve(), attempt_id)
 
 
 def test_wrapper_passes_verified_source_and_prepares_generation_before_mode_first_use():
@@ -372,3 +562,27 @@ def test_wrapper_passes_verified_source_and_prepares_generation_before_mode_firs
     assert dispatch < finalize_train_path
     assert dispatch < inference_launcher
     assert dispatch < training_supervisor
+
+
+def test_eval_wrapper_closes_writer_and_publishes_log_after_result_evidence():
+    script = (Path(__file__).parents[2] / "scripts/run-prime-rl.sh").read_text()
+    eval_dispatch = script.index("eval)")
+    launch = script.index("inference_launcher_live launch", eval_dispatch)
+    rewards = script.index("run_frozen_eval_live", launch)
+    comparison = script.index("tau.eval_tools.cli compare", rewards)
+    stop = script.index("stop_inference", comparison)
+    promote = script.index("inference_launcher_live promote", stop)
+
+    assert launch < rewards < comparison < stop < promote
+    assert 'inference_attempt_id="${HOSTNAME:?HOSTNAME must identify this pod}"' in script
+
+
+def test_tier_curve_wrapper_closes_writer_before_log_promotion():
+    script = (Path(__file__).parents[2] / "scripts/run-prime-rl.sh").read_text()
+    tier_dispatch = script.index("tier-curve)")
+    launch = script.index("inference_launcher_live launch", tier_dispatch)
+    evaluate = script.index("run_harder_tier_curve_live", launch)
+    stop = script.index("stop_inference", evaluate)
+    promote = script.index("inference_launcher_live promote", stop)
+
+    assert launch < evaluate < stop < promote

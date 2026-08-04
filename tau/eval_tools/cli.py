@@ -9,9 +9,9 @@ resolves without installation:
         --output /data/.../comparison.json
 
 Exits 0 only when the comparison passes the goal harness's gate (delta >= +0.03 and
-paired-bootstrap 95% CI lower bound > 0); exits 1 on a failed gate, identity mismatch,
-or malformed input. See `live/` for the scripts that build the manifest and reward
-files against a real model/dataset/inference server.
+paired-bootstrap 95% CI lower bound > 0), 1 when a valid comparison fails the gate,
+and 2 on invalid input or publication failure. See `live/` for the scripts that build
+the manifest and reward files against a real model/dataset/inference server.
 """
 
 from __future__ import annotations
@@ -43,13 +43,13 @@ def _cmd_compare(args: argparse.Namespace) -> int:
             Path(args.baseline),
             Path(args.post),
         )
+        if args.output:
+            write_result(result, Path(args.output))
     except Exception as exc:  # noqa: BLE001 - CLI boundary: surface any failure as a clean nonzero exit
         print(f"error: {exc}", file=sys.stderr)
-        return 1
+        return 2
 
     print(result.report())
-    if args.output:
-        write_result(result, Path(args.output))
     return 0 if result.passed else 1
 
 

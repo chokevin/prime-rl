@@ -303,6 +303,12 @@ revisions are already immutable pins. Every command below points at
 `tau/.rendered/<target>.yaml`, never the bare `tau/<target>.yaml` template, so pin
 validation and entrypoint mirroring cannot be skipped.
 
+`tau run --config ...` is the mutating submit/apply operation and must be invoked
+exactly once for each target while its Job/Workload exists. Monitor that submission
+with `tau run get` and read-only `kubectl get`, `kubectl describe`, or `kubectl logs`;
+never issue a second `tau run --config ...` as a status check or retry because it
+client-side applies the live Job and can suspend/delete/resume its running pod.
+
 ```bash
 # 0. Render the checked-in immutable source and image pins.
 uv run --no-sync python tau/render_image.py
@@ -465,15 +471,39 @@ That optional artifact records diagnostics only; it does not alter or replace su
 evidence. If diagnostic persistence or stderr itself fails, exit remains zero and the
 already-verified success evidence remains immutable.
 
+Eval and harder-tier-curve inference use the same failure-safe publication sequence.
+The launcher strictly validates the pod `HOSTNAME` as a DNS label and exclusively
+opens `inference.attempt-<hostname>.log` with no symlink following. TERM, evaluation
+failure, comparison publication failure, or an unexpected server exit preserves that
+attempt file and leaves the fixed `inference.log` absent, so a replacement pod with a
+different hostname can start without deleting evidence. A same-pod rerun collides with
+its own attempt file and fails closed. After rewards are durable, and after post-eval
+comparison is durable (including a valid failed gate), the wrapper terminates and
+waits for inference so BlobFuse observes a closed writer. It then no-follow snapshots
+the attempt inode, bytes, and SHA-256 digest; atomically renames without replacement;
+fsyncs; and strict-reopens the fixed final to verify the same inode, bytes, and digest.
+An existing final, symlink, path swap, or concurrent losing promotion fails without
+overwriting either the final or the losing attempt. The fixed log is therefore the
+last completion marker: interruption before rewards leaves only the attempt log and
+allows a full retry; interruption after rewards but before comparison requires the
+documented comparison-only path; interruption after result evidence but before log
+promotion preserves complete JSON plus the attempt log but does not claim final log
+success; interruption after verified promotion leaves the coherent immutable set.
+Comparison exits 0 for a passed gate, 1 for a valid failed gate, and 2 for invalid
+input/publication failure, so only the first two states may reach log promotion and a
+failed gate still leaves the Job failed.
+
 Every fetch above names an explicit `--artifact <file>` rather than listing the output
 directory: W1's storage proof found directory listing on `blob-training` unreliable
 (exact-file write/fetch/re-fetch passed; listing did not), so every script in this
-implementation writes its results to a fixed, predictable filename inside its own
-`storage.output` (`draft-manifest.json`, `frozen-eval-manifest.json`, `rewards.json`,
-`comparison.json`, `inference.log`) specifically so callers never have to list a
-directory to find them. Attempt artifacts are found only from the ID printed in logs,
-never by enumerating `attempts/`. Reward, comparison, smoke, training, and manifest
-evidence is created exclusively; an existing filename fails instead of being overwritten.
+implementation writes successful results to a fixed, predictable filename inside its
+own `storage.output` (`draft-manifest.json`, `frozen-eval-manifest.json`,
+`rewards.json`, `comparison.json`, `inference.log`) specifically so callers never have
+to list a directory to find them. Failed inference evidence uses the exact
+`inference.attempt-<hostname>.log` name logged before launch. Training attempt artifacts
+are found only from the ID printed in logs, never by enumerating `attempts/`. Reward,
+comparison, smoke, training, manifest, and final-log evidence is created exclusively;
+an existing filename fails instead of being overwritten.
 
 `eval-baseline` binds the stable evaluation identity available in the draft. Finalization
 then binds that exact artifact digest and the effective training configuration into the
@@ -489,10 +519,10 @@ storage proof) — fetch each by its exact name with `--artifact <file>`.
 |---|---|---|---|
 | `smoke` | `<generation-root>/smoke` | `smoke-result.json` | written only after `rl --dry-run` produced all three expected resolved TOMLs |
 | `freeze-manifest` | `<generation-root>/manifest` | `draft-manifest.json`, `frozen-eval-manifest.json` | unfrozen draft (pass 1) and the immutable frozen manifest (pass 2) `tau/eval_tools/manifest.py` reads/writes |
-| `eval-baseline` | `<generation-root>/eval-baseline` | `rewards.json`, `inference.log` | baseline per-example rewards (`RewardRecord`) `tau/eval_tools/compare.py` consumes |
-| `eval-post` | `<generation-root>/eval-post` | `rewards.json`, `comparison.json`, `inference.log` | post-training rewards + the `ComparisonResult` (delta, bootstrap CI, pass/fail) |
+| `eval-baseline` | `<generation-root>/eval-baseline` | successful `rewards.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | baseline per-example rewards (`RewardRecord`) `tau/eval_tools/compare.py` consumes; fixed log publishes last |
+| `eval-post` | `<generation-root>/eval-post` | successful `rewards.json`, `comparison.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | post-training rewards + the `ComparisonResult` (delta, bootstrap CI, pass/fail); fixed log publishes last |
 | `train` | `<generation-root>/train` | fixed `training-result.json` and `final-adapter/`; exact logged `attempts/<attempt-id>/{preflight.json,resolved-train.toml,completion.json,publication.json,run-output/metrics.jsonl}`; optional `attempts/<attempt-id>/private-cleanup-diagnostic.json` | the trusted supervisor owns launch and attestation; attempt evidence binds the exact config/process/STABLE adapter, publication fsyncs and atomically installs without replacement, and writes the fixed result last; a post-success private-cleanup failure writes the optional diagnostic without changing success |
-| `harder-tier-curve` | F11 `<generation-root>/tier-curve` | `raw-base.json`, `raw-core.json`, `raw-hard.json`, `tier-curve.v1.json`, `inference.log` | full trusted harder-math catalog, exact F10 base-model/decoding contract, fixed `0.15` hardness gate |
+| `harder-tier-curve` | F11 `<generation-root>/tier-curve` | successful `raw-base.json`, `raw-core.json`, `raw-hard.json`, `tier-curve.v1.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | full trusted harder-math catalog, exact F10 base-model/decoding contract, fixed `0.15` hardness gate; fixed log publishes last |
 
 Explicit-file fetch while the run's Workload/Job still exists (the proven, reliable path):
 
@@ -539,12 +569,16 @@ tau run --config tau/.rendered/<target>.yaml --context aks-ai-runtime-eastus2-ad
 Submit / monitor / fetch / cancel:
 
 ```bash
+# Submit exactly once. Re-running this line updates the existing Job and can replace its pod.
 tau run --config tau/.rendered/<target>.yaml --context aks-ai-runtime-eastus2-admin
-tau run status <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admin --watch
-tau run logs <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admin -f
 tau run get <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admin --artifact <name>
+kubectl get job,pod,workload -n pretraining-data --context aks-ai-runtime-eastus2-admin
+kubectl logs -n pretraining-data --context aks-ai-runtime-eastus2-admin <pod-name>
 tau run cancel <job-name> -n pretraining-data --context aks-ai-runtime-eastus2-admin
 ```
+
+After submission, only `tau run get` and read-only `kubectl` inspection are monitoring
+operations. Never run the submit/apply form a second time while those objects exist.
 
 Always pass `--artifact <name>` or an exact `--path ... --pvc blob-training` — W1's
 storage proof on `blob-training` found exact-file

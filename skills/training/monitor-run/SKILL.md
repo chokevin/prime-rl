@@ -7,6 +7,14 @@ description: Monitor an ongoing prime-rl training run — find the output direct
 
 ## Runbook
 
+### Tau jobs
+
+`tau run --config ...` submits and client-side applies the target. Invoke it exactly
+once while that target's Job/Workload exists. Monitor with `tau run get` and read-only
+`kubectl get`, `kubectl describe`, or `kubectl logs`; never use a second
+`tau run --config ...` as a status check or retry because it can replace the running
+pod.
+
 ### On launch
 
 1. Find the output dir and read the resolved configs at `{output_dir}/configs/` (start with `rl.toml`).

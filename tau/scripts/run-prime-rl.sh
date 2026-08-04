@@ -254,6 +254,27 @@ wait_for_health() {
     log "inference server healthy after ${waited}s (${url})"
 }
 
+stop_inference() {
+    local child_status
+    [ -n "$CHILD_PID" ] || die "cannot stop inference without a tracked child"
+    log "stopping inference server before log promotion (pid ${CHILD_PID})"
+    if kill -0 "$CHILD_PID" 2>/dev/null; then
+        if ! kill -TERM "$CHILD_PID" 2>/dev/null && kill -0 "$CHILD_PID" 2>/dev/null; then
+            die "failed to terminate inference server (pid ${CHILD_PID})"
+        fi
+    fi
+    if wait "$CHILD_PID"; then
+        child_status=0
+    else
+        child_status=$?
+    fi
+    CHILD_PID=""
+    case "$child_status" in
+    0 | 143) ;;
+    *) die "inference server exited unexpectedly while stopping (status ${child_status})" ;;
+    esac
+}
+
 # --- Step 3: mode dispatch ------------------------------------------------------------
 case "$PRIME_RL_RUN_MODE" in
 smoke)
@@ -366,11 +387,15 @@ eval)
     chmod 0555 "$RUN_ROOT"
 
     rewards_path="${TAU_OUTPUT_DIR}/rewards.json"
+    inference_attempt_id="${HOSTNAME:?HOSTNAME must identify this pod}"
+    comparison_status=0
     if [ "${PRIME_RL_COMPARE_ONLY:-0}" != "1" ]; then
         [ ! -e "$rewards_path" ] || die "${rewards_path} already exists; reward evidence is immutable"
+        log "inference attempt id ${inference_attempt_id}"
         log "starting inference server: uv run inference ${inference_args[*]}"
-        uv run --no-sync python -m tau.eval_tools.live.inference_launcher_live \
-            --output-dir "$TAU_OUTPUT_DIR" -- \
+        uv run --no-sync python -m tau.eval_tools.live.inference_launcher_live launch \
+            --output-dir "$TAU_OUTPUT_DIR" \
+            --attempt-id "$inference_attempt_id" -- \
             uv run --no-sync inference "${inference_args[@]}" &
         CHILD_PID=$!
 
@@ -407,13 +432,29 @@ eval)
         *) die "PRIME_RL_COMPARISON_OUTPUT_PATH must be a named file under ${TAU_OUTPUT_DIR}" ;;
         esac
         log "comparing baseline vs post rewards against the pass/fail gate"
-        uv run --no-sync python -m tau.eval_tools.cli compare \
+        if uv run --no-sync python -m tau.eval_tools.cli compare \
             --manifest "$PRIME_RL_MANIFEST_PATH" \
             --baseline "$PRIME_RL_BASELINE_REWARDS_PATH" \
             --post "$rewards_path" \
-            --output "$comparison_path"
-        # `compare` exits nonzero on a failed gate; with `set -e` that fails this job,
-        # which is the intended, honest signal — never overridden or ignored here.
+            --output "$comparison_path"; then
+            comparison_status=0
+        else
+            comparison_status=$?
+        fi
+        case "$comparison_status" in
+        0 | 1) ;;
+        *) exit "$comparison_status" ;;
+        esac
+    fi
+    if [ "${PRIME_RL_COMPARE_ONLY:-0}" != "1" ]; then
+        stop_inference
+        uv run --no-sync python -m tau.eval_tools.live.inference_launcher_live promote \
+            --output-dir "$TAU_OUTPUT_DIR" \
+            --attempt-id "$inference_attempt_id"
+    fi
+    if [ "$comparison_status" -ne 0 ]; then
+        # A valid failed gate remains a failed Job after all coherent evidence is durable.
+        exit "$comparison_status"
     fi
     ;;
 
@@ -429,9 +470,12 @@ tier-curve)
     model_snapshot_path="${RUN_ROOT}/model"
     chmod 0555 "$RUN_ROOT"
 
+    inference_attempt_id="${HOSTNAME:?HOSTNAME must identify this pod}"
+    log "inference attempt id ${inference_attempt_id}"
     log "starting inference server for the full harder-math tier curve"
-    uv run --no-sync python -m tau.eval_tools.live.inference_launcher_live \
-        --output-dir "$TAU_OUTPUT_DIR" -- \
+    uv run --no-sync python -m tau.eval_tools.live.inference_launcher_live launch \
+        --output-dir "$TAU_OUTPUT_DIR" \
+        --attempt-id "$inference_attempt_id" -- \
         uv run --no-sync inference \
             --model.name "$model_snapshot_path" \
             --server.port 8000 \
@@ -448,6 +492,10 @@ tier-curve)
         --source-revision "$resolved_sha" \
         --output-dir "$TAU_OUTPUT_DIR" \
         --max-concurrency "${PRIME_RL_TIER_CURVE_MAX_CONCURRENCY:-128}"
+    stop_inference
+    uv run --no-sync python -m tau.eval_tools.live.inference_launcher_live promote \
+        --output-dir "$TAU_OUTPUT_DIR" \
+        --attempt-id "$inference_attempt_id"
     ;;
 
 train)
