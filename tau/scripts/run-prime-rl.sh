@@ -65,6 +65,9 @@ esac
 chmod 0700 "$RUN_ROOT"
 mkdir "${RUN_ROOT}/hf-home"
 chmod 0700 "${RUN_ROOT}/hf-home"
+CONTROL_DIR="${RUN_ROOT}/control"
+mkdir "$CONTROL_DIR"
+chmod 0700 "$CONTROL_DIR"
 RUN_ROOT_DEVICE="$(stat -c %d "$RUN_ROOT")"
 RUN_ROOT_INODE="$(stat -c %i "$RUN_ROOT")"
 [ "$RUN_ROOT_DEVICE" = "$(stat -c %d "$TMP_ROOT")" ] || die "private run root must remain on /tmp"
@@ -485,7 +488,7 @@ eval | eval-post-recovery)
         [ ! -e "$rewards_path" ] || die "${rewards_path} already exists; reward evidence is immutable"
         log "inference attempt id ${inference_attempt_id}"
         log "starting inference server: uv run inference ${inference_args[*]}"
-        inference_pgid_file="${RUN_ROOT}/inference-process-group"
+        inference_pgid_file="${CONTROL_DIR}/inference-process-group"
         uv run --no-sync python -m tau.eval_tools.live.inference_launcher_live launch \
             --output-dir "$TAU_OUTPUT_DIR" \
             --attempt-id "$inference_attempt_id" \
@@ -584,7 +587,7 @@ tier-curve)
     inference_attempt_id="${HOSTNAME:?HOSTNAME must identify this pod}"
     log "inference attempt id ${inference_attempt_id}"
     log "starting inference server for the full harder-math tier curve"
-    inference_pgid_file="${RUN_ROOT}/inference-process-group"
+    inference_pgid_file="${CONTROL_DIR}/inference-process-group"
     uv run --no-sync python -m tau.eval_tools.live.inference_launcher_live launch \
         --output-dir "$TAU_OUTPUT_DIR" \
         --attempt-id "$inference_attempt_id" \

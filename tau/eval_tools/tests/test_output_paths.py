@@ -661,15 +661,20 @@ def test_wrapper_passes_verified_source_and_prepares_generation_before_mode_firs
 
 def test_eval_wrapper_closes_writer_and_publishes_log_after_result_evidence():
     script = (Path(__file__).parents[2] / "scripts/run-prime-rl.sh").read_text()
+    control_creation = script.index('CONTROL_DIR="${RUN_ROOT}/control"')
     eval_dispatch = script.index("eval | eval-post-recovery)")
+    run_root_lock = script.index('chmod 0555 "$RUN_ROOT"', eval_dispatch)
+    process_group_path = script.index('inference_pgid_file="${CONTROL_DIR}/inference-process-group"', run_root_lock)
     launch = script.index("inference_launcher_live launch", eval_dispatch)
     rewards = script.index("run_frozen_eval_live", launch)
     comparison = script.index("tau.eval_tools.cli compare", rewards)
     stop = script.index("stop_inference", comparison)
     promote = script.index("inference_launcher_live promote", stop)
 
+    assert control_creation < eval_dispatch < run_root_lock < process_group_path < launch
     assert launch < rewards < comparison < stop < promote
     assert 'inference_attempt_id="${HOSTNAME:?HOSTNAME must identify this pod}"' in script
+    assert script.count('inference_pgid_file="${CONTROL_DIR}/inference-process-group"') == 2
 
 
 def test_recovery_wrapper_validates_fixed_inputs_before_model_or_inference_use():
@@ -692,9 +697,16 @@ def test_recovery_wrapper_validates_fixed_inputs_before_model_or_inference_use()
 
 
 def test_inference_launcher_terminates_complete_process_group_before_promotion(tmp_path):
-    output_dir = tmp_path.resolve()
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    output_dir = output_dir.resolve()
+    run_root = tmp_path / "run-root"
+    run_root.mkdir()
+    control_dir = run_root / "control"
+    control_dir.mkdir(mode=0o700)
+    run_root.chmod(0o555)
     attempt_id = "pod-process-group"
-    process_group_file = tmp_path / "process-group"
+    process_group_file = control_dir / "process-group"
     leader_body = (
         "import os, signal, subprocess, sys, time; "
         "grandchild=subprocess.Popen([sys.executable, '-c', "
@@ -747,6 +759,7 @@ def test_inference_launcher_terminates_complete_process_group_before_promotion(t
         assert "leader-ready:" in final_log
         assert "grandchild-ready" in final_log
     finally:
+        run_root.chmod(0o700)
         if child.poll() is None:
             if process_group_file.exists():
                 os.killpg(int(process_group_file.read_text()), signal.SIGKILL)
