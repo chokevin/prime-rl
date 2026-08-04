@@ -24,8 +24,13 @@ tau/
   eval-post.yaml        # 1 H200: frozen-eval replay against base+LoRA, then compare (`tau run eval-post`)
   train.yaml            # 2 H200 (1 trainer + 1 inference): bounded RL training (`tau run train`)
   harder-tier-curve.yaml # 1 H200: full harder-math base/core/hard empirical curve
+  f12-smoke.yaml          # system-CPU duration-only F12 config validation
+  f12-freeze-manifest.yaml # system-CPU F12 manifest draft/finalize
+  f12-eval-baseline.yaml  # 1 H200: source-matched F12 baseline
+  f12-train.yaml          # 2 H200: 200-step duration-only training
+  f12-eval-post.yaml      # 1 H200: F12 frozen post eval + unchanged gate
   scripts/
-    run-prime-rl.sh      # the one self-contained entrypoint all six targets share (mode via $PRIME_RL_RUN_MODE)
+    run-prime-rl.sh      # the one self-contained entrypoint all targets share (mode via $PRIME_RL_RUN_MODE)
   eval_tools/            # pure, macOS-testable: hashing, frozen-manifest schema, paired comparison + gate
     hashing.py
     json_io.py             # duplicate-key rejection + exclusive JSON evidence writes
@@ -42,6 +47,7 @@ tau/
       training_supervisor_live.py    # owns private inputs, RL child, attestation, publication
 configs/tau/math-7b-h200/
   train.toml             # derived from configs/basic/hendrycks-sanity/rl.toml
+  train-f12.toml         # immutable duration-only F12 contract
 ```
 
 Every `tau/*.yaml` pins the real public digest recorded in `tau/image.pin.json`. Run
@@ -217,6 +223,32 @@ the canonical config identity. Training and
 post-eval derive the one source-proven final checkpoint path
 `weights/step_<max_steps>/lora_adapters` from that frozen identity; there is no runtime
 step override. The handoff never enumerates a storage directory.
+
+### F12 duration-only experiment
+
+F12 is an additive five-target ladder pinned to runtime source
+`a603e791776a4579440edc5df5b70309c61cf46a` and generation root
+`/data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/`.
+It does not reuse, migrate, or rewrite F10/F11 evidence.
+
+`configs/tau/math-7b-h200/train-f12.toml` differs from the resolved F10 RLConfig only
+through `max_steps = 200` and monitoring `orchestrator.eval.interval = 100`. TrainSink
+still samples until each update has exactly 128 survivor rollouts after zero-advantage
+groups are dropped; F12 does not shrink the batch or alter sampler/filter semantics.
+Model and revision, renderer, HF/FA2 model path, rank/alpha-16 LoRA, optimizer, constant
+`1e-6` learning rate, scheduler, batch/group sizes, decoding, grader, seeds, 7,474-row
+training identity, all-500 held-out eval identity, zero-overlap proof, and trainer dtypes
+remain fixed.
+
+In-run MATH-500 evals at startup, step 100, and step 200 are monitoring only and cannot
+select a checkpoint. Step 200 is the sole comparison-of-record adapter. The external
+paired gate remains delta `>= +0.03` and paired-bootstrap 95% CI lower bound `> 0`.
+The complete ladder budget remains below 4 H200-hours. These are frozen pre-run
+contracts, not measured F12 results.
+
+Run the F12 ladder in the same order as F10 using the five
+`tau/.rendered/f12-*.yaml` targets: smoke, freeze draft, baseline, freeze finalize,
+train, and post. Fetch artifacts by exact filenames as described below.
 
 ## Frozen eval manifest and the paired comparison gate
 

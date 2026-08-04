@@ -1,0 +1,33 @@
+# F12 CPU-only config smoke: validates the immutable 200-step duration-only config.
+name: prime-rl-math-7b-h200-f12-smoke
+engine: job
+entrypoint: scripts/run-prime-rl.sh
+
+runtime:
+  image: ghcr.io/primeintellect-ai/prime-rl@sha256:d701d000174052a70ad060197e71915e83e0f2b1fedef956c60b3038cf2b992f
+  env:
+    WANDB_MODE: offline
+    PRIME_RL_RUN_MODE: smoke
+    PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
+    PRIME_RL_REPO_SHA: a603e791776a4579440edc5df5b70309c61cf46a
+    PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
+    PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
+    PRIME_RL_CONFIG_REL: configs/tau/math-7b-h200/train-f12.toml
+
+compute:
+  gpus: 0
+  cpu_request: "2"
+  cpu_limit: "4"
+  memory_request: 4Gi
+  memory_limit: 8Gi
+
+policy:
+  workspace: pretraining-data
+  queue: jobqueue
+  topology: independent
+  node_selector:
+    kubernetes.azure.com/mode: system
+
+storage:
+  data_pvc: blob-training
+  output: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/smoke

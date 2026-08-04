@@ -1,0 +1,38 @@
+# F12 2-H200 duration-only run. Step 200 is the only comparison-of-record checkpoint.
+# Startup, step-100, and step-200 in-run evals are monitoring signals only.
+name: prime-rl-math-7b-h200-f12-train
+engine: job
+entrypoint: scripts/run-prime-rl.sh
+
+runtime:
+  image: ghcr.io/primeintellect-ai/prime-rl@sha256:d701d000174052a70ad060197e71915e83e0f2b1fedef956c60b3038cf2b992f
+  env:
+    WANDB_MODE: offline
+    PRIME_RL_RUN_MODE: train
+    PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
+    PRIME_RL_REPO_SHA: a603e791776a4579440edc5df5b70309c61cf46a
+    PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
+    PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
+    PRIME_RL_MODEL_NAME: Qwen/Qwen2.5-7B-Instruct
+    PRIME_RL_MODEL_REVISION: a09a35458c702b33eeacc393d103063234e8bc28
+    PRIME_RL_CONFIG_REL: configs/tau/math-7b-h200/train-f12.toml
+    PRIME_RL_MANIFEST_DIR: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/manifest
+
+compute:
+  gpus: 2
+  cpu_request: "16"
+  cpu_limit: "32"
+  memory_request: 128Gi
+  memory_limit: 256Gi
+
+policy:
+  workspace: pretraining-data
+  queue: jobqueue
+  topology: single-node-nvlink
+  node_selector:
+    agentpool: h200pool
+    kueue.azure.com/gpu-series: nd-h200-v5
+
+storage:
+  data_pvc: blob-training
+  output: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/train
