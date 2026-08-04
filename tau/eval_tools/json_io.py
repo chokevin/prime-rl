@@ -40,7 +40,6 @@ class JsonEvidenceSnapshot:
 
 @dataclass(frozen=True)
 class FileEvidenceSnapshot:
-    raw: bytes
     digest: str
     mode: int
     device: int
@@ -247,7 +246,13 @@ def _open_json_snapshot(directory_descriptor: int, name: str, path: Path) -> Jso
         os.close(descriptor)
 
 
-def _open_file_snapshot(directory_descriptor: int, name: str, path: Path) -> FileEvidenceSnapshot:
+def _open_file_snapshot(
+    directory_descriptor: int,
+    name: str,
+    path: Path,
+    *,
+    expected_raw: bytes | None = None,
+) -> FileEvidenceSnapshot:
     pathname_metadata = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
     if not stat.S_ISREG(pathname_metadata.st_mode):
         raise ValueError(f"evidence path must be a regular file: {path}")
@@ -256,16 +261,20 @@ def _open_file_snapshot(directory_descriptor: int, name: str, path: Path) -> Fil
         before = os.fstat(descriptor)
         if _snapshot_metadata(pathname_metadata) != _snapshot_metadata(before):
             raise RuntimeError(f"evidence path changed while being opened: {path}")
-        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        offset = 0
         while chunk := os.read(descriptor, 1024 * 1024):
-            chunks.append(chunk)
+            digest.update(chunk)
+            if expected_raw is not None and chunk != expected_raw[offset : offset + len(chunk)]:
+                raise RuntimeError(f"evidence bytes do not match expected evidence: {path}")
+            offset += len(chunk)
         after = os.fstat(descriptor)
         if _snapshot_metadata(before) != _snapshot_metadata(after):
             raise RuntimeError(f"evidence changed while being read: {path}")
-        raw = b"".join(chunks)
+        if expected_raw is not None and offset != len(expected_raw):
+            raise RuntimeError(f"evidence size does not match expected evidence: {path}")
         snapshot = FileEvidenceSnapshot(
-            raw=raw,
-            digest=hashlib.sha256(raw).hexdigest(),
+            digest=digest.hexdigest(),
             mode=stat.S_IFMT(after.st_mode),
             device=after.st_dev,
             inode=after.st_ino,
@@ -309,9 +318,12 @@ def promote_file_noreplace(
         destination_descriptor = open_directory_nofollow(final_path.parent)
         if os.fstat(source_descriptor).st_dev != os.fstat(destination_descriptor).st_dev:
             raise RuntimeError("evidence staging and destination must be on the same filesystem")
-        staged = _open_file_snapshot(source_descriptor, staging_path.name, staging_path)
-        if expected_raw is not None and staged.raw != expected_raw:
-            raise RuntimeError(f"staged evidence bytes do not match expected evidence: {staging_path}")
+        staged = _open_file_snapshot(
+            source_descriptor,
+            staging_path.name,
+            staging_path,
+            expected_raw=expected_raw,
+        )
         if expected_digest is not None and staged.digest != expected_digest:
             raise RuntimeError(f"staged evidence digest does not match expected evidence: {staging_path}")
         if expected_identity is not None and (staged.device, staged.inode) != expected_identity:
@@ -350,14 +362,12 @@ def promote_file_noreplace(
             final.device,
             final.inode,
             final.size,
-            final.raw,
             final.digest,
         ) != (
             staged.mode,
             staged.device,
             staged.inode,
             staged.size,
-            staged.raw,
             staged.digest,
         ):
             raise RuntimeError(f"installed evidence does not match validated staging: {final_path}")

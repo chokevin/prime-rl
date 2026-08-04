@@ -10,6 +10,11 @@ from threading import Barrier
 import pytest
 
 import tau.eval_tools.live.inference_launcher_live as inference_launcher
+from tau.eval_tools.f12_recovery import (
+    F12_EXPERIMENT_SOURCE_REVISION,
+    F12_RECOVERY_ENVIRONMENT,
+    f12_recovery_paths,
+)
 from tau.eval_tools.live.inference_launcher_live import (
     attempt_log_name,
     open_inference_log,
@@ -53,6 +58,21 @@ def _references(mode, eval_label, source_revision, data_root):
     if mode == "freeze-finalize":
         references["baseline_rewards_path"] = generation.baseline_rewards
     return references
+
+
+def _f12_recovery_references(data_root):
+    paths = f12_recovery_paths(data_root)
+    return {
+        "manifest_path": paths.manifest,
+        "baseline_rewards_path": paths.baseline_rewards,
+        "training_result_path": paths.training_result,
+        "training_output_dir": paths.training_output_dir,
+        "lora_adapter_path": paths.adapter,
+        "comparison_output_path": (
+            evidence_generation(SOURCE_B, data_root=data_root).eval_post_recovery / "comparison.json"
+        ),
+        "recovery_environment": F12_RECOVERY_ENVIRONMENT,
+    }
 
 
 @pytest.mark.parametrize(
@@ -101,6 +121,77 @@ def test_source_generations_are_disjoint_and_preserve_prior_artifacts(tmp_path):
     assert first.smoke != second.smoke
     assert prior.read_bytes() == b"immutable generation A"
     assert not (second.smoke / prior.name).exists()
+
+
+def test_f12_recovery_creates_only_new_runtime_output_and_preserves_source_evidence(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    source_paths = f12_recovery_paths(data_root)
+    source_paths.generation_root.mkdir(parents=True)
+    preserved = source_paths.generation_root / "eval-post" / "inference.log"
+    preserved.parent.mkdir()
+    preserved.write_bytes(b"preserved interrupted F12 log")
+    expected = evidence_generation(SOURCE_B, data_root=data_root).eval_post_recovery
+
+    prepared = prepare_output_directory(
+        "eval-post-recovery",
+        expected,
+        SOURCE_B,
+        eval_label="post",
+        data_root=data_root,
+        **_f12_recovery_references(data_root),
+    )
+
+    assert prepared == expected
+    assert prepared.is_dir()
+    assert preserved.read_bytes() == b"preserved interrupted F12 log"
+    assert not (source_paths.generation_root / "eval-post-recovery").exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ({"manifest_path": "/data/wrong.json"}, "PRIME_RL_MANIFEST_PATH"),
+        (
+            {"recovery_environment": F12_RECOVERY_ENVIRONMENT | {"manifest_sha256": "0" * 64}},
+            "manifest_sha256",
+        ),
+    ],
+)
+def test_f12_recovery_rejects_mismatched_contract_before_output_creation(tmp_path, mutation, error):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    expected = evidence_generation(SOURCE_B, data_root=data_root).eval_post_recovery
+    references = _f12_recovery_references(data_root) | mutation
+
+    with pytest.raises(ValueError, match=error):
+        prepare_output_directory(
+            "eval-post-recovery",
+            expected,
+            SOURCE_B,
+            eval_label="post",
+            data_root=data_root,
+            **references,
+        )
+
+    assert not expected.exists()
+
+
+def test_f12_recovery_rejects_reusing_experiment_source_generation_before_creation(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    expected = evidence_generation(F12_EXPERIMENT_SOURCE_REVISION, data_root=data_root).eval_post_recovery
+
+    with pytest.raises(ValueError, match="new runtime source generation"):
+        prepare_output_directory(
+            "eval-post-recovery",
+            expected,
+            F12_EXPERIMENT_SOURCE_REVISION,
+            eval_label="post",
+            data_root=data_root,
+        )
+
+    assert not expected.exists()
 
 
 def test_prepared_eval_and_train_outputs_support_first_runtime_use(tmp_path):
@@ -566,7 +657,7 @@ def test_wrapper_passes_verified_source_and_prepares_generation_before_mode_firs
 
 def test_eval_wrapper_closes_writer_and_publishes_log_after_result_evidence():
     script = (Path(__file__).parents[2] / "scripts/run-prime-rl.sh").read_text()
-    eval_dispatch = script.index("eval)")
+    eval_dispatch = script.index("eval | eval-post-recovery)")
     launch = script.index("inference_launcher_live launch", eval_dispatch)
     rewards = script.index("run_frozen_eval_live", launch)
     comparison = script.index("tau.eval_tools.cli compare", rewards)
@@ -575,6 +666,76 @@ def test_eval_wrapper_closes_writer_and_publishes_log_after_result_evidence():
 
     assert launch < rewards < comparison < stop < promote
     assert 'inference_attempt_id="${HOSTNAME:?HOSTNAME must identify this pod}"' in script
+
+
+def test_recovery_wrapper_validates_fixed_inputs_before_model_or_inference_use():
+    script = (Path(__file__).parents[2] / "scripts/run-prime-rl.sh").read_text()
+    prepare = script.index("tau.eval_tools.output_paths")
+    dispatch = script.index("eval | eval-post-recovery)", prepare)
+    recovery_validation = script.index("tau.eval_tools.cli validate-f12-recovery", dispatch)
+    resolved_source = script.index('--runtime-source-revision "$resolved_sha"', recovery_validation)
+    model_materialization = script.index("tau.eval_tools.live.private_materialization_live", resolved_source)
+    launch = script.index("inference_launcher_live launch", model_materialization)
+    evaluate = script.index("run_frozen_eval_live", launch)
+    comparison = script.index("compare-f12-recovery", evaluate)
+    stop = script.index("stop_inference", comparison)
+    promote = script.index("inference_launcher_live promote", stop)
+
+    assert prepare < dispatch < recovery_validation < resolved_source < model_materialization
+    assert model_materialization < launch < evaluate < comparison < stop < promote
+    assert "CHILD_PROCESS_GROUP=true" in script
+    assert 'kill -TERM -- "-${inference_pid}"' in script
+
+
+def test_inference_launcher_terminates_complete_process_group_before_promotion(tmp_path):
+    output_dir = tmp_path.resolve()
+    attempt_id = "pod-process-group"
+    leader_body = (
+        "import os, signal, subprocess, sys, time; "
+        "grandchild=subprocess.Popen([sys.executable, '-c', "
+        "\"import time; print('grandchild-ready', flush=True); time.sleep(60)\"]); "
+        "signal.signal(signal.SIGTERM, lambda *_: (grandchild.wait(timeout=5), sys.exit(0))); "
+        "print(f'leader-ready:{os.getpgrp()}', flush=True); time.sleep(60)"
+    )
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "tau.eval_tools.live.inference_launcher_live",
+            "launch",
+            "--output-dir",
+            str(output_dir),
+            "--attempt-id",
+            attempt_id,
+            "--",
+            sys.executable,
+            "-c",
+            leader_body,
+        ]
+    )
+    attempt_path = output_dir / attempt_log_name(attempt_id)
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if attempt_path.exists() and "grandchild-ready" in attempt_path.read_text():
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("inference process group did not become ready")
+        assert os.getpgid(child.pid) == child.pid
+
+        os.killpg(child.pid, signal.SIGTERM)
+        assert child.wait(timeout=10) == 0
+        with pytest.raises(ProcessLookupError):
+            os.killpg(child.pid, 0)
+
+        promoted = promote_inference_log(output_dir, attempt_id)
+        assert promoted.digest
+        assert (output_dir / "inference.log").read_text().startswith("leader-ready:")
+    finally:
+        if child.poll() is None:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=5)
 
 
 def test_tier_curve_wrapper_closes_writer_before_log_promotion():

@@ -18,6 +18,7 @@
 #                    frozen-eval manifest (CPU-only, no GPU).
 #   freeze-finalize- validate fixed baseline rewards and freeze the immutable manifest.
 #   eval           - 1 GPU: standalone frozen-eval replay (baseline or post-training).
+#   eval-post-recovery - 1 GPU: one fixed F12 post-only recovery against immutable inputs.
 #   tier-curve     - 1 GPU: full harder-math-v1 base/core/hard evaluation curve.
 #   train          - 2 GPU: bounded RL training; refuses to start without a frozen
 #                    manifest already on durable storage.
@@ -29,7 +30,7 @@ die() {
     exit 1
 }
 
-: "${PRIME_RL_RUN_MODE:?PRIME_RL_RUN_MODE must be set (smoke|freeze-draft|freeze-finalize|eval|tier-curve|train)}"
+: "${PRIME_RL_RUN_MODE:?PRIME_RL_RUN_MODE must be set (smoke|freeze-draft|freeze-finalize|eval|eval-post-recovery|tier-curve|train)}"
 : "${TAU_OUTPUT_DIR:?TAU_OUTPUT_DIR not set by Tau}"
 : "${PRIME_RL_REPO_URL:?PRIME_RL_REPO_URL must be set (e.g. https://github.com/chokevin/prime-rl.git)}"
 : "${PRIME_RL_REPO_SHA:?PRIME_RL_REPO_SHA must be set to the exact commit to overlay}"
@@ -41,6 +42,7 @@ die() {
 [[ "$PRIME_RL_TASKSETS_SHA" =~ ^[0-9a-f]{40}$ ]] || die "PRIME_RL_TASKSETS_SHA must be a full lowercase 40-character commit SHA"
 
 CHILD_PID=""
+CHILD_PROCESS_GROUP=false
 TMP_ROOT="$(realpath -e /tmp)"
 [ -d "$TMP_ROOT" ] || die "canonical /tmp root is unavailable"
 overlay_raw="$(mktemp -d "${TMP_ROOT}/prime-rl-overlay.XXXXXX")"
@@ -74,9 +76,13 @@ if command -v findmnt >/dev/null 2>&1; then
 fi
 
 cleanup() {
-    if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+    if [ -n "$CHILD_PID" ]; then
         log "stopping child process (pid ${CHILD_PID})"
-        kill -TERM "$CHILD_PID" 2>/dev/null || true
+        if [ "$CHILD_PROCESS_GROUP" = true ]; then
+            kill -TERM -- "-${CHILD_PID}" 2>/dev/null || kill -TERM "$CHILD_PID" 2>/dev/null || true
+        else
+            kill -TERM "$CHILD_PID" 2>/dev/null || true
+        fi
         wait "$CHILD_PID" 2>/dev/null || true
     fi
     canonical_overlay="$(realpath -e "$OVERLAY_DIR" 2>/dev/null || true)"
@@ -113,12 +119,18 @@ cleanup() {
 forward_signal_and_exit() {
     local signal_name="$1" exit_status="$2"
     trap - INT TERM
-    if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+    if [ -n "$CHILD_PID" ]; then
         log "forwarding ${signal_name} to child process (pid ${CHILD_PID})"
-        kill "-${signal_name}" "$CHILD_PID" 2>/dev/null || true
+        if [ "$CHILD_PROCESS_GROUP" = true ]; then
+            kill "-${signal_name}" -- "-${CHILD_PID}" 2>/dev/null ||
+                kill "-${signal_name}" "$CHILD_PID" 2>/dev/null || true
+        else
+            kill "-${signal_name}" "$CHILD_PID" 2>/dev/null || true
+        fi
         wait "$CHILD_PID" 2>/dev/null || true
     fi
     CHILD_PID=""
+    CHILD_PROCESS_GROUP=false
     exit "$exit_status"
 }
 
@@ -224,7 +236,22 @@ GENERATION_ROOT="$(uv run --no-sync python -m tau.eval_tools.output_paths \
     --lora-adapter-path "${PRIME_RL_LORA_ADAPTER_PATH:-}" \
     --comparison-output-path "${PRIME_RL_COMPARISON_OUTPUT_PATH:-}" \
     --tier-curve-model-source-revision "${PRIME_RL_TIER_CURVE_MODEL_SOURCE_REVISION:-}" \
-    --tier-curve-model-manifest-path "${PRIME_RL_TIER_CURVE_MODEL_MANIFEST_PATH:-}")"
+    --tier-curve-model-manifest-path "${PRIME_RL_TIER_CURVE_MODEL_MANIFEST_PATH:-}" \
+    --recovery-experiment-source-revision "${PRIME_RL_RECOVERY_EXPERIMENT_SOURCE_REVISION:-}" \
+    --recovery-manifest-sha256 "${PRIME_RL_RECOVERY_MANIFEST_SHA256:-}" \
+    --recovery-baseline-rewards-sha256 "${PRIME_RL_RECOVERY_BASELINE_REWARDS_SHA256:-}" \
+    --recovery-training-result-sha256 "${PRIME_RL_RECOVERY_TRAINING_RESULT_SHA256:-}" \
+    --recovery-manifest-identity "${PRIME_RL_RECOVERY_MANIFEST_IDENTITY:-}" \
+    --recovery-adapter-aggregate "${PRIME_RL_RECOVERY_ADAPTER_AGGREGATE:-}" \
+    --recovery-adapter-config-sha256 "${PRIME_RL_RECOVERY_ADAPTER_CONFIG_SHA256:-}" \
+    --recovery-adapter-model-sha256 "${PRIME_RL_RECOVERY_ADAPTER_MODEL_SHA256:-}" \
+    --recovery-model-aggregate "${PRIME_RL_RECOVERY_MODEL_AGGREGATE:-}" \
+    --recovery-training-data-digest "${PRIME_RL_RECOVERY_TRAINING_DATA_DIGEST:-}" \
+    --recovery-source-config-digest "${PRIME_RL_RECOVERY_SOURCE_CONFIG_DIGEST:-}" \
+    --recovery-training-attempt-id "${PRIME_RL_RECOVERY_TRAINING_ATTEMPT_ID:-}" \
+    --recovery-source-step "${PRIME_RL_RECOVERY_SOURCE_STEP:-}" \
+    --recovery-max-steps "${PRIME_RL_RECOVERY_MAX_STEPS:-}" \
+    --recovery-eval-interval "${PRIME_RL_RECOVERY_EVAL_INTERVAL:-}")"
 log "prepared source generation ${GENERATION_ROOT} and mode output ${TAU_OUTPUT_DIR}"
 
 # --- Step 2: child-process lifecycle helpers -----------------------------------------
@@ -243,6 +270,7 @@ wait_for_health() {
                 child_status=$?
             fi
             CHILD_PID=""
+            CHILD_PROCESS_GROUP=false
             die "inference server exited before readiness (status ${child_status}; ${url})"
         fi
         if [ "$waited" -ge "$timeout_s" ]; then
@@ -255,24 +283,36 @@ wait_for_health() {
 }
 
 stop_inference() {
-    local child_status
+    local child_status inference_pid waited
     [ -n "$CHILD_PID" ] || die "cannot stop inference without a tracked child"
+    [ "$CHILD_PROCESS_GROUP" = true ] || die "inference child is not isolated in its own process group"
+    inference_pid="$CHILD_PID"
     log "stopping inference server before log promotion (pid ${CHILD_PID})"
-    if kill -0 "$CHILD_PID" 2>/dev/null; then
-        if ! kill -TERM "$CHILD_PID" 2>/dev/null && kill -0 "$CHILD_PID" 2>/dev/null; then
-            die "failed to terminate inference server (pid ${CHILD_PID})"
+    if kill -0 -- "-${inference_pid}" 2>/dev/null; then
+        if ! kill -TERM -- "-${inference_pid}" 2>/dev/null &&
+            kill -0 -- "-${inference_pid}" 2>/dev/null; then
+            die "failed to terminate inference process group ${inference_pid}"
         fi
     fi
-    if wait "$CHILD_PID"; then
+    if wait "$inference_pid"; then
         child_status=0
     else
         child_status=$?
     fi
     CHILD_PID=""
+    CHILD_PROCESS_GROUP=false
     case "$child_status" in
     0 | 143) ;;
     *) die "inference server exited unexpectedly while stopping (status ${child_status})" ;;
     esac
+    waited=0
+    while kill -0 -- "-${inference_pid}" 2>/dev/null && [ "$waited" -lt 100 ]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    if kill -0 -- "-${inference_pid}" 2>/dev/null; then
+        die "inference process group ${inference_pid} still owns descendants after TERM"
+    fi
 }
 
 # --- Step 3: mode dispatch ------------------------------------------------------------
@@ -339,7 +379,7 @@ freeze-finalize)
         --out "${PRIME_RL_MANIFEST_DIR}/frozen-eval-manifest.json"
     ;;
 
-eval)
+eval | eval-post-recovery)
     : "${PRIME_RL_EVAL_LABEL:?PRIME_RL_EVAL_LABEL must be baseline or post}"
     : "${PRIME_RL_MODEL_NAME:?PRIME_RL_MODEL_NAME must be set}"
     : "${PRIME_RL_MODEL_REVISION:?PRIME_RL_MODEL_REVISION must be an exact HF commit SHA}"
@@ -363,7 +403,18 @@ eval)
         : "${PRIME_RL_TRAINING_OUTPUT_DIR:?PRIME_RL_TRAINING_OUTPUT_DIR must be set for post eval}"
         manifest_args+=(--require-finalized)
     fi
-    uv run --no-sync python -m tau.eval_tools.cli validate-manifest "${manifest_args[@]}" >/dev/null
+    if [ "$PRIME_RL_RUN_MODE" = "eval-post-recovery" ]; then
+        uv run --no-sync python -m tau.eval_tools.cli validate-f12-recovery \
+            --runtime-source-revision "$resolved_sha" \
+            --manifest "$PRIME_RL_MANIFEST_PATH" \
+            --baseline "$PRIME_RL_BASELINE_REWARDS_PATH" \
+            --training-result "$PRIME_RL_TRAINING_RESULT_PATH" \
+            --training-output-dir "$PRIME_RL_TRAINING_OUTPUT_DIR" \
+            --adapter-path "$PRIME_RL_LORA_ADAPTER_PATH" \
+            --private-run-root "$RUN_ROOT"
+    else
+        uv run --no-sync python -m tau.eval_tools.cli validate-manifest "${manifest_args[@]}" >/dev/null
+    fi
     uv run --no-sync python -m tau.eval_tools.live.private_materialization_live \
         --manifest "$PRIME_RL_MANIFEST_PATH" \
         --run-root "$RUN_ROOT" \
@@ -375,12 +426,14 @@ eval)
     inference_args=(--model.name "$model_snapshot_path" --server.port 8000 --router None)
     lora_name=""
     if [ "$PRIME_RL_EVAL_LABEL" = "post" ]; then
-        uv run --no-sync python -m tau.eval_tools.cli validate-adapter-handoff \
-            --manifest "$PRIME_RL_MANIFEST_PATH" \
-            --training-result "$PRIME_RL_TRAINING_RESULT_PATH" \
-            --training-output-dir "$PRIME_RL_TRAINING_OUTPUT_DIR" \
-            --adapter-path "$PRIME_RL_LORA_ADAPTER_PATH" \
-            --private-run-root "$RUN_ROOT"
+        if [ "$PRIME_RL_RUN_MODE" != "eval-post-recovery" ]; then
+            uv run --no-sync python -m tau.eval_tools.cli validate-adapter-handoff \
+                --manifest "$PRIME_RL_MANIFEST_PATH" \
+                --training-result "$PRIME_RL_TRAINING_RESULT_PATH" \
+                --training-output-dir "$PRIME_RL_TRAINING_OUTPUT_DIR" \
+                --adapter-path "$PRIME_RL_LORA_ADAPTER_PATH" \
+                --private-run-root "$RUN_ROOT"
+        fi
         inference_args+=(--enable-lora --max-lora-rank 16)
         lora_name="post-adapter"
     fi
@@ -398,6 +451,7 @@ eval)
             --attempt-id "$inference_attempt_id" -- \
             uv run --no-sync inference "${inference_args[@]}" &
         CHILD_PID=$!
+        CHILD_PROCESS_GROUP=true
 
         wait_for_health "http://localhost:8000/health" "${PRIME_RL_HEALTH_TIMEOUT_S:-1800}"
 
@@ -432,11 +486,27 @@ eval)
         *) die "PRIME_RL_COMPARISON_OUTPUT_PATH must be a named file under ${TAU_OUTPUT_DIR}" ;;
         esac
         log "comparing baseline vs post rewards against the pass/fail gate"
-        if uv run --no-sync python -m tau.eval_tools.cli compare \
-            --manifest "$PRIME_RL_MANIFEST_PATH" \
-            --baseline "$PRIME_RL_BASELINE_REWARDS_PATH" \
-            --post "$rewards_path" \
-            --output "$comparison_path"; then
+        comparison_command=(
+            uv run --no-sync python -m tau.eval_tools.cli compare
+            --manifest "$PRIME_RL_MANIFEST_PATH"
+            --baseline "$PRIME_RL_BASELINE_REWARDS_PATH"
+            --post "$rewards_path"
+            --output "$comparison_path"
+        )
+        if [ "$PRIME_RL_RUN_MODE" = "eval-post-recovery" ]; then
+            comparison_command=(
+                uv run --no-sync python -m tau.eval_tools.cli compare-f12-recovery
+                --runtime-source-revision "$resolved_sha"
+                --manifest "$PRIME_RL_MANIFEST_PATH"
+                --baseline "$PRIME_RL_BASELINE_REWARDS_PATH"
+                --post "$rewards_path"
+                --training-result "$PRIME_RL_TRAINING_RESULT_PATH"
+                --training-output-dir "$PRIME_RL_TRAINING_OUTPUT_DIR"
+                --adapter-path "$PRIME_RL_LORA_ADAPTER_PATH"
+                --output "$comparison_path"
+            )
+        fi
+        if "${comparison_command[@]}"; then
             comparison_status=0
         else
             comparison_status=$?
@@ -481,6 +551,7 @@ tier-curve)
             --server.port 8000 \
             --router None &
     CHILD_PID=$!
+    CHILD_PROCESS_GROUP=true
     wait_for_health "http://localhost:8000/health" "${PRIME_RL_HEALTH_TIMEOUT_S:-1800}"
 
     uv run --no-sync python -m tau.eval_tools.live.run_harder_tier_curve_live \
@@ -529,6 +600,7 @@ train)
         supervisor_status=$?
     fi
     CHILD_PID=""
+    CHILD_PROCESS_GROUP=false
     if [ "$supervisor_status" -ne 0 ]; then
         log "training supervisor failed with status ${supervisor_status}"
         exit "$supervisor_status"

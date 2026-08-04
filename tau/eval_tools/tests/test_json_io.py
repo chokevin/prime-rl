@@ -1,10 +1,25 @@
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
 import pytest
 
 import tau.eval_tools.json_io as json_io_module
-from tau.eval_tools.json_io import load_json_with_sha256, write_json_exclusive
+from tau.eval_tools.json_io import load_json_with_sha256, promote_file_noreplace, write_json_exclusive
+
+
+def test_generic_file_promotion_streams_large_evidence_without_retaining_bytes(tmp_path):
+    staging = tmp_path / "inference.attempt-pod.log"
+    final = tmp_path / "inference.log"
+    raw = b"x" * (3 * 1024 * 1024 + 17)
+    staging.write_bytes(raw)
+
+    snapshot = promote_file_noreplace(staging, final)
+
+    assert snapshot.digest == hashlib.sha256(raw).hexdigest()
+    assert snapshot.size == len(raw)
+    assert not hasattr(snapshot, "raw")
+    assert final.read_bytes() == raw
 
 
 @pytest.mark.parametrize("phase", ["during-write", "before-install"])

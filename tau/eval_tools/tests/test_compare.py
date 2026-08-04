@@ -10,6 +10,10 @@ from tau.eval_tools.compare import (
     paired_bootstrap_ci,
     write_result,
 )
+from tau.eval_tools.f12_recovery import (
+    F12_EXPERIMENT_SOURCE_REVISION,
+    F12RecoveryComparisonResult,
+)
 from tau.eval_tools.hashing import hash_text
 from tau.eval_tools.json_io import DuplicateKeyError, write_json_exclusive
 from tau.eval_tools.live.freeze_manifest_live import validate_baseline_evidence
@@ -145,6 +149,51 @@ def test_compare_runs_passes_on_clear_one_directional_improvement():
     assert result.ci_lower > 0
     assert result.n_bootstrap == 10_000
     assert result.bootstrap_seed == 0
+
+
+def test_f12_recovery_comparison_records_both_runtime_and_experiment_sources():
+    manifest = _manifest()
+    baseline = _reward_record(
+        manifest,
+        {i: (1.0 if i < 80 else 0.0) for i in range(N)},
+        model_label="baseline",
+    )
+    post = _reward_record(
+        manifest,
+        {i: (1.0 if i < 100 else 0.0) for i in range(N)},
+        model_label="post",
+    )
+    comparison = _compare(manifest, baseline, post)
+
+    recovery = F12RecoveryComparisonResult(
+        **comparison.model_dump(),
+        recovery_runtime_source_revision="b" * 40,
+    )
+
+    assert recovery.recovery_runtime_source_revision == "b" * 40
+    assert recovery.frozen_experiment_source_revision == F12_EXPERIMENT_SOURCE_REVISION
+    assert recovery.recovery_contract_version == 1
+
+
+def test_f12_recovery_comparison_rejects_experiment_source_as_runtime_source():
+    with pytest.raises(ValueError, match="new full lowercase"):
+        F12RecoveryComparisonResult(
+            n=500,
+            baseline_mean=0.738,
+            post_mean=0.8,
+            delta=0.062,
+            ci_lower=0.01,
+            ci_upper=0.1,
+            n_bootstrap=10_000,
+            bootstrap_seed=0,
+            ci_alpha=0.05,
+            min_delta=0.03,
+            manifest_identity_hash="0" * 64,
+            baseline_rewards_sha256="1" * 64,
+            post_rewards_sha256="2" * 64,
+            passed=True,
+            recovery_runtime_source_revision=F12_EXPERIMENT_SOURCE_REVISION,
+        )
 
 
 def test_compare_runs_fails_when_delta_below_threshold():

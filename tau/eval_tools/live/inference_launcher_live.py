@@ -73,6 +73,7 @@ def launch_with_inference_log(output_dir: str | Path, attempt_id: str, command: 
     finally:
         if descriptor > 2:
             os.close(descriptor)
+    os.setsid()
     os.execvp(command[0], command)
 
 

@@ -27,6 +27,11 @@ from tau.eval_tools.artifacts import (
     write_smoke_result,
 )
 from tau.eval_tools.compare import compare_from_paths, write_result
+from tau.eval_tools.f12_recovery import (
+    compare_f12_recovery,
+    validate_f12_recovery_inputs,
+    validate_recovery_runtime_source,
+)
 from tau.eval_tools.live.private_materialization_live import validate_run_root
 from tau.eval_tools.manifest import (
     FrozenEvalManifest,
@@ -49,6 +54,46 @@ def _cmd_compare(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    print(result.report())
+    return 0 if result.passed else 1
+
+
+def _f12_recovery_paths_from_args(args: argparse.Namespace) -> dict[str, Path]:
+    return {
+        "manifest_path": Path(args.manifest),
+        "baseline_path": Path(args.baseline),
+        "training_result_path": Path(args.training_result),
+        "training_output_dir": Path(args.training_output_dir),
+        "adapter_path": Path(args.adapter_path),
+    }
+
+
+def _cmd_validate_f12_recovery(args: argparse.Namespace) -> int:
+    validate_recovery_runtime_source(args.runtime_source_revision)
+    paths = _f12_recovery_paths_from_args(args)
+    _, _, result = validate_f12_recovery_inputs(**paths)
+    private_run_root = validate_run_root(Path(args.private_run_root))
+    private_adapter = materialize_adapter_for_eval(
+        result=result,
+        durable_adapter_path=paths["adapter_path"],
+        run_root=private_run_root,
+    )
+    print(f"ok: verified immutable F12 recovery inputs and materialized {private_adapter}", file=sys.stderr)
+    return 0
+
+
+def _cmd_compare_f12_recovery(args: argparse.Namespace) -> int:
+    try:
+        result = compare_f12_recovery(
+            runtime_source_revision=args.runtime_source_revision,
+            post_path=Path(args.post),
+            **_f12_recovery_paths_from_args(args),
+        )
+        if args.output:
+            write_result(result, Path(args.output))
+    except Exception as exc:  # noqa: BLE001 - CLI boundary: surface any failure as a clean nonzero exit
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     print(result.report())
     return 0 if result.passed else 1
 
@@ -139,6 +184,27 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--post", required=True, help="Path to the post-training rewards JSON.")
     compare_parser.add_argument("--output", default=None, help="Optional path to write the comparison result JSON.")
     compare_parser.set_defaults(func=_cmd_compare)
+
+    recovery_validate_parser = subparsers.add_parser(
+        "validate-f12-recovery",
+        help="Validate the one fixed F12 post-recovery input contract and materialize its adapter.",
+    )
+    recovery_compare_parser = subparsers.add_parser(
+        "compare-f12-recovery",
+        help="Compare the fixed F12 baseline to recovery post rewards with dual-source provenance.",
+    )
+    for recovery_parser in (recovery_validate_parser, recovery_compare_parser):
+        recovery_parser.add_argument("--runtime-source-revision", required=True)
+        recovery_parser.add_argument("--manifest", required=True)
+        recovery_parser.add_argument("--baseline", required=True)
+        recovery_parser.add_argument("--training-result", required=True)
+        recovery_parser.add_argument("--training-output-dir", required=True)
+        recovery_parser.add_argument("--adapter-path", required=True)
+    recovery_validate_parser.add_argument("--private-run-root", required=True)
+    recovery_validate_parser.set_defaults(func=_cmd_validate_f12_recovery)
+    recovery_compare_parser.add_argument("--post", required=True)
+    recovery_compare_parser.add_argument("--output", required=True)
+    recovery_compare_parser.set_defaults(func=_cmd_compare_f12_recovery)
 
     disjoint_parser = subparsers.add_parser(
         "check-disjoint",
