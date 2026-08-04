@@ -172,3 +172,10 @@ The empirical model run is intentionally outside this package. The repository's
 `tau/harder-tier-curve.yaml` target runs the full catalog on one H200, binds the exact
 finalized F10 base-model/decoding manifest, writes immutable raw base/core/hard evidence,
 and fails if any request/grader fails or the fixed `0.15` gap is missed.
+
+The pinned Qwen2.5-7B F11 run completed all 5,030 records with zero failures:
+base `0.9151` (1,218/1,331), core `0.7812` (1,832/2,345), and hard `0.5288`
+(716/1,354). The measured base-minus-hard gap was `0.3863`, so the fixed gate passed.
+These public-benchmark rewards are an exact/math-answer accuracy proxy and may reflect
+pretraining contamination; they establish tier separation for this pinned setup, not
+uncontaminated generalization.

@@ -7,9 +7,10 @@ against a frozen, paired `math500-v1` held-out eval, through the `tau` CLI on
 `0.7480 -> 0.7500`, delta `+0.0020`, paired-bootstrap 95% CI
 `[-0.0160, +0.0200]`.
 
-The additive F11 target measures the same frozen base model over the full 5,030-row
-`harder-math-v1` eval catalog. It is independent of F10 training evidence and does
-not rerun or reinterpret the failed F10 tuple.
+The additive F11 target measured the same frozen base model over the full 5,030-row
+`harder-math-v1` eval catalog. It passed the fixed hardness gate with base `0.9151`,
+core `0.7812`, hard `0.5288`, and base-minus-hard `+0.3863`. It is independent of
+F10 training evidence and does not rerun or reinterpret the failed F10 tuple.
 
 ## Layout
 
@@ -354,9 +355,23 @@ for artifact in raw-base.json raw-core.json raw-hard.json tier-curve.v1.json inf
 done
 ```
 
-This one-H200 full-catalog run is the only remaining empirical gate for the custom
-environment. Runtime and token cost are not yet measured; do not infer a cost estimate
-from the client dry-run.
+The measured run used Job `prime-rl-harder-math-7b-h200-tier-curve`, Workload
+`job-prime-rl-harder-math-7b-h200-tier-curve-46b30`, and pod
+`prime-rl-harder-math-7b-h200-tier-curve-8wn67` on
+`aks-h200pool-35981772-vmss000000`. The server became healthy after 70 seconds,
+reached 100% H200 utilization with 129,848 MiB allocated, and completed all 5,030
+HTTP-200 requests with zero request/grader failures:
+
+| Tier | Correct / count | Mean | Wilson 95% CI |
+|---|---:|---:|---:|
+| base | 1,218 / 1,331 | 0.9151 | [0.8989, 0.9289] |
+| core | 1,832 / 2,345 | 0.7812 | [0.7641, 0.7975] |
+| hard | 716 / 1,354 | 0.5288 | [0.5022, 0.5553] |
+
+`base_mean - hard_mean = 0.3863`, so the fixed `>= 0.15` environment gate passed.
+The raw base/core/hard JSON, aggregate, and inference log were fetched before cleanup,
+the package's own trusted-catalog API revalidated all records, and every file re-fetched
+byte-identically from the PVC after Job/Pod/Workload deletion.
 
 If a job is interrupted **before** `completion.json`, submit the unchanged train target
 again. The supervisor creates a new attempt ID and ignores stale attempt evidence; it
@@ -576,8 +591,7 @@ MATH, MATH-500, and AIME material may have appeared in model pretraining, so eve
 future positive result would demonstrate only this pinned setup, not uncontaminated
 generalization.
 
-F11's 5,030-record harder-math tier curve has passed local render, validation, and
-client dry-run only. A live one-H200 submission must still prove zero request/grader
-failures, retain every fixed artifact, and satisfy
-`base_mean - hard_mean >= 0.15`. Any future RL attempt after F10 must be a new,
-separately justified and predeclared source generation.
+F11's 5,030-record harder-math tier curve is proven live with zero failures and
+`base_mean - hard_mean = 0.3863`. The repo-local custom environment therefore meets
+its empirical acceptance gate. The primary RL hill-climb remains unproven; any future
+attempt after F10 must be a new, separately justified and predeclared source generation.
