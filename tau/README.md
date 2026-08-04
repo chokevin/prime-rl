@@ -258,8 +258,8 @@ Its source-generation `eval-post/inference.log` remains preserved partial eviden
 there is no F12 post `rewards.json` or `comparison.json`, and that immutable tuple must
 not be rerun or cleaned up. The only approved continuation is the additive
 `f12-eval-post-recovery.yaml` target. It runs source
-`4c1c7dd9fde25c47af510fd7d757e9b885fc9d96`, writes only beneath
-`/data/pretraining-data/prime-rl-math-7b-h200/generations/4c1c7dd9fde25c47af510fd7d757e9b885fc9d96/eval-post-recovery/`,
+`00edda20c6d51862ce6d7a94d6dadfe501e94666`, writes only beneath
+`/data/pretraining-data/prime-rl-math-7b-h200/generations/00edda20c6d51862ce6d7a94d6dadfe501e94666/eval-post-recovery/`,
 and treats the complete F12 source generation as read-only.
 
 The recovery validates the exact F12 frozen manifest, 500-row baseline, successful
