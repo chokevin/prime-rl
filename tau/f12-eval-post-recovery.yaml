@@ -1,0 +1,58 @@
+# One approved 1-H200 recovery of the interrupted F12 post eval against immutable F12 inputs.
+name: prime-rl-math-7b-h200-f12-eval-post-recovery
+engine: job
+entrypoint: scripts/run-prime-rl.sh
+
+runtime:
+  image: ghcr.io/primeintellect-ai/prime-rl@sha256:d701d000174052a70ad060197e71915e83e0f2b1fedef956c60b3038cf2b992f
+  env:
+    WANDB_MODE: offline
+    PRIME_RL_RUN_MODE: eval-post-recovery
+    PRIME_RL_REPO_URL: https://github.com/chokevin/prime-rl.git
+    PRIME_RL_REPO_SHA: 4c1c7dd9fde25c47af510fd7d757e9b885fc9d96
+    PRIME_RL_VERIFIERS_SHA: f646beb37eef51869f886f244456e3d07818e4d6
+    PRIME_RL_TASKSETS_SHA: 6a2dee6fcd805f41128dba0024f7073afd496169
+    PRIME_RL_MODEL_NAME: Qwen/Qwen2.5-7B-Instruct
+    PRIME_RL_MODEL_REVISION: a09a35458c702b33eeacc393d103063234e8bc28
+    PRIME_RL_EVAL_LABEL: post
+    PRIME_RL_MANIFEST_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/manifest/frozen-eval-manifest.json
+    PRIME_RL_BASELINE_REWARDS_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/eval-baseline/rewards.json
+    PRIME_RL_TRAINING_RESULT_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/train/training-result.json
+    PRIME_RL_TRAINING_OUTPUT_DIR: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/train
+    PRIME_RL_LORA_ADAPTER_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/a603e791776a4579440edc5df5b70309c61cf46a/train/final-adapter
+    PRIME_RL_COMPARISON_OUTPUT_PATH: /data/pretraining-data/prime-rl-math-7b-h200/generations/4c1c7dd9fde25c47af510fd7d757e9b885fc9d96/eval-post-recovery/comparison.json
+    PRIME_RL_RECOVERY_EXPERIMENT_SOURCE_REVISION: a603e791776a4579440edc5df5b70309c61cf46a
+    PRIME_RL_RECOVERY_MANIFEST_SHA256: 759bb7ba018f75d3c3dee219e0746e00d2ff0c7531ddc986becac4f909291845
+    PRIME_RL_RECOVERY_BASELINE_REWARDS_SHA256: 8fc09bce4b4ecaf5256712d2b0eb1b72979e8f5a250f86e1e8e310ec3b2ec000
+    PRIME_RL_RECOVERY_TRAINING_RESULT_SHA256: 72b197a353978cff2a8c51aad6e8a45157bef189bac449a00384b3755744a0f3
+    PRIME_RL_RECOVERY_MANIFEST_IDENTITY: 2a35089008d5f5b2e0606facafe88b5534c155d1fd95787482aaef4f9cdba673
+    PRIME_RL_RECOVERY_ADAPTER_AGGREGATE: 48e6e1fe8dd4039e9fb716cff91101bc463f8198ef499c040e81b90b72af6f9e
+    PRIME_RL_RECOVERY_ADAPTER_CONFIG_SHA256: f1dcd0c6293492cf407eb63d8c8198360f8859433ad08ca1899dbffd7a8f50b5
+    PRIME_RL_RECOVERY_ADAPTER_MODEL_SHA256: 6bea386c91b51916bef28aa9e841e4a48cdc81ac0ce2c39bbb92239789eb0801
+    PRIME_RL_RECOVERY_MODEL_AGGREGATE: d2d9ab0fbeed7ab74ff3dc433209aec9b01952ccc4d88eec16c0d9aaf1fef9c8
+    PRIME_RL_RECOVERY_TRAINING_DATA_DIGEST: d5924980fe96e2a5ae2de7cd9470c061432adc15f5ac488535cd0f6ac0e8a155
+    PRIME_RL_RECOVERY_SOURCE_CONFIG_DIGEST: 5450d2ff141172a4ababc5dfe3df572f2764cba5c6e998d982bb21d270e9e2ff
+    PRIME_RL_RECOVERY_TRAINING_ATTEMPT_ID: 20260804T013900Z-0de01384c398f8d3
+    PRIME_RL_RECOVERY_SOURCE_STEP: "200"
+    PRIME_RL_RECOVERY_MAX_STEPS: "200"
+    PRIME_RL_RECOVERY_EVAL_INTERVAL: "100"
+    PRIME_RL_HEALTH_TIMEOUT_S: "1800"
+
+compute:
+  gpus: 1
+  cpu_request: "8"
+  cpu_limit: "16"
+  memory_request: 64Gi
+  memory_limit: 128Gi
+
+policy:
+  workspace: pretraining-data
+  queue: jobqueue
+  topology: single-node-nvlink
+  node_selector:
+    agentpool: h200pool
+    kueue.azure.com/gpu-series: nd-h200-v5
+
+storage:
+  data_pvc: blob-training
+  output: /data/pretraining-data/prime-rl-math-7b-h200/generations/4c1c7dd9fde25c47af510fd7d757e9b885fc9d96/eval-post-recovery

@@ -29,6 +29,7 @@ tau/
   f12-eval-baseline.yaml  # 1 H200: source-matched F12 baseline
   f12-train.yaml          # 2 H200: 200-step duration-only training
   f12-eval-post.yaml      # 1 H200: F12 frozen post eval + unchanged gate
+  f12-eval-post-recovery.yaml # 1 H200: fixed-input recovery of interrupted F12 post eval
   scripts/
     run-prime-rl.sh      # the one self-contained entrypoint all targets share (mode via $PRIME_RL_RUN_MODE)
   eval_tools/            # pure, macOS-testable: hashing, frozen-manifest schema, paired comparison + gate
@@ -246,9 +247,38 @@ paired gate remains delta `>= +0.03` and paired-bootstrap 95% CI lower bound `> 
 The complete ladder budget remains below 4 H200-hours. These are frozen pre-run
 contracts, not measured F12 results.
 
-Run the F12 ladder in the same order as F10 using the five
-`tau/.rendered/f12-*.yaml` targets: smoke, freeze draft, baseline, freeze finalize,
-train, and post. Fetch artifacts by exact filenames as described below.
+Run the original F12 ladder in the same order as F10 using
+`f12-smoke.yaml`, `f12-freeze-manifest.yaml`, `f12-eval-baseline.yaml`,
+`f12-train.yaml`, and `f12-eval-post.yaml`: smoke, freeze draft, baseline,
+freeze finalize, train, and post. Fetch artifacts by exact filenames as described
+below.
+
+The original F12 post Job was interrupted before any of its 500 requests completed.
+Its source-generation `eval-post/inference.log` remains preserved partial evidence;
+there is no F12 post `rewards.json` or `comparison.json`, and that immutable tuple must
+not be rerun or cleaned up. The only approved continuation is the additive
+`f12-eval-post-recovery.yaml` target. It runs source
+`4c1c7dd9fde25c47af510fd7d757e9b885fc9d96`, writes only beneath
+`/data/pretraining-data/prime-rl-math-7b-h200/generations/4c1c7dd9fde25c47af510fd7d757e9b885fc9d96/eval-post-recovery/`,
+and treats the complete F12 source generation as read-only.
+
+The recovery validates the exact F12 frozen manifest, 500-row baseline, successful
+step-200 training result, attempt `20260804T013900Z-0de01384c398f8d3`, model/data/config
+identities, and complete rank-16 adapter tree before inference. The approved SHA-256
+values are embedded in both runtime code and target environment, so path or digest drift
+fails before output creation. Its `comparison.json` records both the recovery runtime
+source and frozen F12 experiment source while applying the unchanged deterministic
+10,000-sample paired-bootstrap gate. It does not expose an alternate checkpoint,
+decoding, grader, seed, baseline, or reroll knob.
+
+Static recovery validation is:
+
+```bash
+uv run --no-sync python tau/render_image.py
+tau run validate --config tau/.rendered/f12-eval-post-recovery.yaml
+tau run --config tau/.rendered/f12-eval-post-recovery.yaml \
+  --context aks-ai-runtime-eastus2-admin --dry-run=client
+```
 
 ## Frozen eval manifest and the paired comparison gate
 
@@ -471,17 +501,20 @@ That optional artifact records diagnostics only; it does not alter or replace su
 evidence. If diagnostic persistence or stderr itself fails, exit remains zero and the
 already-verified success evidence remains immutable.
 
-Eval and harder-tier-curve inference use the same failure-safe publication sequence.
+Eval, recovery eval, and harder-tier-curve inference use the same failure-safe
+publication sequence.
 The launcher strictly validates the pod `HOSTNAME` as a DNS label and exclusively
 opens `inference.attempt-<hostname>.log` with no symlink following. TERM, evaluation
 failure, comparison publication failure, or an unexpected server exit preserves that
 attempt file and leaves the fixed `inference.log` absent, so a replacement pod with a
 different hostname can start without deleting evidence. A same-pod rerun collides with
 its own attempt file and fails closed. After rewards are durable, and after post-eval
-comparison is durable (including a valid failed gate), the wrapper terminates and
-waits for inference so BlobFuse observes a closed writer. It then no-follow snapshots
-the attempt inode, bytes, and SHA-256 digest; atomically renames without replacement;
-fsyncs; and strict-reopens the fixed final to verify the same inode, bytes, and digest.
+comparison is durable (including a valid failed gate), the wrapper terminates the
+dedicated inference process group and waits until no descendant can retain the writer,
+so BlobFuse observes a closed log. It then streams a no-follow snapshot of the attempt
+inode, size, and SHA-256 digest without retaining the unbounded log in memory; atomically
+renames without replacement; fsyncs; and strict-reopens the fixed final to verify the
+same inode, size, and digest.
 An existing final, symlink, path swap, or concurrent losing promotion fails without
 overwriting either the final or the losing attempt. The fixed log is therefore the
 last completion marker: interruption before rewards leaves only the attempt log and
@@ -521,6 +554,7 @@ storage proof) — fetch each by its exact name with `--artifact <file>`.
 | `freeze-manifest` | `<generation-root>/manifest` | `draft-manifest.json`, `frozen-eval-manifest.json` | unfrozen draft (pass 1) and the immutable frozen manifest (pass 2) `tau/eval_tools/manifest.py` reads/writes |
 | `eval-baseline` | `<generation-root>/eval-baseline` | successful `rewards.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | baseline per-example rewards (`RewardRecord`) `tau/eval_tools/compare.py` consumes; fixed log publishes last |
 | `eval-post` | `<generation-root>/eval-post` | successful `rewards.json`, `comparison.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | post-training rewards + the `ComparisonResult` (delta, bootstrap CI, pass/fail); fixed log publishes last |
+| `f12-eval-post-recovery` | recovery `<generation-root>/eval-post-recovery` | successful `rewards.json`, `comparison.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | one fixed-input post-only recovery; comparison records recovery runtime source plus frozen F12 source; F12 source generation remains read-only |
 | `train` | `<generation-root>/train` | fixed `training-result.json` and `final-adapter/`; exact logged `attempts/<attempt-id>/{preflight.json,resolved-train.toml,completion.json,publication.json,run-output/metrics.jsonl}`; optional `attempts/<attempt-id>/private-cleanup-diagnostic.json` | the trusted supervisor owns launch and attestation; attempt evidence binds the exact config/process/STABLE adapter, publication fsyncs and atomically installs without replacement, and writes the fixed result last; a post-success private-cleanup failure writes the optional diagnostic without changing success |
 | `harder-tier-curve` | F11 `<generation-root>/tier-curve` | successful `raw-base.json`, `raw-core.json`, `raw-hard.json`, `tier-curve.v1.json`, `inference.log`; failed `inference.attempt-<hostname>.log` | full trusted harder-math catalog, exact F10 base-model/decoding contract, fixed `0.15` hardness gate; fixed log publishes last |
 
@@ -589,7 +623,8 @@ its output.
 
 `<job-name>` equals each YAML's `name:` field
 (`prime-rl-math-7b-h200-{smoke,freeze-manifest,eval-baseline,eval-post,train}` or
-`prime-rl-harder-math-7b-h200-tier-curve`).
+`prime-rl-harder-math-7b-h200-tier-curve`, or
+`prime-rl-math-7b-h200-f12-eval-post-recovery`).
 Never submit the bare `tau/<target>.yaml` template directly; use the validated rendered
 copy so image-pin validation cannot be skipped.
 
@@ -615,9 +650,9 @@ copy so image-pin validation cannot be skipped.
 
 Run all of the following before any submit:
 
-- `tau run validate --config tau/.rendered/<target>.yaml` for all 6 targets.
+- `tau run validate --config tau/.rendered/<target>.yaml` for all 12 checked-in targets.
 - `tau run --config tau/.rendered/<target>.yaml --context aks-ai-runtime-eastus2-admin --dry-run=client`
-  for all 6 targets — rendered `batch/v1 Job`s with correct GPU requests/limits, node
+  for all 12 checked-in targets — rendered `batch/v1 Job`s with correct GPU requests/limits, node
   selectors, topology annotation, storage mounts, and env vars; the embedded
   `TAU_SCRIPT_B64` was verified byte-identical to `tau/scripts/run-prime-rl.sh` by
   decoding it back and diffing.
