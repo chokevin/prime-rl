@@ -16,6 +16,9 @@ from tau.eval_tools.live.inference_launcher_live import (
     promote_inference_log,
 )
 from tau.eval_tools.output_paths import (
+    RECOVERY_MODE,
+    RECOVERY_OUTPUT_LEAF,
+    RECOVERY_SOURCE_REVISION,
     evidence_generation,
     expected_output_path,
     prepare_output_directory,
@@ -622,3 +625,108 @@ def test_uv_run_inference_sigterm_status_matches_wrapper_contract(tmp_path, infe
         if child.poll() is None:
             child.kill()
             child.wait(timeout=5)
+
+
+def _recovery_frozen_references(data_root):
+    frozen = evidence_generation(RECOVERY_SOURCE_REVISION, data_root=data_root)
+    return {
+        "manifest_path": frozen.frozen_manifest,
+        "baseline_rewards_path": frozen.baseline_rewards,
+        "training_result_path": frozen.training_result,
+        "training_output_dir": frozen.train,
+        "lora_adapter_path": frozen.final_adapter,
+    }
+
+
+def test_recovery_output_is_fresh_leaf_in_runtime_generation(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    runtime = evidence_generation(SOURCE_A, data_root=data_root)
+    expected = runtime.root / RECOVERY_OUTPUT_LEAF
+
+    assert expected_output_path(RECOVERY_MODE, SOURCE_A, data_root=data_root) == expected
+
+    prepared = prepare_output_directory(
+        RECOVERY_MODE,
+        expected,
+        SOURCE_A,
+        data_root=data_root,
+        **_recovery_frozen_references(data_root),
+    )
+    assert prepared == expected
+    assert prepared.is_dir()
+    # The frozen F12 generation is never created or written by preparing the recovery output.
+    frozen = evidence_generation(RECOVERY_SOURCE_REVISION, data_root=data_root)
+    assert not frozen.root.exists()
+
+
+def test_recovery_rejects_running_from_the_frozen_f12_source(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    with pytest.raises(ValueError, match="distinct from the frozen F12 source"):
+        expected_output_path(RECOVERY_MODE, RECOVERY_SOURCE_REVISION, data_root=data_root)
+    assert not list(data_root.iterdir())
+
+
+def test_recovery_rejects_eval_label(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    with pytest.raises(ValueError, match="does not accept PRIME_RL_EVAL_LABEL"):
+        expected_output_path(RECOVERY_MODE, SOURCE_A, eval_label="post", data_root=data_root)
+
+
+def test_recovery_inputs_must_live_in_frozen_generation_not_runtime(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    runtime = evidence_generation(SOURCE_A, data_root=data_root)
+    references = _recovery_frozen_references(data_root)
+    # Pointing the manifest at the runtime generation (rather than the frozen F12 one) is rejected.
+    references["manifest_path"] = runtime.frozen_manifest
+    with pytest.raises(ValueError, match="PRIME_RL_MANIFEST_PATH"):
+        validate_generation_references(RECOVERY_MODE, SOURCE_A, data_root=data_root, **references)
+
+
+def test_recovery_rejects_manifest_dir_and_tier_curve_refs(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    frozen = evidence_generation(RECOVERY_SOURCE_REVISION, data_root=data_root)
+    with pytest.raises(ValueError, match="PRIME_RL_MANIFEST_DIR is not used"):
+        validate_generation_references(
+            RECOVERY_MODE,
+            SOURCE_A,
+            manifest_dir=frozen.manifest,
+            data_root=data_root,
+            **_recovery_frozen_references(data_root),
+        )
+    with pytest.raises(ValueError, match="tier-curve model references are not valid"):
+        validate_generation_references(
+            RECOVERY_MODE,
+            SOURCE_A,
+            tier_curve_model_source_revision=SOURCE_B,
+            data_root=data_root,
+            **_recovery_frozen_references(data_root),
+        )
+
+
+def test_recovery_comparison_output_must_be_under_recovery_leaf(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    runtime = evidence_generation(SOURCE_A, data_root=data_root)
+    recovery_leaf = runtime.root / RECOVERY_OUTPUT_LEAF
+    references = _recovery_frozen_references(data_root)
+
+    validate_generation_references(
+        RECOVERY_MODE,
+        SOURCE_A,
+        comparison_output_path=recovery_leaf / "comparison.json",
+        data_root=data_root,
+        **references,
+    )
+    with pytest.raises(ValueError, match="directly under"):
+        validate_generation_references(
+            RECOVERY_MODE,
+            SOURCE_A,
+            comparison_output_path=runtime.eval_post / "comparison.json",
+            data_root=data_root,
+            **references,
+        )

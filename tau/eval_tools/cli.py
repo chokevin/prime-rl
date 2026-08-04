@@ -127,6 +127,44 @@ def _cmd_recover_publish(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_validate_recovery_contract(args: argparse.Namespace) -> int:
+    from tau.eval_tools.recovery import validate_recovery_contract
+
+    contract = validate_recovery_contract(
+        manifest_path=Path(args.manifest),
+        baseline_rewards_path=Path(args.baseline_rewards),
+        training_result_path=Path(args.training_result),
+        training_output_dir=Path(args.training_output_dir),
+        lora_adapter_path=Path(args.adapter_path),
+    )
+    print(
+        f"ok: verified frozen F12 recovery contract (manifest identity {contract.manifest_identity_hash}, "
+        f"training attempt {contract.training_attempt_id})",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _cmd_write_recovery_provenance(args: argparse.Namespace) -> int:
+    from tau.eval_tools.recovery import validate_recovery_contract, write_recovery_provenance
+
+    contract = validate_recovery_contract(
+        manifest_path=Path(args.manifest),
+        baseline_rewards_path=Path(args.baseline_rewards),
+        training_result_path=Path(args.training_result),
+        training_output_dir=Path(args.training_output_dir),
+        lora_adapter_path=Path(args.adapter_path),
+    )
+    provenance = write_recovery_provenance(
+        output_dir=Path(args.output_dir),
+        runtime_source_revision=args.runtime_source_revision,
+        comparison_path=Path(args.comparison_path),
+        contract=contract,
+    )
+    print(f"ok: wrote recovery provenance to {provenance}", file=sys.stderr)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tau.eval_tools", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -194,6 +232,31 @@ def build_parser() -> argparse.ArgumentParser:
     handoff_parser.add_argument("--private-run-root", required=True)
     handoff_parser.add_argument("--adapter-path", required=True)
     handoff_parser.set_defaults(func=_cmd_validate_adapter_handoff)
+
+    recovery_contract_parser = subparsers.add_parser(
+        "validate-recovery-contract",
+        help="Validate the frozen F12 post-eval inputs against the pinned cross-generation recovery contract.",
+    )
+    recovery_contract_parser.add_argument("--manifest", required=True)
+    recovery_contract_parser.add_argument("--baseline-rewards", required=True)
+    recovery_contract_parser.add_argument("--training-result", required=True)
+    recovery_contract_parser.add_argument("--training-output-dir", required=True)
+    recovery_contract_parser.add_argument("--adapter-path", required=True)
+    recovery_contract_parser.set_defaults(func=_cmd_validate_recovery_contract)
+
+    provenance_parser = subparsers.add_parser(
+        "write-recovery-provenance",
+        help="Write recovery-provenance.json binding the recovery runtime source and frozen F12 source to the comparison.",
+    )
+    provenance_parser.add_argument("--manifest", required=True)
+    provenance_parser.add_argument("--baseline-rewards", required=True)
+    provenance_parser.add_argument("--training-result", required=True)
+    provenance_parser.add_argument("--training-output-dir", required=True)
+    provenance_parser.add_argument("--adapter-path", required=True)
+    provenance_parser.add_argument("--output-dir", required=True)
+    provenance_parser.add_argument("--runtime-source-revision", required=True)
+    provenance_parser.add_argument("--comparison-path", required=True)
+    provenance_parser.set_defaults(func=_cmd_write_recovery_provenance)
 
     return parser
 

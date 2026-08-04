@@ -24,6 +24,15 @@ _EVAL_OUTPUTS = {
     "post": "eval-post",
 }
 
+#: The single frozen source generation whose immutable post-eval inputs the one
+#: `eval-post-recovery` cycle reads read-only. The recovery replays that post eval in a
+#: fresh runtime-source generation under `RECOVERY_OUTPUT_LEAF` and never writes into,
+#: deletes from, or quarantines anything in this frozen generation. This is deliberately
+#: a source-owned constant dedicated to that one recovery, not an arbitrary-source knob.
+RECOVERY_SOURCE_REVISION = "a603e791776a4579440edc5df5b70309c61cf46a"
+RECOVERY_MODE = "eval-post-recovery"
+RECOVERY_OUTPUT_LEAF = "eval-post-recovery"
+
 
 @dataclass(frozen=True)
 class EvidenceGeneration:
@@ -84,6 +93,14 @@ def expected_output_path(
 ) -> Path:
     generation = evidence_generation(source_revision, data_root=data_root)
     eval_label = eval_label or None
+    if mode == RECOVERY_MODE:
+        if eval_label is not None:
+            raise ValueError("eval-post-recovery mode does not accept PRIME_RL_EVAL_LABEL")
+        if source_revision == RECOVERY_SOURCE_REVISION:
+            raise ValueError(
+                "eval-post-recovery must run from a runtime source distinct from the frozen F12 source generation"
+            )
+        return generation.root / RECOVERY_OUTPUT_LEAF
     if mode == "eval":
         if eval_label not in _EVAL_OUTPUTS:
             raise ValueError("eval mode requires PRIME_RL_EVAL_LABEL=baseline or post")
@@ -130,6 +147,22 @@ def validate_generation_references(
     generation = evidence_generation(source_revision, data_root=data_root)
     expected_output_path(mode, source_revision, eval_label=eval_label, data_root=data_root)
     eval_label = eval_label or None
+
+    if mode == RECOVERY_MODE:
+        return _validate_recovery_references(
+            runtime_generation=generation,
+            eval_label=eval_label,
+            manifest_dir=manifest_dir,
+            manifest_path=manifest_path,
+            baseline_rewards_path=baseline_rewards_path,
+            training_result_path=training_result_path,
+            training_output_dir=training_output_dir,
+            lora_adapter_path=lora_adapter_path,
+            comparison_output_path=comparison_output_path,
+            tier_curve_model_source_revision=tier_curve_model_source_revision,
+            tier_curve_model_manifest_path=tier_curve_model_manifest_path,
+            data_root=data_root,
+        )
 
     _validate_exact_path(
         "PRIME_RL_MANIFEST_DIR",
@@ -194,6 +227,63 @@ def validate_generation_references(
     elif tier_curve_model_source_revision or tier_curve_model_manifest_path:
         raise ValueError("tier-curve model references are valid only for tier-curve mode")
     return generation
+
+
+def _validate_recovery_references(
+    *,
+    runtime_generation: EvidenceGeneration,
+    eval_label: str | None,
+    manifest_dir: str | Path | None,
+    manifest_path: str | Path | None,
+    baseline_rewards_path: str | Path | None,
+    training_result_path: str | Path | None,
+    training_output_dir: str | Path | None,
+    lora_adapter_path: str | Path | None,
+    comparison_output_path: str | Path | None,
+    tier_curve_model_source_revision: str | None,
+    tier_curve_model_manifest_path: str | Path | None,
+    data_root: Path,
+) -> EvidenceGeneration:
+    """Cross-generation path contract for the one `eval-post-recovery` cycle.
+
+    The output/comparison paths must live in the runtime-source generation's recovery
+    leaf; every input path must be the exact canonical file/directory in the frozen F12
+    source generation. Content digests and internal identities are checked separately by
+    `tau.eval_tools.recovery.validate_recovery_contract`.
+    """
+    if eval_label is not None:
+        raise ValueError("eval-post-recovery mode does not accept PRIME_RL_EVAL_LABEL")
+    if manifest_dir is not None and os.fspath(manifest_dir) != "":
+        raise ValueError("PRIME_RL_MANIFEST_DIR is not used by eval-post-recovery mode")
+    if tier_curve_model_source_revision or (
+        tier_curve_model_manifest_path is not None and os.fspath(tier_curve_model_manifest_path) != ""
+    ):
+        raise ValueError("tier-curve model references are not valid for eval-post-recovery mode")
+
+    frozen = evidence_generation(RECOVERY_SOURCE_REVISION, data_root=data_root)
+    _validate_exact_path("PRIME_RL_MANIFEST_PATH", manifest_path, frozen.frozen_manifest, required=True)
+    _validate_exact_path(
+        "PRIME_RL_BASELINE_REWARDS_PATH", baseline_rewards_path, frozen.baseline_rewards, required=True
+    )
+    _validate_exact_path("PRIME_RL_TRAINING_RESULT_PATH", training_result_path, frozen.training_result, required=True)
+    _validate_exact_path("PRIME_RL_TRAINING_OUTPUT_DIR", training_output_dir, frozen.train, required=True)
+    _validate_exact_path("PRIME_RL_LORA_ADAPTER_PATH", lora_adapter_path, frozen.final_adapter, required=True)
+
+    recovery_output = runtime_generation.root / RECOVERY_OUTPUT_LEAF
+    if comparison_output_path is not None and os.fspath(comparison_output_path) != "":
+        raw_comparison = os.fspath(comparison_output_path)
+        comparison = Path(raw_comparison)
+        if (
+            not comparison.is_absolute()
+            or raw_comparison != str(comparison)
+            or ".." in comparison.parts
+            or comparison.parent != recovery_output
+            or comparison.name in {"", ".", ".."}
+        ):
+            raise ValueError(
+                f"PRIME_RL_COMPARISON_OUTPUT_PATH must be a canonical named file directly under {recovery_output}"
+            )
+    return runtime_generation
 
 
 def prepare_output_directory(

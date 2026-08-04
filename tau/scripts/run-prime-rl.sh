@@ -18,6 +18,9 @@
 #                    frozen-eval manifest (CPU-only, no GPU).
 #   freeze-finalize- validate fixed baseline rewards and freeze the immutable manifest.
 #   eval           - 1 GPU: standalone frozen-eval replay (baseline or post-training).
+#   eval-post-recovery - 1 GPU: re-run the frozen F12 post eval in a fresh runtime-source
+#                    generation, reading the F12 inputs read-only via the pinned recovery
+#                    contract. Identical semantics to `eval` post; no reroll knobs.
 #   tier-curve     - 1 GPU: full harder-math-v1 base/core/hard evaluation curve.
 #   train          - 2 GPU: bounded RL training; refuses to start without a frozen
 #                    manifest already on durable storage.
@@ -29,7 +32,7 @@ die() {
     exit 1
 }
 
-: "${PRIME_RL_RUN_MODE:?PRIME_RL_RUN_MODE must be set (smoke|freeze-draft|freeze-finalize|eval|tier-curve|train)}"
+: "${PRIME_RL_RUN_MODE:?PRIME_RL_RUN_MODE must be set (smoke|freeze-draft|freeze-finalize|eval|eval-post-recovery|tier-curve|train)}"
 : "${TAU_OUTPUT_DIR:?TAU_OUTPUT_DIR not set by Tau}"
 : "${PRIME_RL_REPO_URL:?PRIME_RL_REPO_URL must be set (e.g. https://github.com/chokevin/prime-rl.git)}"
 : "${PRIME_RL_REPO_SHA:?PRIME_RL_REPO_SHA must be set to the exact commit to overlay}"
@@ -452,6 +455,132 @@ eval)
             --output-dir "$TAU_OUTPUT_DIR" \
             --attempt-id "$inference_attempt_id"
     fi
+    if [ "$comparison_status" -ne 0 ]; then
+        # A valid failed gate remains a failed Job after all coherent evidence is durable.
+        exit "$comparison_status"
+    fi
+    ;;
+
+eval-post-recovery)
+    # Post-only recovery: re-run the frozen F12 post eval in THIS fresh runtime-source
+    # generation, reading the F12 inputs read-only through the pinned recovery contract.
+    # No alternate checkpoint/reroll knobs; the semantics match `eval` post byte-for-byte.
+    : "${PRIME_RL_MODEL_NAME:?PRIME_RL_MODEL_NAME must be set}"
+    : "${PRIME_RL_MODEL_REVISION:?PRIME_RL_MODEL_REVISION must be an exact HF commit SHA}"
+    : "${PRIME_RL_MANIFEST_PATH:?PRIME_RL_MANIFEST_PATH must be the frozen F12 manifest}"
+    : "${PRIME_RL_BASELINE_REWARDS_PATH:?PRIME_RL_BASELINE_REWARDS_PATH must be the frozen F12 baseline rewards}"
+    : "${PRIME_RL_LORA_ADAPTER_PATH:?PRIME_RL_LORA_ADAPTER_PATH must be the frozen F12 final adapter}"
+    : "${PRIME_RL_TRAINING_RESULT_PATH:?PRIME_RL_TRAINING_RESULT_PATH must be the frozen F12 training result}"
+    : "${PRIME_RL_TRAINING_OUTPUT_DIR:?PRIME_RL_TRAINING_OUTPUT_DIR must be the frozen F12 train generation}"
+    [ "${PRIME_RL_COMPARE_ONLY:-0}" != "1" ] || die "PRIME_RL_COMPARE_ONLY is not valid for eval-post-recovery; recovery always runs a fresh post eval"
+
+    # The frozen F12 source generation is a source-owned constant, never a target input.
+    frozen_source_revision="$(uv run --no-sync python -c 'from tau.eval_tools.output_paths import RECOVERY_SOURCE_REVISION; print(RECOVERY_SOURCE_REVISION)')"
+    [[ "$frozen_source_revision" =~ ^[0-9a-f]{40}$ ]] || die "failed to resolve the pinned frozen F12 source revision"
+    [ "$resolved_sha" != "$frozen_source_revision" ] || die "recovery runtime source must differ from the frozen F12 source"
+
+    log "validating frozen F12 recovery contract (read-only inputs from generation ${frozen_source_revision})"
+    uv run --no-sync python -m tau.eval_tools.cli validate-recovery-contract \
+        --manifest "$PRIME_RL_MANIFEST_PATH" \
+        --baseline-rewards "$PRIME_RL_BASELINE_REWARDS_PATH" \
+        --training-result "$PRIME_RL_TRAINING_RESULT_PATH" \
+        --training-output-dir "$PRIME_RL_TRAINING_OUTPUT_DIR" \
+        --adapter-path "$PRIME_RL_LORA_ADAPTER_PATH"
+
+    uv run --no-sync python -m tau.eval_tools.cli validate-manifest \
+        --manifest "$PRIME_RL_MANIFEST_PATH" \
+        --source-revision "$frozen_source_revision" \
+        --verifiers-revision "$PRIME_RL_VERIFIERS_SHA" \
+        --tasksets-revision "$PRIME_RL_TASKSETS_SHA" \
+        --model-name "$PRIME_RL_MODEL_NAME" \
+        --model-revision "$PRIME_RL_MODEL_REVISION" \
+        --require-finalized \
+        >/dev/null
+    uv run --no-sync python -m tau.eval_tools.live.private_materialization_live \
+        --manifest "$PRIME_RL_MANIFEST_PATH" \
+        --run-root "$RUN_ROOT" \
+        >/dev/null
+    model_snapshot_path="${RUN_ROOT}/model"
+
+    inference_args=(--model.name "$model_snapshot_path" --server.port 8000 --router None)
+    uv run --no-sync python -m tau.eval_tools.cli validate-adapter-handoff \
+        --manifest "$PRIME_RL_MANIFEST_PATH" \
+        --training-result "$PRIME_RL_TRAINING_RESULT_PATH" \
+        --training-output-dir "$PRIME_RL_TRAINING_OUTPUT_DIR" \
+        --adapter-path "$PRIME_RL_LORA_ADAPTER_PATH" \
+        --private-run-root "$RUN_ROOT"
+    inference_args+=(--enable-lora --max-lora-rank 16)
+    lora_name="post-adapter"
+    chmod 0555 "$RUN_ROOT"
+
+    rewards_path="${TAU_OUTPUT_DIR}/rewards.json"
+    inference_attempt_id="${HOSTNAME:?HOSTNAME must identify this pod}"
+    [ ! -e "$rewards_path" ] || die "${rewards_path} already exists; recovery reward evidence is immutable"
+    log "inference attempt id ${inference_attempt_id}"
+    log "starting inference server: uv run inference ${inference_args[*]}"
+    uv run --no-sync python -m tau.eval_tools.live.inference_launcher_live launch \
+        --output-dir "$TAU_OUTPUT_DIR" \
+        --attempt-id "$inference_attempt_id" -- \
+        uv run --no-sync inference "${inference_args[@]}" &
+    CHILD_PID=$!
+
+    wait_for_health "http://localhost:8000/health" "${PRIME_RL_HEALTH_TIMEOUT_S:-1800}"
+
+    private_adapter_path="${RUN_ROOT}/adapter"
+    log "loading privately materialized LoRA adapter ${private_adapter_path} as ${lora_name}"
+    curl -fsS -X POST "http://localhost:8000/load_lora_adapter" \
+        -H 'Content-Type: application/json' \
+        -d "{\"lora_name\": \"${lora_name}\", \"lora_path\": \"${private_adapter_path}\"}" \
+        >/dev/null
+    curl -fsS -o /dev/null "http://localhost:8000/health"
+
+    uv run --no-sync python -m tau.eval_tools.live.run_frozen_eval_live \
+        --manifest "$PRIME_RL_MANIFEST_PATH" \
+        --base-url "http://localhost:8000/v1" \
+        --served-model-name "$model_snapshot_path" \
+        --label post \
+        --output "$rewards_path" \
+        --lora-name "$lora_name"
+
+    comparison_path="${PRIME_RL_COMPARISON_OUTPUT_PATH:-${TAU_OUTPUT_DIR}/comparison.json}"
+    case "$comparison_path" in
+    "${TAU_OUTPUT_DIR}"/*) ;;
+    *) die "PRIME_RL_COMPARISON_OUTPUT_PATH must be a named file under ${TAU_OUTPUT_DIR}" ;;
+    esac
+    log "comparing frozen F12 baseline vs recovery post rewards against the unchanged pass/fail gate"
+    comparison_status=0
+    if uv run --no-sync python -m tau.eval_tools.cli compare \
+        --manifest "$PRIME_RL_MANIFEST_PATH" \
+        --baseline "$PRIME_RL_BASELINE_REWARDS_PATH" \
+        --post "$rewards_path" \
+        --output "$comparison_path"; then
+        comparison_status=0
+    else
+        comparison_status=$?
+    fi
+    case "$comparison_status" in
+    0 | 1) ;;
+    *) exit "$comparison_status" ;;
+    esac
+
+    # Bind both the recovery runtime source and the frozen F12 source to the comparison
+    # result while all reward/comparison evidence is durable and before final log
+    # promotion. Per the terminal-state rule, an isolated later log-promotion failure is a
+    # diagnostic artifact only and never triggers a resubmit.
+    uv run --no-sync python -m tau.eval_tools.cli write-recovery-provenance \
+        --manifest "$PRIME_RL_MANIFEST_PATH" \
+        --baseline-rewards "$PRIME_RL_BASELINE_REWARDS_PATH" \
+        --training-result "$PRIME_RL_TRAINING_RESULT_PATH" \
+        --training-output-dir "$PRIME_RL_TRAINING_OUTPUT_DIR" \
+        --adapter-path "$PRIME_RL_LORA_ADAPTER_PATH" \
+        --output-dir "$TAU_OUTPUT_DIR" \
+        --runtime-source-revision "$resolved_sha" \
+        --comparison-path "$comparison_path"
+
+    stop_inference
+    uv run --no-sync python -m tau.eval_tools.live.inference_launcher_live promote \
+        --output-dir "$TAU_OUTPUT_DIR" \
+        --attempt-id "$inference_attempt_id"
     if [ "$comparison_status" -ne 0 ]; then
         # A valid failed gate remains a failed Job after all coherent evidence is durable.
         exit "$comparison_status"
