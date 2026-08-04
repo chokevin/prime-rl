@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timezone
 
 import pytest
@@ -22,6 +23,7 @@ from tau.eval_tools.manifest import (
     check_headroom,
     make_tree_immutable,
     materialize_regular_snapshot,
+    validate_file_manifest_by_exact_paths,
     validate_manifest_contract,
     validate_model_materialization,
     validate_training_materialization,
@@ -521,3 +523,105 @@ def test_validate_manifest_contract_rejects_draft(tmp_path):
             expected_model_revision=MODEL_REVISION,
             require_finalized=True,
         )
+
+
+def _empty_scandir_for(monkeypatch, *targets: os.PathLike | str):
+    """Simulate a durable mount (e.g. BlobFuse) whose directory enumeration returns
+    zero entries even though its named children are directly readable -- the exact
+    fault observed in the F12 recovery incident. Delegates to the real `os.scandir`
+    for every directory except the given targets."""
+    real_scandir = os.scandir
+    resolved_targets = {os.path.abspath(target) for target in targets}
+
+    def fake_scandir(path="."):
+        if os.path.abspath(path) in resolved_targets:
+            return iter([])
+        return real_scandir(path)
+
+    monkeypatch.setattr("tau.eval_tools.manifest.os.scandir", fake_scandir)
+
+
+def test_build_file_manifest_is_fooled_by_empty_directory_enumeration(tmp_path, monkeypatch):
+    """Documents the actual F12 regression: enumeration-based `build_file_manifest`
+    (and therefore `validate_file_manifest`) is unsafe at a durable mount boundary
+    because it trusts `os.scandir`, which can return zero records even though the
+    directory's named children are directly readable."""
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text('{"r": 16}')
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    assert (adapter / "adapter_config.json").is_file()
+
+    _empty_scandir_for(monkeypatch, adapter)
+    with pytest.raises(ValueError, match="must contain at least one file"):
+        build_file_manifest(adapter)
+
+
+def test_validate_file_manifest_by_exact_paths_survives_empty_directory_enumeration(tmp_path, monkeypatch):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text('{"r": 16}')
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    expected = build_file_manifest(adapter)
+
+    _empty_scandir_for(monkeypatch, adapter)
+    with pytest.raises(ValueError, match="must contain at least one file"):
+        build_file_manifest(adapter)
+
+    # The exact-path validator never calls os.scandir, so it is unaffected.
+    actual = validate_file_manifest_by_exact_paths(adapter, expected)
+    assert actual == expected
+
+
+def test_validate_file_manifest_by_exact_paths_rejects_missing_file(tmp_path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text('{"r": 16}')
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    expected = build_file_manifest(adapter)
+
+    (adapter / "adapter_model.safetensors").unlink()
+    with pytest.raises((FileNotFoundError, OSError)):
+        validate_file_manifest_by_exact_paths(adapter, expected)
+
+
+def test_validate_file_manifest_by_exact_paths_rejects_changed_content(tmp_path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text('{"r": 16}')
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    expected = build_file_manifest(adapter)
+
+    (adapter / "adapter_model.safetensors").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="exact-path file manifest mismatch"):
+        validate_file_manifest_by_exact_paths(adapter, expected)
+
+
+def test_validate_file_manifest_by_exact_paths_rejects_symlinked_source_file(tmp_path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text('{"r": 16}')
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    expected = build_file_manifest(adapter)
+
+    outside = tmp_path / "outside-weights"
+    outside.write_bytes(b"weights")
+    weight = adapter / "adapter_model.safetensors"
+    weight.unlink()
+    weight.symlink_to(outside)
+    with pytest.raises((ValueError, OSError)):
+        validate_file_manifest_by_exact_paths(adapter, expected)
+
+
+def test_validate_file_manifest_by_exact_paths_ignores_extra_entries(tmp_path):
+    """The exact-path validator is intentionally scoped to proving expected records
+    are present/unchanged; it cannot see untracked extras since it never enumerates.
+    Extra-entry rejection remains the freshly-created private destination's job."""
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text('{"r": 16}')
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    expected = build_file_manifest(adapter)
+
+    (adapter / "unexpected.txt").write_text("extra")
+    validate_file_manifest_by_exact_paths(adapter, expected)

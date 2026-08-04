@@ -19,6 +19,10 @@
 #   freeze-finalize- validate fixed baseline rewards and freeze the immutable manifest.
 #   eval           - 1 GPU: standalone frozen-eval replay (baseline or post-training).
 #   eval-post-recovery - 1 GPU: one fixed F12 post-only recovery against immutable inputs.
+#   eval-post-recovery-preflight - 0 GPU/CPU: strictly re-validates the exact F12 recovery
+#                    inputs and private adapter materialization the H200 recovery job
+#                    performs before inference, and publishes the deterministic
+#                    recovery-preflight.json artifact that job must then require.
 #   tier-curve     - 1 GPU: full harder-math-v1 base/core/hard evaluation curve.
 #   train          - 2 GPU: bounded RL training; refuses to start without a frozen
 #                    manifest already on durable storage.
@@ -30,7 +34,7 @@ die() {
     exit 1
 }
 
-: "${PRIME_RL_RUN_MODE:?PRIME_RL_RUN_MODE must be set (smoke|freeze-draft|freeze-finalize|eval|eval-post-recovery|tier-curve|train)}"
+: "${PRIME_RL_RUN_MODE:?PRIME_RL_RUN_MODE must be set (smoke|freeze-draft|freeze-finalize|eval|eval-post-recovery|eval-post-recovery-preflight|tier-curve|train)}"
 : "${TAU_OUTPUT_DIR:?TAU_OUTPUT_DIR not set by Tau}"
 : "${PRIME_RL_REPO_URL:?PRIME_RL_REPO_URL must be set (e.g. https://github.com/chokevin/prime-rl.git)}"
 : "${PRIME_RL_REPO_SHA:?PRIME_RL_REPO_SHA must be set to the exact commit to overlay}"
@@ -239,6 +243,8 @@ GENERATION_ROOT="$(uv run --no-sync python -m tau.eval_tools.output_paths \
     --training-output-dir "${PRIME_RL_TRAINING_OUTPUT_DIR:-}" \
     --lora-adapter-path "${PRIME_RL_LORA_ADAPTER_PATH:-}" \
     --comparison-output-path "${PRIME_RL_COMPARISON_OUTPUT_PATH:-}" \
+    --recovery-preflight-path "${PRIME_RL_RECOVERY_PREFLIGHT_PATH:-}" \
+    --recovery-preflight-output-path "${PRIME_RL_RECOVERY_PREFLIGHT_OUTPUT_PATH:-}" \
     --tier-curve-model-source-revision "${PRIME_RL_TIER_CURVE_MODEL_SOURCE_REVISION:-}" \
     --tier-curve-model-manifest-path "${PRIME_RL_TIER_CURVE_MODEL_MANIFEST_PATH:-}" \
     --recovery-experiment-source-revision "${PRIME_RL_RECOVERY_EXPERIMENT_SOURCE_REVISION:-}" \
@@ -446,6 +452,8 @@ eval | eval-post-recovery)
         manifest_args+=(--require-finalized)
     fi
     if [ "$PRIME_RL_RUN_MODE" = "eval-post-recovery" ]; then
+        : "${PRIME_RL_RECOVERY_PREFLIGHT_PATH:?PRIME_RL_RECOVERY_PREFLIGHT_PATH must be set for eval-post-recovery mode}"
+        : "${PRIME_RL_RECOVERY_PREFLIGHT_SHA256:?PRIME_RL_RECOVERY_PREFLIGHT_SHA256 must be set for eval-post-recovery mode}"
         uv run --no-sync python -m tau.eval_tools.cli validate-f12-recovery \
             --runtime-source-revision "$resolved_sha" \
             --manifest "$PRIME_RL_MANIFEST_PATH" \
@@ -453,6 +461,8 @@ eval | eval-post-recovery)
             --training-result "$PRIME_RL_TRAINING_RESULT_PATH" \
             --training-output-dir "$PRIME_RL_TRAINING_OUTPUT_DIR" \
             --adapter-path "$PRIME_RL_LORA_ADAPTER_PATH" \
+            --recovery-preflight-path "$PRIME_RL_RECOVERY_PREFLIGHT_PATH" \
+            --recovery-preflight-sha256 "$PRIME_RL_RECOVERY_PREFLIGHT_SHA256" \
             --private-run-root "$RUN_ROOT"
     else
         uv run --no-sync python -m tau.eval_tools.cli validate-manifest "${manifest_args[@]}" >/dev/null
@@ -570,6 +580,29 @@ eval | eval-post-recovery)
         # A valid failed gate remains a failed Job after all coherent evidence is durable.
         exit "$comparison_status"
     fi
+    ;;
+
+eval-post-recovery-preflight)
+    : "${PRIME_RL_MANIFEST_PATH:?PRIME_RL_MANIFEST_PATH must be set for eval-post-recovery-preflight mode}"
+    : "${PRIME_RL_BASELINE_REWARDS_PATH:?PRIME_RL_BASELINE_REWARDS_PATH must be set for eval-post-recovery-preflight mode}"
+    : "${PRIME_RL_TRAINING_RESULT_PATH:?PRIME_RL_TRAINING_RESULT_PATH must be set for eval-post-recovery-preflight mode}"
+    : "${PRIME_RL_TRAINING_OUTPUT_DIR:?PRIME_RL_TRAINING_OUTPUT_DIR must be set for eval-post-recovery-preflight mode}"
+    : "${PRIME_RL_LORA_ADAPTER_PATH:?PRIME_RL_LORA_ADAPTER_PATH must be set for eval-post-recovery-preflight mode}"
+    : "${PRIME_RL_RECOVERY_PREFLIGHT_OUTPUT_PATH:?PRIME_RL_RECOVERY_PREFLIGHT_OUTPUT_PATH must be set for eval-post-recovery-preflight mode}"
+    # Zero-GPU/CPU-only gate: strictly re-runs the exact F12 recovery input validation
+    # and private adapter materialization that the H200 job performs before inference,
+    # and publishes a deterministic recovery-preflight.json the H200 job later requires.
+    uv run --no-sync python -m tau.eval_tools.cli f12-recovery-preflight \
+        --runtime-source-revision "$resolved_sha" \
+        --manifest "$PRIME_RL_MANIFEST_PATH" \
+        --baseline "$PRIME_RL_BASELINE_REWARDS_PATH" \
+        --training-result "$PRIME_RL_TRAINING_RESULT_PATH" \
+        --training-output-dir "$PRIME_RL_TRAINING_OUTPUT_DIR" \
+        --adapter-path "$PRIME_RL_LORA_ADAPTER_PATH" \
+        --private-run-root "$RUN_ROOT" \
+        --output "$PRIME_RL_RECOVERY_PREFLIGHT_OUTPUT_PATH"
+    chmod 0555 "$RUN_ROOT"
+    log "eval-post-recovery-preflight OK: published ${PRIME_RL_RECOVERY_PREFLIGHT_OUTPUT_PATH}"
     ;;
 
 tier-curve)

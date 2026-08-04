@@ -8,15 +8,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from pydantic import ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-from tau.eval_tools.artifacts import TrainingResult, validate_adapter_handoff
+from tau.eval_tools.artifacts import (
+    ADAPTER_CONFIG,
+    ADAPTER_WEIGHT_FILES,
+    TrainingResult,
+    materialize_adapter_for_eval,
+    validate_adapter_handoff,
+)
 from tau.eval_tools.compare import ComparisonResult, RewardRecord, compare_runs
-from tau.eval_tools.json_io import load_json_with_sha256
+from tau.eval_tools.json_io import load_json_with_sha256, write_json_exclusive
 from tau.eval_tools.manifest import (
     EXPECTED_MODEL_NAME,
     EXPECTED_MODEL_REVISION,
+    FileManifest,
     FrozenEvalManifest,
+    build_file_manifest,
     validate_manifest_contract,
 )
 
@@ -195,6 +203,13 @@ def validate_f12_recovery_objects(
 AdapterHandoffValidator = Callable[..., None]
 
 
+@dataclass(frozen=True)
+class F12RecoveryInputDigests:
+    manifest_sha256: str
+    baseline_rewards_sha256: str
+    training_result_sha256: str
+
+
 def validate_f12_recovery_inputs(
     *,
     manifest_path: Path,
@@ -204,7 +219,7 @@ def validate_f12_recovery_inputs(
     adapter_path: Path,
     handoff_validator: AdapterHandoffValidator = validate_adapter_handoff,
     data_root: Path = Path("/data"),
-) -> tuple[FrozenEvalManifest, RewardRecord, TrainingResult]:
+) -> tuple[FrozenEvalManifest, RewardRecord, TrainingResult, F12RecoveryInputDigests]:
     manifest_payload, manifest_sha256 = load_json_with_sha256(manifest_path)
     manifest = FrozenEvalManifest.model_validate(manifest_payload)
     baseline, baseline_sha256 = RewardRecord.load_with_digest(baseline_path)
@@ -235,7 +250,12 @@ def validate_f12_recovery_inputs(
         expected_step=F12_SOURCE_STEP,
         expected_rank=F12_LORA_RANK,
     )
-    return manifest, baseline, result
+    digests = F12RecoveryInputDigests(
+        manifest_sha256=manifest_sha256,
+        baseline_rewards_sha256=baseline_sha256,
+        training_result_sha256=training_result_sha256,
+    )
+    return manifest, baseline, result, digests
 
 
 class F12RecoveryComparisonResult(ComparisonResult):
@@ -266,7 +286,7 @@ def compare_f12_recovery(
     data_root: Path = Path("/data"),
 ) -> F12RecoveryComparisonResult:
     validate_recovery_runtime_source(runtime_source_revision)
-    manifest, baseline, _ = validate_f12_recovery_inputs(
+    manifest, baseline, _, _ = validate_f12_recovery_inputs(
         manifest_path=manifest_path,
         baseline_path=baseline_path,
         training_result_path=training_result_path,
@@ -285,4 +305,182 @@ def compare_f12_recovery(
     return F12RecoveryComparisonResult(
         **result.model_dump(),
         recovery_runtime_source_revision=runtime_source_revision,
+    )
+
+
+class F12RecoveryPreflight(BaseModel):
+    """Deterministic, immutable evidence that the zero-GPU preflight gate verified
+    every F12 recovery input and privately materialized the adapter -- with no
+    timestamps or other nondeterministic fields, so identical inputs always produce
+    byte-identical JSON that the pin can embed a fixed SHA-256 digest for.
+
+    This model only enforces the fixed contract *shape* (recovery source revision
+    format/non-reuse, the always-200/16 step and rank, and the adapter manifest's
+    name shape). Whether the individual digest fields actually match the one
+    approved F12 recovery evidence is checked separately, against the caller's
+    already-verified `TrainingResult`/digests, by `validate_f12_recovery_preflight`
+    -- exactly the same separation `F12RecoveryComparisonResult` uses for its own
+    digest fields."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    status: Literal["verified"] = "verified"
+    recovery_runtime_source_revision: str
+    frozen_experiment_source_revision: Literal["a603e791776a4579440edc5df5b70309c61cf46a"] = (
+        F12_EXPERIMENT_SOURCE_REVISION
+    )
+    manifest_sha256: str
+    baseline_rewards_sha256: str
+    training_result_sha256: str
+    manifest_identity_hash: str
+    adapter_aggregate_sha256: str
+    source_step: Literal[200] = F12_SOURCE_STEP
+    lora_rank: Literal[16] = F12_LORA_RANK
+    private_adapter_files: FileManifest
+
+    @field_validator("recovery_runtime_source_revision")
+    @classmethod
+    def validate_runtime_source(cls, runtime_source_revision: str) -> str:
+        validate_recovery_runtime_source(runtime_source_revision)
+        return runtime_source_revision
+
+    @field_validator(
+        "manifest_sha256",
+        "baseline_rewards_sha256",
+        "training_result_sha256",
+        "manifest_identity_hash",
+        "adapter_aggregate_sha256",
+    )
+    @classmethod
+    def validate_sha256(cls, digest: str) -> str:
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError("F12 recovery preflight digests must be lowercase SHA-256 hex")
+        return digest
+
+    @field_validator("private_adapter_files")
+    @classmethod
+    def validate_private_adapter_files(cls, manifest: FileManifest) -> FileManifest:
+        names = {record.path for record in manifest.files}
+        if ADAPTER_CONFIG not in names or len(names) != 2:
+            raise ValueError("F12 recovery preflight private adapter manifest must contain config plus one weight")
+        if not any(name in names for name in ADAPTER_WEIGHT_FILES):
+            raise ValueError("F12 recovery preflight private adapter manifest is missing its supported weight file")
+        return manifest
+
+    @model_validator(mode="after")
+    def _validate_adapter_aggregate_is_self_consistent(self) -> "F12RecoveryPreflight":
+        if self.adapter_aggregate_sha256 != self.private_adapter_files.aggregate_sha256:
+            raise ValueError(
+                "F12 recovery preflight adapter_aggregate_sha256 does not match its own private_adapter_files"
+            )
+        return self
+
+
+def write_f12_recovery_preflight(
+    *,
+    output_path: Path,
+    recovery_runtime_source_revision: str,
+    manifest_sha256: str,
+    baseline_rewards_sha256: str,
+    training_result_sha256: str,
+    manifest_identity_hash: str,
+    adapter_aggregate_sha256: str,
+    source_step: int,
+    lora_rank: int,
+    private_adapter_files: FileManifest,
+) -> F12RecoveryPreflight:
+    preflight = F12RecoveryPreflight(
+        recovery_runtime_source_revision=recovery_runtime_source_revision,
+        manifest_sha256=manifest_sha256,
+        baseline_rewards_sha256=baseline_rewards_sha256,
+        training_result_sha256=training_result_sha256,
+        manifest_identity_hash=manifest_identity_hash,
+        adapter_aggregate_sha256=adapter_aggregate_sha256,
+        source_step=source_step,
+        lora_rank=lora_rank,
+        private_adapter_files=private_adapter_files,
+    )
+    write_json_exclusive(output_path, preflight.model_dump())
+    return preflight
+
+
+def validate_f12_recovery_preflight(
+    path: Path,
+    *,
+    expected_sha256: str,
+    runtime_source_revision: str,
+    digests: F12RecoveryInputDigests,
+    manifest_identity_hash: str,
+    result: TrainingResult,
+) -> F12RecoveryPreflight:
+    """Strictly bind the pin-supplied preflight artifact to this exact H200 run's
+    freshly loaded/validated F12 recovery evidence, failing closed if the artifact is
+    absent, the digest does not match the pin, or any identity field disagrees."""
+    payload, actual_sha256 = load_json_with_sha256(path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(f"F12 recovery preflight digest is {actual_sha256}, expected {expected_sha256}")
+    preflight = F12RecoveryPreflight.model_validate(payload)
+    if preflight.recovery_runtime_source_revision != runtime_source_revision:
+        raise ValueError("F12 recovery preflight runtime source does not match this run")
+    if preflight.manifest_sha256 != digests.manifest_sha256:
+        raise ValueError("F12 recovery preflight manifest digest does not match this run's manifest")
+    if preflight.baseline_rewards_sha256 != digests.baseline_rewards_sha256:
+        raise ValueError("F12 recovery preflight baseline digest does not match this run's baseline")
+    if preflight.training_result_sha256 != digests.training_result_sha256:
+        raise ValueError("F12 recovery preflight training result digest does not match this run's training result")
+    if preflight.manifest_identity_hash != manifest_identity_hash:
+        raise ValueError("F12 recovery preflight manifest identity does not match this run's manifest")
+    if preflight.adapter_aggregate_sha256 != result.adapter_sha256:
+        raise ValueError("F12 recovery preflight adapter aggregate does not match this run's training result")
+    if preflight.source_step != result.source_step:
+        raise ValueError("F12 recovery preflight source step does not match this run's training result")
+    if preflight.lora_rank != result.lora_rank:
+        raise ValueError("F12 recovery preflight LoRA rank does not match this run's training result")
+    if preflight.private_adapter_files != result.adapter_files:
+        raise ValueError("F12 recovery preflight private adapter manifest does not match this run's signed adapter")
+    return preflight
+
+
+def run_f12_recovery_preflight(
+    *,
+    manifest_path: Path,
+    baseline_path: Path,
+    training_result_path: Path,
+    training_output_dir: Path,
+    adapter_path: Path,
+    runtime_source_revision: str,
+    run_root: Path,
+    output_path: Path,
+    data_root: Path = Path("/data"),
+) -> F12RecoveryPreflight:
+    """The zero-GPU preflight gate's single entry point: run the exact same F12
+    recovery input validation and private adapter materialization the H200 job would
+    run before inference, then publish a deterministic success artifact."""
+    validate_recovery_runtime_source(runtime_source_revision)
+    manifest, _, result, digests = validate_f12_recovery_inputs(
+        manifest_path=manifest_path,
+        baseline_path=baseline_path,
+        training_result_path=training_result_path,
+        training_output_dir=training_output_dir,
+        adapter_path=adapter_path,
+        data_root=data_root,
+    )
+    private_adapter_path = materialize_adapter_for_eval(
+        result=result,
+        durable_adapter_path=adapter_path,
+        run_root=run_root,
+    )
+    private_adapter_files = build_file_manifest(private_adapter_path)
+    return write_f12_recovery_preflight(
+        output_path=output_path,
+        recovery_runtime_source_revision=runtime_source_revision,
+        manifest_sha256=digests.manifest_sha256,
+        baseline_rewards_sha256=digests.baseline_rewards_sha256,
+        training_result_sha256=digests.training_result_sha256,
+        manifest_identity_hash=manifest.identity_hash(),
+        adapter_aggregate_sha256=result.adapter_sha256,
+        source_step=result.source_step,
+        lora_rank=result.lora_rank,
+        private_adapter_files=private_adapter_files,
     )

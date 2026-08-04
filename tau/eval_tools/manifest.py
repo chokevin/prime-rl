@@ -21,7 +21,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-from tau.eval_tools.json_io import load_json_with_sha256, write_json_exclusive
+from tau.eval_tools.fs_safety import open_directory_nofollow, open_relative_directory_nofollow
+from tau.eval_tools.json_io import load_json_with_sha256, open_file_snapshot, write_json_exclusive
 
 SCHEMA_VERSION = 5
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -219,6 +220,67 @@ def validate_file_manifest(root: Path, expected: FileManifest) -> None:
             f"(missing={missing[:5]}, extra={extra[:5]}, changed={changed[:5]}, "
             f"actual_aggregate={actual.aggregate_sha256}, expected_aggregate={expected.aggregate_sha256})"
         )
+
+
+def open_record_parent_nofollow(root_descriptor: int, relative_path: str) -> tuple[int, str]:
+    """Open the parent directory of a canonical relative manifest path beneath an
+    already-open root descriptor, walking every intermediate component with
+    `open_relative_directory_nofollow` (no symlinks, no enumeration). Returns a
+    descriptor the caller must close, plus the leaf name to open within it."""
+    parts = PurePosixPath(relative_path).parts
+    descriptor = os.dup(root_descriptor)
+    try:
+        for part in parts[:-1]:
+            next_descriptor = open_relative_directory_nofollow(descriptor, part)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor, parts[-1]
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def validate_file_manifest_by_exact_paths(root: Path, expected: FileManifest) -> FileManifest:
+    """Validate a signed `FileManifest` against exact canonical child paths, without
+    ever trusting directory enumeration (`os.scandir`). Some durable mounts (e.g.
+    BlobFuse) can return a stale or empty directory listing even though the named
+    children are directly readable through descriptor-safe opens; `build_file_manifest`
+    / `validate_file_manifest` are unsafe at that boundary because they enumerate.
+
+    This intentionally cannot detect *extra* untracked entries -- it only proves that
+    every expected record is present, unchanged, and reachable by its exact name. Extra
+    entries remain the private materialization's problem to catch (its destination is
+    freshly created and local, so enumeration there stays authoritative).
+
+    Returns the `FileManifest` recomputed from the bytes actually read on disk (not
+    `expected`), so callers can independently bind their own claimed digest to what was
+    genuinely read rather than echoing the input back to itself."""
+    root = _assert_no_symlink_components(root)
+    if not root.is_dir():
+        raise FileNotFoundError(f"file manifest root is not a directory: {root}")
+    root_descriptor = open_directory_nofollow(root)
+    try:
+        records: list[FileRecord] = []
+        for record in expected.files:
+            parent_descriptor, leaf_name = open_record_parent_nofollow(root_descriptor, record.path)
+            try:
+                snapshot = open_file_snapshot(parent_descriptor, leaf_name, root / record.path)
+            finally:
+                os.close(parent_descriptor)
+            records.append(FileRecord(path=record.path, size=snapshot.size, sha256=snapshot.digest))
+        actual = FileManifest.from_records(records)
+    finally:
+        os.close(root_descriptor)
+    if actual != expected:
+        expected_by_path = {record.path: record for record in expected.files}
+        actual_by_path = {record.path: record for record in actual.files}
+        changed = sorted(path for path in expected_by_path if expected_by_path[path] != actual_by_path.get(path))
+        raise ValueError(
+            "exact-path file manifest mismatch "
+            f"(changed={changed[:5]}, actual_aggregate={actual.aggregate_sha256}, "
+            f"expected_aggregate={expected.aggregate_sha256})"
+        )
+    return actual
 
 
 def materialize_regular_snapshot(source: Path, cache_root: Path, destination: Path) -> FileManifest:

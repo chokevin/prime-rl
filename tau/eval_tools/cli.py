@@ -29,7 +29,9 @@ from tau.eval_tools.artifacts import (
 from tau.eval_tools.compare import compare_from_paths, write_result
 from tau.eval_tools.f12_recovery import (
     compare_f12_recovery,
+    run_f12_recovery_preflight,
     validate_f12_recovery_inputs,
+    validate_f12_recovery_preflight,
     validate_recovery_runtime_source,
 )
 from tau.eval_tools.live.private_materialization_live import validate_run_root
@@ -71,7 +73,15 @@ def _f12_recovery_paths_from_args(args: argparse.Namespace) -> dict[str, Path]:
 def _cmd_validate_f12_recovery(args: argparse.Namespace) -> int:
     validate_recovery_runtime_source(args.runtime_source_revision)
     paths = _f12_recovery_paths_from_args(args)
-    _, _, result = validate_f12_recovery_inputs(**paths)
+    manifest, _, result, digests = validate_f12_recovery_inputs(**paths)
+    validate_f12_recovery_preflight(
+        Path(args.recovery_preflight_path),
+        expected_sha256=args.recovery_preflight_sha256,
+        runtime_source_revision=args.runtime_source_revision,
+        digests=digests,
+        manifest_identity_hash=manifest.identity_hash(),
+        result=result,
+    )
     private_run_root = validate_run_root(Path(args.private_run_root))
     private_adapter = materialize_adapter_for_eval(
         result=result,
@@ -79,6 +89,22 @@ def _cmd_validate_f12_recovery(args: argparse.Namespace) -> int:
         run_root=private_run_root,
     )
     print(f"ok: verified immutable F12 recovery inputs and materialized {private_adapter}", file=sys.stderr)
+    return 0
+
+
+def _cmd_f12_recovery_preflight(args: argparse.Namespace) -> int:
+    paths = _f12_recovery_paths_from_args(args)
+    private_run_root = validate_run_root(Path(args.private_run_root))
+    preflight = run_f12_recovery_preflight(
+        runtime_source_revision=args.runtime_source_revision,
+        run_root=private_run_root,
+        output_path=Path(args.output),
+        **paths,
+    )
+    print(
+        f"ok: F12 recovery preflight verified and published for source {preflight.recovery_runtime_source_revision}",
+        file=sys.stderr,
+    )
     return 0
 
 
@@ -193,7 +219,14 @@ def build_parser() -> argparse.ArgumentParser:
         "compare-f12-recovery",
         help="Compare the fixed F12 baseline to recovery post rewards with dual-source provenance.",
     )
-    for recovery_parser in (recovery_validate_parser, recovery_compare_parser):
+    recovery_preflight_parser = subparsers.add_parser(
+        "f12-recovery-preflight",
+        help=(
+            "Zero-GPU preflight: run the exact same F12 recovery input validation and private "
+            "adapter materialization used by the H200 job, then publish a deterministic result."
+        ),
+    )
+    for recovery_parser in (recovery_validate_parser, recovery_compare_parser, recovery_preflight_parser):
         recovery_parser.add_argument("--runtime-source-revision", required=True)
         recovery_parser.add_argument("--manifest", required=True)
         recovery_parser.add_argument("--baseline", required=True)
@@ -201,10 +234,23 @@ def build_parser() -> argparse.ArgumentParser:
         recovery_parser.add_argument("--training-output-dir", required=True)
         recovery_parser.add_argument("--adapter-path", required=True)
     recovery_validate_parser.add_argument("--private-run-root", required=True)
+    recovery_validate_parser.add_argument(
+        "--recovery-preflight-path",
+        required=True,
+        help="Path to the immutable recovery-preflight.json this run must strictly match.",
+    )
+    recovery_validate_parser.add_argument(
+        "--recovery-preflight-sha256",
+        required=True,
+        help="Pin-supplied SHA-256 of recovery-preflight.json; the run fails closed on any mismatch.",
+    )
     recovery_validate_parser.set_defaults(func=_cmd_validate_f12_recovery)
     recovery_compare_parser.add_argument("--post", required=True)
     recovery_compare_parser.add_argument("--output", required=True)
     recovery_compare_parser.set_defaults(func=_cmd_compare_f12_recovery)
+    recovery_preflight_parser.add_argument("--private-run-root", required=True)
+    recovery_preflight_parser.add_argument("--output", required=True)
+    recovery_preflight_parser.set_defaults(func=_cmd_f12_recovery_preflight)
 
     disjoint_parser = subparsers.add_parser(
         "check-disjoint",

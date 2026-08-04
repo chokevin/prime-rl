@@ -25,6 +25,7 @@ _MODE_OUTPUTS = {
     "tier-curve": "tier-curve",
     "train": "train",
     "eval-post-recovery": "eval-post-recovery",
+    "eval-post-recovery-preflight": "eval-post-recovery-preflight",
 }
 _EVAL_OUTPUTS = {
     "baseline": "eval-baseline",
@@ -41,6 +42,7 @@ class EvidenceGeneration:
     train: Path
     eval_post: Path
     eval_post_recovery: Path
+    eval_post_recovery_preflight: Path
     tier_curve: Path
 
     @property
@@ -63,6 +65,10 @@ class EvidenceGeneration:
     def final_adapter(self) -> Path:
         return self.train / "final-adapter"
 
+    @property
+    def recovery_preflight_result(self) -> Path:
+        return self.eval_post_recovery_preflight / "recovery-preflight.json"
+
 
 def evidence_generation(
     source_revision: str,
@@ -80,6 +86,7 @@ def evidence_generation(
         train=root / "train",
         eval_post=root / "eval-post",
         eval_post_recovery=root / "eval-post-recovery",
+        eval_post_recovery_preflight=root / "eval-post-recovery-preflight",
         tier_curve=root / "tier-curve",
     )
 
@@ -102,6 +109,12 @@ def expected_output_path(
             raise ValueError("eval-post-recovery mode requires PRIME_RL_EVAL_LABEL=post")
         if source_revision == F12_EXPERIMENT_SOURCE_REVISION:
             raise ValueError("eval-post-recovery output must use a new runtime source generation")
+        leaf = _MODE_OUTPUTS[mode]
+    elif mode == "eval-post-recovery-preflight":
+        if eval_label is not None:
+            raise ValueError("PRIME_RL_EVAL_LABEL is not valid for eval-post-recovery-preflight mode")
+        if source_revision == F12_EXPERIMENT_SOURCE_REVISION:
+            raise ValueError("eval-post-recovery-preflight output must use a new runtime source generation")
         leaf = _MODE_OUTPUTS[mode]
     else:
         if eval_label is not None:
@@ -138,6 +151,8 @@ def validate_generation_references(
     training_output_dir: str | Path | None = None,
     lora_adapter_path: str | Path | None = None,
     comparison_output_path: str | Path | None = None,
+    recovery_preflight_path: str | Path | None = None,
+    recovery_preflight_output_path: str | Path | None = None,
     tier_curve_model_source_revision: str | None = None,
     tier_curve_model_manifest_path: str | Path | None = None,
     recovery_environment: Mapping[str, str | None] | None = None,
@@ -154,7 +169,9 @@ def validate_generation_references(
         required=mode in {"freeze-draft", "freeze-finalize", "train"},
     )
     recovery_mode = mode == "eval-post-recovery"
-    if recovery_mode:
+    preflight_mode = mode == "eval-post-recovery-preflight"
+    recovery_input_mode = recovery_mode or preflight_mode
+    if recovery_input_mode:
         validate_f12_recovery_environment(
             **(
                 dict(recovery_environment)
@@ -173,14 +190,14 @@ def validate_generation_references(
         "PRIME_RL_MANIFEST_PATH",
         manifest_path,
         expected_manifest,
-        required=mode in {"eval", "eval-post-recovery"},
+        required=mode in {"eval", "eval-post-recovery", "eval-post-recovery-preflight"},
     )
     expected_baseline = recovery_paths.baseline_rewards if recovery_paths is not None else generation.baseline_rewards
     _validate_exact_path(
         "PRIME_RL_BASELINE_REWARDS_PATH",
         baseline_rewards_path,
         expected_baseline,
-        required=mode == "freeze-finalize" or (mode == "eval" and eval_label == "post") or recovery_mode,
+        required=mode == "freeze-finalize" or (mode == "eval" and eval_label == "post") or recovery_input_mode,
     )
     expected_training_result = (
         recovery_paths.training_result if recovery_paths is not None else generation.training_result
@@ -191,25 +208,31 @@ def validate_generation_references(
         "PRIME_RL_TRAINING_RESULT_PATH",
         training_result_path,
         expected_training_result,
-        required=(mode == "eval" and eval_label == "post") or recovery_mode,
+        required=(mode == "eval" and eval_label == "post") or recovery_input_mode,
     )
     _validate_exact_path(
         "PRIME_RL_TRAINING_OUTPUT_DIR",
         training_output_dir,
         expected_training_output,
-        required=(mode == "eval" and eval_label == "post") or recovery_mode,
+        required=(mode == "eval" and eval_label == "post") or recovery_input_mode,
     )
     _validate_exact_path(
         "PRIME_RL_LORA_ADAPTER_PATH",
         lora_adapter_path,
         expected_adapter,
-        required=(mode == "eval" and eval_label == "post") or recovery_mode,
+        required=(mode == "eval" and eval_label == "post") or recovery_input_mode,
     )
     if recovery_mode:
         _validate_exact_path(
             "PRIME_RL_COMPARISON_OUTPUT_PATH",
             comparison_output_path,
             generation.eval_post_recovery / "comparison.json",
+            required=True,
+        )
+        _validate_exact_path(
+            "PRIME_RL_RECOVERY_PREFLIGHT_PATH",
+            recovery_preflight_path,
+            generation.recovery_preflight_result,
             required=True,
         )
     elif comparison_output_path is not None and os.fspath(comparison_output_path) != "":
@@ -225,6 +248,17 @@ def validate_generation_references(
             raise ValueError(
                 f"PRIME_RL_COMPARISON_OUTPUT_PATH must be a canonical named file directly under {generation.eval_post}"
             )
+    if not recovery_mode and recovery_preflight_path is not None and os.fspath(recovery_preflight_path) != "":
+        raise ValueError("PRIME_RL_RECOVERY_PREFLIGHT_PATH is only valid in eval-post-recovery mode")
+    if preflight_mode:
+        _validate_exact_path(
+            "PRIME_RL_RECOVERY_PREFLIGHT_OUTPUT_PATH",
+            recovery_preflight_output_path,
+            generation.recovery_preflight_result,
+            required=True,
+        )
+    elif recovery_preflight_output_path is not None and os.fspath(recovery_preflight_output_path) != "":
+        raise ValueError("PRIME_RL_RECOVERY_PREFLIGHT_OUTPUT_PATH is only valid in eval-post-recovery-preflight mode")
     if mode == "tier-curve":
         if not tier_curve_model_source_revision:
             raise ValueError("PRIME_RL_TIER_CURVE_MODEL_SOURCE_REVISION must be set for tier-curve mode")
@@ -253,6 +287,8 @@ def prepare_output_directory(
     training_output_dir: str | Path | None = None,
     lora_adapter_path: str | Path | None = None,
     comparison_output_path: str | Path | None = None,
+    recovery_preflight_path: str | Path | None = None,
+    recovery_preflight_output_path: str | Path | None = None,
     tier_curve_model_source_revision: str | None = None,
     tier_curve_model_manifest_path: str | Path | None = None,
     recovery_environment: Mapping[str, str | None] | None = None,
@@ -269,6 +305,8 @@ def prepare_output_directory(
         training_output_dir=training_output_dir,
         lora_adapter_path=lora_adapter_path,
         comparison_output_path=comparison_output_path,
+        recovery_preflight_path=recovery_preflight_path,
+        recovery_preflight_output_path=recovery_preflight_output_path,
         tier_curve_model_source_revision=tier_curve_model_source_revision,
         tier_curve_model_manifest_path=tier_curve_model_manifest_path,
         recovery_environment=recovery_environment,
@@ -323,6 +361,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--training-output-dir", default="")
     parser.add_argument("--lora-adapter-path", default="")
     parser.add_argument("--comparison-output-path", default="")
+    parser.add_argument("--recovery-preflight-path", default="")
+    parser.add_argument("--recovery-preflight-output-path", default="")
     parser.add_argument("--tier-curve-model-source-revision", default="")
     parser.add_argument("--tier-curve-model-manifest-path", default="")
     for name in F12_RECOVERY_ENVIRONMENT:
@@ -340,11 +380,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         training_output_dir=args.training_output_dir,
         lora_adapter_path=args.lora_adapter_path,
         comparison_output_path=args.comparison_output_path,
+        recovery_preflight_path=args.recovery_preflight_path,
+        recovery_preflight_output_path=args.recovery_preflight_output_path,
         tier_curve_model_source_revision=args.tier_curve_model_source_revision,
         tier_curve_model_manifest_path=args.tier_curve_model_manifest_path,
         recovery_environment=(
             {name: getattr(args, f"recovery_{name}") for name in F12_RECOVERY_ENVIRONMENT}
-            if args.mode == "eval-post-recovery"
+            if args.mode in {"eval-post-recovery", "eval-post-recovery-preflight"}
             else None
         ),
     )

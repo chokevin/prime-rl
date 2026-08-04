@@ -13,13 +13,16 @@ import pytest
 import tau.eval_tools.artifacts as artifacts_module
 import tau.eval_tools.live.training_supervisor_live as supervisor_module
 from tau.eval_tools.artifacts import (
+    ADAPTER_CONFIG,
     TrainingCompletionAttestation,
     TrainingResult,
     _write_json_staged_noreplace,
     attempt_paths,
+    copy_adapter_exclusive_by_manifest,
     materialize_adapter_for_eval,
     publish_training_result,
     select_final_adapter,
+    validate_adapter_directory_exact,
     validate_adapter_handoff,
     write_smoke_result,
     write_training_preflight,
@@ -60,6 +63,7 @@ from tau.eval_tools.manifest import (
     TrainingRecord,
     build_file_manifest,
     build_manifest,
+    validate_file_manifest,
 )
 from tau.eval_tools.output_paths import evidence_generation
 
@@ -742,6 +746,263 @@ def test_private_adapter_materialization_is_readonly_and_content_bound(tmp_path,
     assert stat.S_IMODE(private.stat().st_mode) == 0o555
     assert all(stat.S_IMODE(path.stat().st_mode) == 0o444 for path in private.iterdir())
     assert (run_root / "adapter-materialization-complete").is_file()
+
+
+def _empty_scandir_for(monkeypatch, *targets: os.PathLike | str):
+    """Simulate a durable mount (e.g. BlobFuse) whose directory enumeration returns
+    zero entries even though its named children are directly readable -- the exact
+    fault observed in the F12 recovery incident. Delegates to the real `os.scandir`
+    for every directory except the given targets."""
+    real_scandir = os.scandir
+    resolved_targets = {os.path.abspath(target) for target in targets}
+
+    def fake_scandir(path="."):
+        if os.path.abspath(path) in resolved_targets:
+            return iter([])
+        return real_scandir(path)
+
+    monkeypatch.setattr("tau.eval_tools.manifest.os.scandir", fake_scandir)
+
+
+def _published_result_with_durable_adapter(tmp_path, exact_config_validator):
+    manifest = _manifest()
+    durable = tmp_path / "durable"
+    _evidence(durable, manifest, exact_config_validator(manifest))
+    result = publish_training_result(**_publication_kwargs(durable, manifest))
+    return manifest, result, durable / "final-adapter"
+
+
+def test_validate_adapter_handoff_survives_empty_directory_enumeration_at_durable_boundary(
+    tmp_path, exact_config_validator, monkeypatch
+):
+    """Faithful regression for the F12 recovery incident: the durable adapter's exact
+    child files exist and are directly readable, but `os.scandir` on the durable
+    directory returns zero records. `validate_adapter_handoff` must still succeed."""
+    manifest, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    assert (durable_adapter / ADAPTER_CONFIG).is_file()
+
+    _empty_scandir_for(monkeypatch, durable_adapter)
+    validate_adapter_handoff(
+        result=result,
+        manifest=manifest,
+        training_output_dir=tmp_path / "durable",
+        expected_adapter_path=durable_adapter,
+        expected_step=50,
+        expected_rank=16,
+    )
+
+
+def test_materialize_adapter_for_eval_survives_empty_directory_enumeration_at_durable_boundary(
+    tmp_path, exact_config_validator, monkeypatch
+):
+    manifest, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    run_root = tmp_path / "prime-rl-run-private"
+    run_root.mkdir(mode=0o700)
+
+    _empty_scandir_for(monkeypatch, durable_adapter)
+    private = materialize_adapter_for_eval(
+        result=result,
+        durable_adapter_path=durable_adapter,
+        run_root=run_root,
+    )
+    assert private == run_root / "adapter"
+    assert build_file_manifest(private) == result.adapter_files
+
+
+def test_validate_adapter_directory_exact_rejects_missing_file(tmp_path, exact_config_validator):
+    _, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    (durable_adapter / "adapter_model.safetensors").unlink()
+    with pytest.raises((FileNotFoundError, OSError)):
+        validate_adapter_directory_exact(durable_adapter, result.adapter_files, expected_rank=16)
+
+
+def test_validate_adapter_directory_exact_rejects_wrong_digest(tmp_path, exact_config_validator):
+    _, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    (durable_adapter / "adapter_model.safetensors").write_bytes(b"tampered-weights")
+    with pytest.raises(ValueError, match="exact-path file manifest mismatch"):
+        validate_adapter_directory_exact(durable_adapter, result.adapter_files, expected_rank=16)
+
+
+def test_validate_adapter_directory_exact_rejects_wrong_rank(tmp_path, exact_config_validator):
+    _, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    with pytest.raises(ValueError, match="adapter rank is"):
+        validate_adapter_directory_exact(durable_adapter, result.adapter_files, expected_rank=8)
+
+
+def test_validate_adapter_directory_exact_returns_digest_recomputed_from_bytes_actually_read(
+    tmp_path, exact_config_validator
+):
+    """The returned digest must come from `validate_file_manifest_by_exact_paths`'s own
+    on-disk reads, not merely echo the caller-supplied `expected` manifest back to it --
+    otherwise a future weakening of that validator (e.g. presence-only, no content check)
+    would leave this return value silently vouching for unread bytes."""
+    _, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    digest = validate_adapter_directory_exact(durable_adapter, result.adapter_files, expected_rank=16)
+    assert digest == result.adapter_files.aggregate_sha256
+    assert digest == build_file_manifest(durable_adapter).aggregate_sha256
+
+
+def test_validate_adapter_directory_exact_rejects_symlinked_source_file(tmp_path, exact_config_validator):
+    _, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    outside = tmp_path / "outside-weights"
+    outside.write_bytes(b"weights-50")
+    weight = durable_adapter / "adapter_model.safetensors"
+    weight.unlink()
+    weight.symlink_to(outside)
+    with pytest.raises((ValueError, OSError)):
+        validate_adapter_directory_exact(durable_adapter, result.adapter_files, expected_rank=16)
+
+
+def test_validate_adapter_directory_exact_rejects_unsupported_weight_name(tmp_path, exact_config_validator):
+    _, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    unsupported = FileManifest.from_records(
+        [
+            record
+            if record.path != "adapter_model.safetensors"
+            else record.model_copy(update={"path": "adapter_model.bin"})
+            for record in result.adapter_files.files
+        ]
+    )
+    with pytest.raises(ValueError, match="missing its supported weight file"):
+        validate_adapter_directory_exact(durable_adapter, unsupported, expected_rank=16)
+
+
+def test_validate_adapter_directory_exact_rejects_extra_manifest_entry(tmp_path, exact_config_validator):
+    _, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    (durable_adapter / "extra.json").write_text("{}")
+    bloated = FileManifest.from_records(
+        [*result.adapter_files.files, FileRecord(path="extra.json", size=2, sha256=hashlib.sha256(b"{}").hexdigest())]
+    )
+    with pytest.raises(ValueError, match="exactly one weight file"):
+        validate_adapter_directory_exact(durable_adapter, bloated, expected_rank=16)
+
+
+def test_copy_adapter_exclusive_by_manifest_rejects_missing_or_symlinked_source(tmp_path, exact_config_validator):
+    _, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    destination = tmp_path / "private-adapter-missing"
+    (durable_adapter / "adapter_model.safetensors").unlink()
+    with pytest.raises((FileNotFoundError, OSError)):
+        copy_adapter_exclusive_by_manifest(durable_adapter, destination, result.adapter_files)
+
+    outside = tmp_path / "outside-weights"
+    outside.write_bytes(b"weights-50")
+    (durable_adapter / "adapter_model.safetensors").symlink_to(outside)
+    destination_2 = tmp_path / "private-adapter-symlink"
+    with pytest.raises((ValueError, OSError)):
+        copy_adapter_exclusive_by_manifest(durable_adapter, destination_2, result.adapter_files)
+
+
+def test_copy_adapter_exclusive_by_manifest_does_not_write_to_frozen_source(tmp_path, exact_config_validator):
+    _, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    before = {path.name: path.read_bytes() for path in durable_adapter.iterdir()}
+    for path in durable_adapter.iterdir():
+        path.chmod(0o444)
+    durable_adapter.chmod(0o555)
+    try:
+        destination = tmp_path / "private-adapter-readonly-source"
+        copy_adapter_exclusive_by_manifest(durable_adapter, destination, result.adapter_files)
+        validate_file_manifest(destination, result.adapter_files)
+    finally:
+        durable_adapter.chmod(0o755)
+        for path in durable_adapter.iterdir():
+            path.chmod(0o644)
+    after = {path.name: path.read_bytes() for path in durable_adapter.iterdir()}
+    assert before == after
+
+
+def test_copy_adapter_exclusive_by_manifest_rejects_extra_entries_in_fresh_private_destination(
+    tmp_path, exact_config_validator
+):
+    """The private destination is freshly created and local, so extra-entry rejection
+    remains authoritative there even though the durable source's enumeration is not
+    trusted for the copy itself."""
+    _, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    destination = tmp_path / "private-adapter"
+    copy_adapter_exclusive_by_manifest(durable_adapter, destination, result.adapter_files)
+    (destination / "unexpected.txt").write_text("extra")
+    with pytest.raises(ValueError, match="extra=.*unexpected.txt"):
+        validate_file_manifest(destination, result.adapter_files)
+
+
+def test_copy_adapter_exclusive_by_manifest_rejects_swap_between_stat_and_open(
+    tmp_path, exact_config_validator, monkeypatch
+):
+    _, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    real_open = os.open
+    swapped = {"done": False}
+
+    def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+        is_plain_read = not (flags & (os.O_WRONLY | os.O_CREAT | os.O_DIRECTORY))
+        if not swapped["done"] and path == "adapter_model.safetensors" and is_plain_read:
+            swapped["done"] = True
+            os.unlink(path, dir_fd=dir_fd)
+            new_fd = real_open(path, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o644, dir_fd=dir_fd)
+            os.write(new_fd, b"swapped-in-between-stat-and-open")
+            os.close(new_fd)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr("os.open", fake_open)
+    os.supports_dir_fd.add(fake_open)  # preserve dir-fd support detection for the wrapper
+    try:
+        destination = tmp_path / "private-adapter-stat-open-swap"
+        with pytest.raises(RuntimeError, match="changed while being opened"):
+            copy_adapter_exclusive_by_manifest(durable_adapter, destination, result.adapter_files)
+    finally:
+        os.supports_dir_fd.discard(fake_open)
+
+
+def test_copy_adapter_exclusive_by_manifest_is_bound_to_inode_despite_path_swap_after_open(
+    tmp_path, exact_config_validator, monkeypatch
+):
+    """Once our descriptor is open, later swapping the directory entry (unlink + a
+    new file at the same name) must not affect the bytes we read: the copy stays
+    bound to the original inode, proving pathname is not trusted after open."""
+    _, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    original_bytes = (durable_adapter / "adapter_model.safetensors").read_bytes()
+    real_open = os.open
+    swapped = {"done": False}
+
+    def fake_open(path, flags, mode=0o777, *, dir_fd=None):
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        is_plain_read = not (flags & (os.O_WRONLY | os.O_CREAT | os.O_DIRECTORY))
+        if not swapped["done"] and path == "adapter_model.safetensors" and is_plain_read:
+            swapped["done"] = True
+            os.unlink(path, dir_fd=dir_fd)
+            new_fd = real_open(path, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o644, dir_fd=dir_fd)
+            os.write(new_fd, b"swapped-after-open-should-be-invisible")
+            os.close(new_fd)
+        return descriptor
+
+    monkeypatch.setattr("os.open", fake_open)
+    os.supports_dir_fd.add(fake_open)
+    try:
+        destination = tmp_path / "private-adapter-post-open-swap"
+        copy_adapter_exclusive_by_manifest(durable_adapter, destination, result.adapter_files)
+        assert (destination / "adapter_model.safetensors").read_bytes() == original_bytes
+    finally:
+        os.supports_dir_fd.discard(fake_open)
+
+
+def test_copy_adapter_exclusive_by_manifest_rejects_content_mutated_during_copy(
+    tmp_path, exact_config_validator, monkeypatch
+):
+    _, result, durable_adapter = _published_result_with_durable_adapter(tmp_path, exact_config_validator)
+    real_read = os.read
+    mutated = {"done": False}
+
+    def fake_read(fd, length):
+        chunk = real_read(fd, length)
+        if not mutated["done"] and chunk:
+            mutated["done"] = True
+            weight = durable_adapter / "adapter_model.safetensors"
+            with weight.open("ab") as handle:
+                handle.write(b"-mutated-mid-copy")
+        return chunk
+
+    monkeypatch.setattr("os.read", fake_read)
+    destination = tmp_path / "private-adapter-mutated-mid-copy"
+    with pytest.raises((RuntimeError, ValueError)):
+        copy_adapter_exclusive_by_manifest(durable_adapter, destination, result.adapter_files)
 
 
 def test_publication_rejects_config_and_attestation_mismatch(tmp_path, exact_config_validator):

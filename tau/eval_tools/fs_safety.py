@@ -91,6 +91,24 @@ def open_directory_nofollow(path: Path) -> int:
         raise
 
 
+def open_relative_directory_nofollow(directory_descriptor: int, name: str) -> int:
+    """Open a single path component as a directory beneath an already-open directory
+    descriptor, following no symlinks. Used to walk a canonical relative path (e.g. a
+    signed manifest's ``FileRecord.path``) one component at a time without ever trusting
+    a parent directory's enumeration (``os.scandir``) of what children exist."""
+    _require_directory_fd_support()
+    if "/" in name or name in ("", ".", ".."):
+        raise ValueError(f"unsafe directory-relative name: {name!r}")
+    metadata = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise NotADirectoryError(f"path component is not a directory: {name}")
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_descriptor)
+    if not _same_entry(metadata, os.fstat(descriptor)):
+        os.close(descriptor)
+        raise RuntimeError(f"directory component changed while being opened: {name}")
+    return descriptor
+
+
 def rename_entries_noreplace(
     source_directory_descriptor: int,
     source_name: str,

@@ -15,7 +15,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from tau.eval_tools.fs_safety import quarantine_entry
+from tau.eval_tools.fs_safety import open_directory_nofollow, quarantine_entry
 from tau.eval_tools.fs_safety import rename_noreplace as _rename_noreplace
 from tau.eval_tools.json_io import (
     fsync_directory,
@@ -27,11 +27,14 @@ from tau.eval_tools.json_io import (
 )
 from tau.eval_tools.manifest import (
     FileManifest,
+    FileRecord,
     FrozenEvalManifest,
     RLConfigIdentity,
     build_file_manifest,
     make_tree_immutable,
+    open_record_parent_nofollow,
     validate_file_manifest,
+    validate_file_manifest_by_exact_paths,
     validate_tree_immutable,
 )
 
@@ -484,6 +487,32 @@ def validate_adapter_directory(path: Path, *, expected_rank: int) -> str:
     return manifest.aggregate_sha256
 
 
+def validate_adapter_directory_exact(path: Path, expected: FileManifest, *, expected_rank: int) -> str:
+    """Validate a durable adapter directory using only its exact, already-signed
+    manifest of child paths -- never trusting directory enumeration (`os.scandir`) at
+    this boundary. Some durable mounts (e.g. BlobFuse) can return a stale or empty
+    directory listing even though the named children (`adapter_config.json` plus the
+    one supported weight file) are directly readable through descriptor-safe opens.
+    Used only at the durable handoff boundary (`validate_adapter_handoff`); local/fresh
+    training checkpoint trees keep using `validate_adapter_directory`'s enumeration."""
+    path = Path(os.path.abspath(path))
+    metadata = os.lstat(path)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"adapter directory is not a directory: {path}")
+    names = {record.path for record in expected.files}
+    if ADAPTER_CONFIG not in names or len(names) != 2:
+        raise ValueError(f"adapter manifest must contain config plus exactly one weight file, got {sorted(names)}")
+    weight_names = [name for name in names if name in ADAPTER_WEIGHT_FILES]
+    if len(weight_names) != 1:
+        raise ValueError(f"adapter manifest is missing its supported weight file: {sorted(names)}")
+    validated = validate_file_manifest_by_exact_paths(path, expected)
+    config, _ = load_json_with_sha256(path / ADAPTER_CONFIG)
+    if not isinstance(config, dict) or config.get("r") != expected_rank:
+        actual_rank = config.get("r") if isinstance(config, dict) else None
+        raise ValueError(f"adapter rank is {actual_rank!r}, expected {expected_rank}")
+    return validated.aggregate_sha256
+
+
 def copy_adapter_exclusive(source: Path, destination: Path) -> None:
     source = Path(source)
     destination = Path(destination)
@@ -500,6 +529,91 @@ def copy_adapter_exclusive(source: Path, destination: Path) -> None:
     fsync_directory(destination)
 
 
+def _copy_exact_record(
+    source_directory_descriptor: int,
+    source_name: str,
+    destination_directory_descriptor: int,
+    record: FileRecord,
+) -> None:
+    source_metadata = os.stat(source_name, dir_fd=source_directory_descriptor, follow_symlinks=False)
+    if not stat.S_ISREG(source_metadata.st_mode):
+        raise ValueError(f"adapter source file is not a regular file: {record.path}")
+    source_descriptor = os.open(source_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_directory_descriptor)
+    try:
+        before = os.fstat(source_descriptor)
+        if (before.st_dev, before.st_ino) != (source_metadata.st_dev, source_metadata.st_ino):
+            raise RuntimeError(f"adapter source file changed while being opened: {record.path}")
+        destination_descriptor = os.open(
+            record.path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o444,
+            dir_fd=destination_directory_descriptor,
+        )
+        try:
+            digest = hashlib.sha256()
+            total_bytes = 0
+            while chunk := os.read(source_descriptor, 1024 * 1024):
+                digest.update(chunk)
+                total_bytes += len(chunk)
+                offset = 0
+                while offset < len(chunk):
+                    written = os.write(destination_descriptor, chunk[offset:])
+                    if written == 0:
+                        raise OSError(f"short write while copying adapter file: {record.path}")
+                    offset += written
+            after = os.fstat(source_descriptor)
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                raise RuntimeError(f"adapter source file changed while being copied: {record.path}")
+            if total_bytes != record.size or digest.hexdigest() != record.sha256:
+                raise ValueError(
+                    f"adapter source file {record.path} does not match its signed manifest record "
+                    f"(size={total_bytes} vs {record.size}, sha256={digest.hexdigest()} vs {record.sha256})"
+                )
+            os.fsync(destination_descriptor)
+        finally:
+            os.close(destination_descriptor)
+    finally:
+        os.close(source_descriptor)
+
+
+def copy_adapter_exclusive_by_manifest(source: Path, destination: Path, expected: FileManifest) -> None:
+    """Materialize exactly the signed manifest's records from a durable (possibly
+    BlobFuse-mounted) adapter directory into a brand-new private destination.
+
+    Every source child is opened by its exact canonical name through a no-follow
+    descriptor (never `os.scandir`), streamed while verifying its size/SHA-256 against
+    the already-signed `FileRecord`, and written to an exclusive (`O_EXCL`) destination
+    file before being fsynced. The destination directory itself remains untrusted
+    directory enumeration's rightful home: callers must still validate it (e.g. via
+    `validate_file_manifest`) once every record has been copied."""
+    if ADAPTER_CONFIG not in {record.path for record in expected.files}:
+        raise ValueError("adapter manifest must contain adapter_config.json")
+    source_descriptor = open_directory_nofollow(Path(source))
+    try:
+        destination = Path(destination)
+        destination.mkdir(parents=False, exist_ok=False)
+        destination_descriptor = open_directory_nofollow(destination)
+        try:
+            for record in expected.files:
+                if "/" in record.path:
+                    raise ValueError(f"adapter manifest records must be flat filenames: {record.path}")
+                parent_descriptor, leaf_name = open_record_parent_nofollow(source_descriptor, record.path)
+                try:
+                    _copy_exact_record(parent_descriptor, leaf_name, destination_descriptor, record)
+                finally:
+                    os.close(parent_descriptor)
+            os.fsync(destination_descriptor)
+        finally:
+            os.close(destination_descriptor)
+    finally:
+        os.close(source_descriptor)
+
+
 def materialize_adapter_for_eval(
     *,
     result: TrainingResult,
@@ -509,7 +623,7 @@ def materialize_adapter_for_eval(
     run_root = Path(run_root).resolve(strict=True)
     durable_adapter_path = Path(durable_adapter_path)
     destination = run_root / "adapter"
-    copy_adapter_exclusive(durable_adapter_path, destination)
+    copy_adapter_exclusive_by_manifest(durable_adapter_path, destination, result.adapter_files)
     validate_file_manifest(destination, result.adapter_files)
     make_tree_immutable(destination)
     validate_tree_immutable(destination, result.adapter_files)
@@ -1237,10 +1351,9 @@ def validate_adapter_handoff(
         raise ValueError(
             f"training result final adapter path is {result.final_adapter_path}, expected {expected_adapter_path}"
         )
-    digest = validate_adapter_directory(expected_adapter_path, expected_rank=expected_rank)
+    digest = validate_adapter_directory_exact(expected_adapter_path, result.adapter_files, expected_rank=expected_rank)
     if digest != result.adapter_sha256:
         raise ValueError(f"final adapter digest {digest} does not match training result digest {result.adapter_sha256}")
-    validate_file_manifest(expected_adapter_path, result.adapter_files)
     if (
         publication.resolved_config_sha256 != resolved_digest
         or publication.source_step != result.source_step

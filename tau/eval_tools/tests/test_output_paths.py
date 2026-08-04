@@ -71,6 +71,22 @@ def _f12_recovery_references(data_root):
         "comparison_output_path": (
             evidence_generation(SOURCE_B, data_root=data_root).eval_post_recovery / "comparison.json"
         ),
+        "recovery_preflight_path": evidence_generation(SOURCE_B, data_root=data_root).recovery_preflight_result,
+        "recovery_environment": F12_RECOVERY_ENVIRONMENT,
+    }
+
+
+def _f12_recovery_preflight_references(data_root):
+    paths = f12_recovery_paths(data_root)
+    return {
+        "manifest_path": paths.manifest,
+        "baseline_rewards_path": paths.baseline_rewards,
+        "training_result_path": paths.training_result,
+        "training_output_dir": paths.training_output_dir,
+        "lora_adapter_path": paths.adapter,
+        "recovery_preflight_output_path": (
+            evidence_generation(SOURCE_B, data_root=data_root).recovery_preflight_result
+        ),
         "recovery_environment": F12_RECOVERY_ENVIRONMENT,
     }
 
@@ -189,6 +205,114 @@ def test_f12_recovery_rejects_reusing_experiment_source_generation_before_creati
             F12_EXPERIMENT_SOURCE_REVISION,
             eval_label="post",
             data_root=data_root,
+        )
+
+    assert not expected.exists()
+
+
+def test_f12_recovery_preflight_creates_only_new_runtime_output_and_preserves_source_evidence(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    source_paths = f12_recovery_paths(data_root)
+    source_paths.generation_root.mkdir(parents=True)
+    preserved = source_paths.generation_root / "eval-post" / "inference.log"
+    preserved.parent.mkdir()
+    preserved.write_bytes(b"preserved interrupted F12 log")
+    expected = evidence_generation(SOURCE_B, data_root=data_root).eval_post_recovery_preflight
+
+    prepared = prepare_output_directory(
+        "eval-post-recovery-preflight",
+        expected,
+        SOURCE_B,
+        data_root=data_root,
+        **_f12_recovery_preflight_references(data_root),
+    )
+
+    assert prepared == expected
+    assert prepared.is_dir()
+    assert preserved.read_bytes() == b"preserved interrupted F12 log"
+    assert not (source_paths.generation_root / "eval-post-recovery-preflight").exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ({"manifest_path": "/data/wrong.json"}, "PRIME_RL_MANIFEST_PATH"),
+        (
+            {"recovery_environment": F12_RECOVERY_ENVIRONMENT | {"manifest_sha256": "0" * 64}},
+            "manifest_sha256",
+        ),
+        ({"recovery_preflight_output_path": "/data/wrong.json"}, "PRIME_RL_RECOVERY_PREFLIGHT_OUTPUT_PATH"),
+    ],
+)
+def test_f12_recovery_preflight_rejects_mismatched_contract_before_output_creation(tmp_path, mutation, error):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    expected = evidence_generation(SOURCE_B, data_root=data_root).eval_post_recovery_preflight
+    references = _f12_recovery_preflight_references(data_root) | mutation
+
+    with pytest.raises(ValueError, match=error):
+        prepare_output_directory(
+            "eval-post-recovery-preflight",
+            expected,
+            SOURCE_B,
+            data_root=data_root,
+            **references,
+        )
+
+    assert not expected.exists()
+
+
+def test_f12_recovery_preflight_rejects_reusing_experiment_source_generation_before_creation(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    expected = evidence_generation(F12_EXPERIMENT_SOURCE_REVISION, data_root=data_root).eval_post_recovery_preflight
+
+    with pytest.raises(ValueError, match="new runtime source generation"):
+        prepare_output_directory(
+            "eval-post-recovery-preflight",
+            expected,
+            F12_EXPERIMENT_SOURCE_REVISION,
+            data_root=data_root,
+        )
+
+    assert not expected.exists()
+
+
+def test_f12_recovery_requires_matching_preflight_path_sibling_to_own_generation(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    expected = evidence_generation(SOURCE_B, data_root=data_root).eval_post_recovery
+    references = _f12_recovery_references(data_root) | {
+        "recovery_preflight_path": evidence_generation(SOURCE_A, data_root=data_root).recovery_preflight_result
+    }
+
+    with pytest.raises(ValueError, match="PRIME_RL_RECOVERY_PREFLIGHT_PATH"):
+        prepare_output_directory(
+            "eval-post-recovery",
+            expected,
+            SOURCE_B,
+            eval_label="post",
+            data_root=data_root,
+            **references,
+        )
+
+    assert not expected.exists()
+
+
+def test_f12_recovery_preflight_path_is_rejected_outside_recovery_mode(tmp_path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    expected = evidence_generation(SOURCE_A, data_root=data_root).smoke
+    stray_path = evidence_generation(SOURCE_A, data_root=data_root).recovery_preflight_result
+
+    with pytest.raises(ValueError, match="PRIME_RL_RECOVERY_PREFLIGHT_PATH is only valid in eval-post-recovery mode"):
+        prepare_output_directory(
+            "smoke",
+            expected,
+            SOURCE_A,
+            data_root=data_root,
+            recovery_preflight_path=stray_path,
         )
 
     assert not expected.exists()

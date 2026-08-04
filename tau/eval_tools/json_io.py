@@ -246,13 +246,19 @@ def _open_json_snapshot(directory_descriptor: int, name: str, path: Path) -> Jso
         os.close(descriptor)
 
 
-def _open_file_snapshot(
+def open_file_snapshot(
     directory_descriptor: int,
     name: str,
     path: Path,
     *,
     expected_raw: bytes | None = None,
 ) -> FileEvidenceSnapshot:
+    """Read and hash exactly one named child of an already-open directory descriptor,
+    following no symlinks and re-verifying identity/metadata before and after the read.
+    This is the descriptor-safe primitive reused wherever a durable path must be
+    validated by its exact name rather than trusted directory enumeration (e.g. a
+    BlobFuse mount whose `os.scandir` can return a stale/empty listing even though the
+    named child is directly readable)."""
     pathname_metadata = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
     if not stat.S_ISREG(pathname_metadata.st_mode):
         raise ValueError(f"evidence path must be a regular file: {path}")
@@ -318,7 +324,7 @@ def promote_file_noreplace(
         destination_descriptor = open_directory_nofollow(final_path.parent)
         if os.fstat(source_descriptor).st_dev != os.fstat(destination_descriptor).st_dev:
             raise RuntimeError("evidence staging and destination must be on the same filesystem")
-        staged = _open_file_snapshot(
+        staged = open_file_snapshot(
             source_descriptor,
             staging_path.name,
             staging_path,
@@ -356,7 +362,7 @@ def promote_file_noreplace(
             os.fsync(destination_descriptor)
         if after_install is not None:
             after_install(final_path)
-        final = _open_file_snapshot(destination_descriptor, final_path.name, final_path)
+        final = open_file_snapshot(destination_descriptor, final_path.name, final_path)
         if (
             final.mode,
             final.device,
