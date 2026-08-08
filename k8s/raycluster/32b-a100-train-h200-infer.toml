@@ -1,0 +1,63 @@
+max_steps = 50
+seq_len = 8192
+output_dir = "/shared/outputs/32b-a100-train-h200-infer"
+
+[model]
+name = "Qwen/Qwen3-32B"
+
+[deployment]
+type = "multi_node"
+gpus_per_node = 8
+num_train_nodes = 2
+num_infer_nodes = 2
+
+[execution]
+type = "ray"
+address = "auto"
+placement_timeout_seconds = 1800
+
+[execution.trainer]
+accelerator_type = "A100"
+
+[execution.inference]
+accelerator_type = "H200"
+
+[weight_broadcast]
+type = "filesystem"
+
+[wandb]
+project = "prime-rl-mixed-compute-32b"
+name = "a100-train-h200-infer"
+
+[trainer.model]
+attn = "flash_attention_2"
+
+[trainer.model.ac]
+freq = 1
+
+[orchestrator]
+batch_size = 128
+group_size = 8
+
+[[orchestrator.train.source]]
+name = "hendrycks-math"
+
+[orchestrator.train.source.env.taskset]
+id = "math-env-v1"
+
+[orchestrator.train.source.env.agent.harness]
+id = "null"
+
+[orchestrator.train.source.env.agent.runtime]
+type = "subprocess"
+
+[orchestrator.renderer]
+name = "default"
+reasoning_parser = "think"
+
+[inference.parallel]
+tp = 8
+dp = 2
+
+[inference.model]
+max_model_len = 8192

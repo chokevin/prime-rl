@@ -1,0 +1,110 @@
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: prime-rl-32b-mixed
+  namespace: ray
+  labels:
+    kueue.x-k8s.io/queue-name: cpu
+spec:
+  suspend: true
+  entrypoint: >-
+    uv run rl @ /app/k8s/raycluster/32b-a100-train-h200-infer.toml
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 0
+  rayClusterSpec:
+    rayVersion: "2.54.0"
+    enableInTreeAutoscaling: false
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        num-gpus: "0"
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              image: ghcr.io/primeintellect-ai/prime-rl:REPLACE_WITH_DIGEST
+              imagePullPolicy: IfNotPresent
+              resources:
+                requests:
+                  cpu: "8"
+                  memory: 32Gi
+                limits:
+                  cpu: "8"
+                  memory: 32Gi
+              volumeMounts:
+                - name: shared
+                  mountPath: /shared
+          volumes:
+            - name: shared
+              persistentVolumeClaim:
+                claimName: chexpert-lustre
+    workerGroupSpecs:
+      - groupName: a100-workers
+        replicas: 2
+        minReplicas: 2
+        maxReplicas: 2
+        rayStartParams:
+          num-gpus: "8"
+        template:
+          spec:
+            nodeSelector:
+              kueue.azure.com/gpu-series: ndm-a100-v4
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            containers:
+              - name: ray-worker
+                image: ghcr.io/primeintellect-ai/prime-rl:REPLACE_WITH_DIGEST
+                imagePullPolicy: IfNotPresent
+                resources:
+                  requests:
+                    cpu: "64"
+                    memory: 512Gi
+                    nvidia.com/gpu: "8"
+                  limits:
+                    cpu: "64"
+                    memory: 512Gi
+                    nvidia.com/gpu: "8"
+                volumeMounts:
+                  - name: shared
+                    mountPath: /shared
+            volumes:
+              - name: shared
+                persistentVolumeClaim:
+                  claimName: chexpert-lustre
+      - groupName: h200-workers
+        replicas: 2
+        minReplicas: 2
+        maxReplicas: 2
+        rayStartParams:
+          num-gpus: "8"
+        template:
+          spec:
+            nodeSelector:
+              kueue.azure.com/gpu-series: nd-h200-v5
+            tolerations:
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            containers:
+              - name: ray-worker
+                image: ghcr.io/primeintellect-ai/prime-rl:REPLACE_WITH_DIGEST
+                imagePullPolicy: IfNotPresent
+                resources:
+                  requests:
+                    cpu: "64"
+                    memory: 1024Gi
+                    nvidia.com/gpu: "8"
+                  limits:
+                    cpu: "64"
+                    memory: 1024Gi
+                    nvidia.com/gpu: "8"
+                volumeMounts:
+                  - name: shared
+                    mountPath: /shared
+            volumes:
+              - name: shared
+                persistentVolumeClaim:
+                  claimName: chexpert-lustre

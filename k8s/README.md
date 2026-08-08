@@ -2,6 +2,10 @@
 
 This directory contains a Helm chart for deploying prime-rl training infrastructure on Kubernetes clusters.
 
+For Ray-owned mixed-accelerator runs, use [`raycluster/`](./raycluster/). That
+path provides a Kueue-admitted per-job RayCluster with separate A100 and H200
+worker groups and symmetric 32B experiment configs.
+
 For complete documentation, see the [Kubernetes guide](https://docs.primeintellect.ai/prime-rl/kubernetes).
 
 ## Quick Start

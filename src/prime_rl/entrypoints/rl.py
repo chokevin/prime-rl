@@ -74,7 +74,7 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
         # Exclude launcher-only fields that are not needed by the vLLM server
         exclude_inference = {"deployment", "slurm", "output_dir", "dry_run"}
         inference_dict = to_toml_dict(config.inference, exclude=exclude_inference)
-        if config.deployment.type == "multi_node":
+        if config.execution.type == "slurm" and config.deployment.type == "multi_node":
             # Per-rank processes run bare engines; the sbatch starts the single global router.
             inference_dict["router"] = "None"
         with open(output_dir / INFERENCE_TOML, "wb") as f:
@@ -565,12 +565,16 @@ def rl(config: RLConfig):
         get_logger().info("Training from scratch, cleaning any stale rollouts and broadcasts")
         clean_future_steps(config.output_dir, -1)
 
-    if not config.dry_run:
+    if not config.dry_run and config.execution.type != "ray":
         from prime_rl.trainer.model import pre_download_model
 
         pre_download_model(config.trainer.model.name)
 
-    if config.slurm is not None:
+    if config.execution.type == "ray":
+        from prime_rl.ray import run_ray
+
+        run_ray(config)
+    elif config.execution.type == "slurm":
         rl_slurm(config)
     else:
         rl_local(config)

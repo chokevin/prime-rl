@@ -159,6 +159,53 @@ SharedWeightBroadcastConfig: TypeAlias = Annotated[
 ]
 
 
+class LocalExecutionConfig(BaseConfig):
+    type: Literal["local"] = "local"
+
+
+class SlurmExecutionConfig(BaseConfig):
+    type: Literal["slurm"] = "slurm"
+
+
+class RayAcceleratorSelector(BaseConfig):
+    accelerator_type: str
+    """Ray node accelerator type or custom label value, for example ``A100`` or ``H200``."""
+
+
+class RayExecutionConfig(BaseConfig):
+    type: Literal["ray"] = "ray"
+
+    address: str | None = None
+    """Ray address. Use ``auto`` for a driver running inside a RayCluster."""
+
+    namespace: str = "prime-rl"
+    """Ray namespace for attempt-scoped actors and jobs."""
+
+    trainer: RayAcceleratorSelector
+    """Homogeneous accelerator family used by every Ray Train worker."""
+
+    inference: RayAcceleratorSelector
+    """Accelerator family used by policy inference actors."""
+
+    trainer_num_cpus: float = Field(1.0, gt=0)
+    """CPU resources reserved for each Ray Train worker."""
+
+    inference_num_cpus: float = Field(1.0, gt=0)
+    """CPU resources reserved for each policy inference actor."""
+
+    placement_timeout_seconds: int = Field(900, gt=0)
+    """Maximum time to wait for role placement before rolling back the attempt."""
+
+    log_to_driver: bool = False
+    """Forward Ray worker logs to the driver."""
+
+
+ExecutionConfig: TypeAlias = Annotated[
+    LocalExecutionConfig | SlurmExecutionConfig | RayExecutionConfig,
+    Field(discriminator="type"),
+]
+
+
 class BaseDeploymentConfig(BaseConfig):
     gpus_per_node: int = 8
     """GPUs per node."""
@@ -268,8 +315,11 @@ class RLConfig(BaseConfig):
 
     deployment: DeploymentConfig = SingleNodeDeploymentConfig()
 
+    execution: ExecutionConfig = LocalExecutionConfig()
+    """Runtime that owns role placement and lifecycle."""
+
     slurm: SlurmConfig | None = None
-    """SLURM configuration. If None, runs locally."""
+    """SLURM submission settings. Requires ``execution.type = "slurm"``."""
 
     dry_run: bool = False
     """Only validate and dump resolved configs, then exit early."""
@@ -305,9 +355,17 @@ class RLConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_deployment(self):
+        if self.slurm is not None and self.execution.type == "local":
+            self.execution = SlurmExecutionConfig()
+        if self.execution.type == "slurm" and self.slurm is None:
+            raise ValueError("execution.type = 'slurm' requires a [slurm] config.")
+        if self.execution.type != "slurm" and self.slurm is not None:
+            raise ValueError("[slurm] requires execution.type = 'slurm'.")
+        if self.execution.type == "ray" and self.deployment.type != "multi_node":
+            raise ValueError("execution.type = 'ray' requires deployment.type = 'multi_node'.")
         if self.deployment.type == "multi_node":
-            if self.slurm is None:
-                raise ValueError("Must use SLURM for multi-node deployment.")
+            if self.execution.type not in ("slurm", "ray"):
+                raise ValueError("Multi-node deployment requires execution.type = 'slurm' or 'ray'.")
             num_infer_nodes = self.deployment.infer_nodes_per_replica
             if num_infer_nodes > 0 and not self.inference:
                 raise ValueError("Must configure inference when using multi-node deployment with inference nodes.")
@@ -321,6 +379,21 @@ class RLConfig(BaseConfig):
                     "Must use fake data (trainer.data.fake or bench = true) when num_infer_nodes = 0, "
                     "since no orchestrator or inference server will be running."
                 )
+            if self.execution.type == "ray" and self.inference is not None:
+                expected_infer_gpus = self.deployment.total_infer_nodes * self.deployment.gpus_per_node
+                configured_infer_gpus = self.inference.parallel.dp * self.inference.parallel.tp
+                if configured_infer_gpus != expected_infer_gpus:
+                    raise ValueError(
+                        "Ray inference topology requires inference.parallel.dp * inference.parallel.tp "
+                        f"to equal total inference GPUs ({expected_infer_gpus}), got {configured_infer_gpus}."
+                    )
+                if self.inference.parallel.tp != self.deployment.gpus_per_node:
+                    raise ValueError(
+                        "Ray v1 requires one tensor-parallel inference replica per node: "
+                        "inference.parallel.tp must equal deployment.gpus_per_node."
+                    )
+                if self.weight_broadcast is not None and self.weight_broadcast.type != "filesystem":
+                    raise ValueError("Ray v1 supports only weight_broadcast.type = 'filesystem'.")
         return self
 
     @model_validator(mode="after")
@@ -566,7 +639,12 @@ class RLConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_multi_node_requires_router(self):
-        if self.deployment.type == "multi_node" and self.inference is not None and self.inference.router is None:
+        if (
+            self.execution.type == "slurm"
+            and self.deployment.type == "multi_node"
+            and self.inference is not None
+            and self.inference.router is None
+        ):
             raise ValueError("Multi-node deployments require inference.router to front the per-rank engines.")
         return self
 

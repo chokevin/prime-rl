@@ -96,6 +96,32 @@ enable_token_export = true
 
 Leave it unset for normal training. When enabled, it exports every sequence from each exporting rank.
 
+## Ray mixed-accelerator execution
+
+Ray execution is orthogonal to deployment topology:
+
+```toml
+[deployment]
+type = "multi_node"
+gpus_per_node = 8
+num_train_nodes = 2
+num_infer_nodes = 2
+
+[execution]
+type = "ray"
+address = "auto"
+
+[execution.trainer]
+accelerator_type = "A100"
+
+[execution.inference]
+accelerator_type = "H200"
+```
+
+The first supported Ray shape uses homogeneous Ray Train workers, one TP
+inference replica per GPU node, filesystem weight broadcast, and custom Ray
+resources named `accelerator_type:<GPU>`.
+
 ## Key files
 
 - `packages/prime-rl-configs/src/prime_rl/` — config classes under `configs/`; `utils/config.py` re-exports `BaseConfig` and `cli`

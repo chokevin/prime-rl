@@ -159,6 +159,72 @@ def test_removed_fused_lm_head_chunk_size_field_is_rejected():
         TrainerModelConfig.model_validate({"fused_lm_head_chunk_size": "auto"})
 
 
+@pytest.mark.parametrize(
+    ("trainer_accelerator", "inference_accelerator"),
+    [("A100", "H200"), ("H200", "A100")],
+)
+def test_ray_mixed_accelerator_execution_config(trainer_accelerator, inference_accelerator):
+    config = RLConfig.model_validate(
+        {
+            "trainer": {},
+            "orchestrator": {},
+            "inference": {"parallel": {"tp": 8, "dp": 2}},
+            "deployment": {
+                "type": "multi_node",
+                "num_train_nodes": 2,
+                "num_infer_nodes": 2,
+                "gpus_per_node": 8,
+            },
+            "execution": {
+                "type": "ray",
+                "trainer": {"accelerator_type": trainer_accelerator},
+                "inference": {"accelerator_type": inference_accelerator},
+            },
+        }
+    )
+
+    assert config.execution.type == "ray"
+    assert config.execution.trainer.accelerator_type == trainer_accelerator
+    assert config.execution.inference.accelerator_type == inference_accelerator
+
+
+def test_ray_execution_requires_multi_node_deployment():
+    with pytest.raises(ValidationError, match="requires deployment.type = 'multi_node'"):
+        RLConfig.model_validate(
+            {
+                "trainer": {},
+                "orchestrator": {},
+                "execution": {
+                    "type": "ray",
+                    "trainer": {"accelerator_type": "A100"},
+                    "inference": {"accelerator_type": "H200"},
+                },
+            }
+        )
+
+
+def test_ray_execution_validates_inference_topology():
+    with pytest.raises(ValidationError, match="to equal total inference GPUs"):
+        RLConfig.model_validate(
+            {
+                "trainer": {},
+                "orchestrator": {},
+                "inference": {"parallel": {"tp": 8, "dp": 1}},
+                "deployment": {
+                    "type": "multi_node",
+                    "num_train_nodes": 2,
+                    "num_infer_nodes": 2,
+                    "gpus_per_node": 8,
+                },
+                "execution": {
+                    "type": "ray",
+                    "trainer": {"accelerator_type": "A100"},
+                    "inference": {"accelerator_type": "H200"},
+                },
+            }
+        )
+
+
 def test_to_toml_dict_roundtrips_explicit_none(tmp_path):
     """An explicit None override survives the write/re-parse round-trip used by SLURM launches."""
     config = cli(TrainerConfig, args=["--model.compile", "None", "--optim.max_norm", "None"])
