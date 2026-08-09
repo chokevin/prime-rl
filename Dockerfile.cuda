@@ -94,6 +94,7 @@ COPY scripts/docker-editable-pretend-versions.sh /app/scripts/docker-editable-pr
 # /app/.git/modules to the read-only context before resolving versions.
 ARG VERIFIERS_PRETEND_VERSION
 ARG RENDERERS_PRETEND_VERSION
+ARG PYDANTIC_CONFIG_PRETEND_VERSION=0.4.2
 RUN --mount=type=cache,target=/app/.cache/uv \
     --mount=type=bind,source=.,target=/build-context,readonly \
     if [ -d /build-context/.git/modules ]; then mkdir -p /app/.git && ln -s /build-context/.git/modules /app/.git/modules; fi \
@@ -105,6 +106,8 @@ RUN --mount=type=cache,target=/app/.cache/uv \
     sed -i "s/fallback-version = \"0.0.0\"/fallback-version = \"${VERIFIERS_PRETEND_VERSION}\"/" /app/deps/verifiers/pyproject.toml \
     && \
     sed -i "s/fallback-version = \"0.0.0\"/fallback-version = \"${RENDERERS_PRETEND_VERSION}\"/" /app/deps/renderers/pyproject.toml \
+    && \
+    sed -i "s/fallback-version = \"0.0.0\"/fallback-version = \"${PYDANTIC_CONFIG_PRETEND_VERSION}\"/" /app/deps/pydantic-config/pyproject.toml \
     && \
     uv sync --all-packages --extra flash-attn --extra flash-attn-3 --extra flash-attn-cute --extra disagg --extra gpt-oss --extra quack --group mamba-ssm --locked --no-dev \
     && uv pip install --python /app/.venv/bin/python "ray[default,train]==2.54.0" \
