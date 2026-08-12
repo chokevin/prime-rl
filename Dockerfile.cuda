@@ -71,6 +71,8 @@ ENV UV_CACHE_DIR="/usr/local/share/uv/cache"
 # Explicity set venv dir inside /app so to ensure it gets copied over during
 # the runtime stage's `COPY /app`
 ENV UV_PROJECT_ENVIRONMENT="/app/.venv"
+ENV UV_HTTP_TIMEOUT=120
+ENV UV_HTTP_RETRIES=10
 
 # Install Python dependencies (The gradual copies help with caching)
 WORKDIR /app
